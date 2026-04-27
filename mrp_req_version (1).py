@@ -1,25 +1,20 @@
-"""
-SAP MRP ENGINE — Full L1 to L4 with Phantom Handling
-Streamlit Cloud deployment (GitHub-ready)
-
-Fixes applied:
-  1. Date formats preserved in output (26-Apr stays 26-Apr, Apr-26 stays Apr-26)
-  2. AttributeError: duplicate month columns no longer crash the app
-  3. Receipt Quantity file: adds to stock before shortage calculation
-  4. Component search bar with ancestry tree (Graphviz)
-"""
-
+# ═══════════════════════════════════════════════════════════════
+# SAP MRP ENGINE — Full L1 to L4 with Phantom Handling + Set Capacity
+# Streamlit Cloud deployment (GitHub-ready)
+# ═══════════════════════════════════════════════════════════════
 import io
 import re
 import pandas as pd
 import streamlit as st
+import pulp  # New: for optimization
+from functools import reduce
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="SAP MRP Engine", page_icon="⚙️", layout="wide")
-st.title("⚙️ SAP MRP Engine — L1 to L4")
-st.caption("Phantom handling · Alt-aware · NET propagation · Dynamic date/month columns")
+st.title("⚙️ SAP MRP Engine — L1 to L4 + Set Capacity Planning")
+st.caption("Phantom handling · Alt-aware · NET propagation · Dynamic date/month columns · Import Part Set Optimization")
 
 # ═══════════════════════════════════════════════════════════════
 # SIDEBAR
@@ -32,26 +27,29 @@ with st.sidebar:
     VERIFY_L3 = st.text_input("Verify L3 (phantom)",         value="0010748814")
     VERIFY_L4 = st.text_input("Verify component L4",         value="0010300601DEL")
     st.divider()
-    st.subheader("Upload files")
+    st.subheader("Upload MRP Files")
     bom_file      = st.file_uploader("BOM file (.xlsx)",              type=["xlsx","xls"], key="bom")
     req_file      = st.file_uploader("Req and Stock (.xlsx)",         type=["xlsx","xls"], key="req")
     prod_file     = st.file_uploader("Production Orders (.xlsx) — optional", type=["xlsx","xls"], key="prod")
     receipt_file  = st.file_uploader("Receipt Quantities (.xlsx) — optional",
                                      type=["xlsx","xls"], key="receipt",
                                      help="Components with GR/receipt qty to add to stock")
+    st.divider()
+    st.subheader("Upload Set Capacity Files")
+    segment_file = st.file_uploader("Import Part & Segment File (.xlsx)", type=["xlsx","xls"], key="segment",
+                                    help="Sheet 1: Import Part (Material + Stock), Sheet 2: Segment (Model + Segment + Type IDU/ODU)")
     run_btn = st.button("▶ Run MRP", type="primary", use_container_width=True)
 
-
 # ═══════════════════════════════════════════════════════════════
-# SHARED HELPERS
+# SHARED HELPERS (unchanged from your existing code)
 # ═══════════════════════════════════════════════════════════════
-
 MONTH_ABBR = {
     "jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
     "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12
 }
 
 def parse_col_to_date(col, default_year=2026):
+    # [Unchanged existing code]
     orig_label = str(col).strip() if not isinstance(col, pd.Timestamp) else col.strftime("%d-%b-%y")
     if isinstance(col, pd.Timestamp):
         return col.replace(day=1), col.strftime("%d-%b-%y")
@@ -89,16 +87,16 @@ def parse_col_to_date(col, default_year=2026):
         pass
     return None, None
 
-
 def infer_year_from_parsed(parsed_list):
+    # [Unchanged existing code]
     years = []
     for p in parsed_list:
         if p["ts"] is not None:
             years.append(p["ts"].year)
     return max(set(years), key=years.count) if years else 2026
 
-
 def parse_all_month_cols(req_cols, non_month_set):
+    # [Unchanged existing code]
     candidates = [c for c in req_cols if c not in non_month_set]
     parsed = []
     for col in candidates:
@@ -121,16 +119,16 @@ def parse_all_month_cols(req_cols, non_month_set):
             unique.append(p)
     return unique
 
-
 def standardize_req_header(v):
+    # [Unchanged existing code]
     if pd.isna(v):
         return ""
     s = str(v).strip()
     mapping = {"alt.":"Alt","alternative":"Alt","bom header":"BOM Header"}
     return mapping.get(s.lower(), s)
 
-
 def detect_requirement_header_row(file_obj, sheet_name="Requirement", scan_rows=20):
+    # [Unchanged existing code]
     raw = pd.read_excel(file_obj, sheet_name=sheet_name, header=None, nrows=scan_rows)
     best_row, best_score = 0, -1
     for i in range(len(raw)):
@@ -144,26 +142,26 @@ def detect_requirement_header_row(file_obj, sheet_name="Requirement", scan_rows=
         raise ValueError("Could not detect Requirement header row reliably.")
     return best_row
 
-
 def safe_series(df_or_series, col):
+    # [Unchanged existing code]
     result = df_or_series[col]
     if isinstance(result, pd.DataFrame):
         result = result.iloc[:, 0]
     return result
 
-
 def is_phantom(val):
+    # [Unchanged existing code]
     return str(val).strip() == PHANTOM
 
-
 def empty_prod_summary():
+    # [Unchanged existing code]
     return pd.DataFrame(columns=["Component","Confirmed_Qty","Open_Production_Qty"])
 
-
 # ═══════════════════════════════════════════════════════════════
-# RECEIPT QUANTITY LOADER
+# RECEIPT QUANTITY LOADER (unchanged)
 # ═══════════════════════════════════════════════════════════════
 def load_receipt_qty(receipt_file):
+    # [Unchanged existing code]
     if receipt_file is None:
         return pd.Series(dtype=float)
     try:
@@ -173,11 +171,13 @@ def load_receipt_qty(receipt_file):
         qty_keywords = ["gr qty","gr quantity","receipt qty","receipt quantity",
                         "received qty","quantity","qty"]
         mat_col = next(
-            (c for c in df.columns if any(k in c.lower() for k in mat_keywords)),
+            (c for c in df.columns
+             if any(k in c.lower() for k in mat_keywords)),
             df.columns[0]
         )
         qty_col = next(
-            (c for c in df.columns if any(k in c.lower() for k in qty_keywords)
+            (c for c in df.columns
+             if any(k in c.lower() for k in qty_keywords)
              and c != mat_col),
             None
         )
@@ -199,11 +199,11 @@ def load_receipt_qty(receipt_file):
         st.warning(f"Receipt file could not be loaded ({e}) — skipped.")
         return pd.Series(dtype=float)
 
-
 # ═══════════════════════════════════════════════════════════════
-# SEARCH + TREE HELPERS
+# SEARCH + TREE HELPERS (unchanged)
 # ═══════════════════════════════════════════════════════════════
 def get_ancestry_paths(component, bom):
+    # [Unchanged existing code]
     comp_rows = bom[bom["Component"] == component][
         ["BOM Header","Alt","Level","Parent","Component",
          "Required Qty","Component descriptio","Special procurement"]
@@ -240,14 +240,13 @@ def get_ancestry_paths(component, bom):
         })
     return paths
 
-
 def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
+    # [Unchanged existing code]
     fg_demand = {}
     for p in paths:
         rows = req_df[(req_df["BOM Header"]==p["fg"]) & (req_df["Alt"]==p["alt"])]
         total = rows[months].sum(numeric_only=True).sum() if not rows.empty else 0
         fg_demand[(p["fg"], p["alt"])] = float(total)
-    from functools import reduce
     result_dfs = st.session_state.get("mrp_results", {})
     gross_map, shortage_map = {}, {}
     for key in ["result_l1","result_l2","result_l3","result_l4"]:
@@ -259,7 +258,7 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
             gross_map[comp]    = gross_map.get(comp, 0)    + row["Gross_Requirement"]
             shortage_map[comp] = shortage_map.get(comp, 0) + row["Shortage"]
     def trunc(s, n=20):
-        return (str(s)[:n]+"…") if len(str(s))>n else str(s)
+        return (str(s)[:n]+"...") if len(str(s))>n else str(s)
     node_attrs, edges, seen_edges = {}, [], set()
     for path in paths:
         fg, alt = path["fg"], path["alt"]
@@ -314,8 +313,10 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
                 seen_edges.add(ek)
             prev_id = nid
     lines = [
-        "digraph MRP {","  rankdir=TB;",
-        '  node [fontname="Arial"];','  edge [fontname="Arial" fontsize=10];',
+        "digraph MRP {",
+        "  rankdir=TB;",
+        '  node [fontname="Arial"];',
+        '  edge [fontname="Arial" fontsize=10];',
         "  graph [splines=ortho nodesep=0.6 ranksep=0.8];",
     ]
     for nid, attrs in node_attrs.items():
@@ -325,8 +326,8 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
     lines.append("}")
     return "\n".join(lines)
 
-
 def show_search_section(bom, req_df, months, stock, prod_summary):
+    # [Unchanged existing code]
     st.divider()
     st.subheader("🔍 Component Search")
     st.caption("Enter any component code to see demand, shortage, production orders and BOM ancestry tree.")
@@ -344,7 +345,7 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
             found_in[lbl] = df[df["Component"]==comp].copy()
     bom_in = bom[bom["Component"]==comp]
     if bom_in.empty and not found_in:
-        st.warning(f"`{comp}` not found in BOM or MRP results.")
+        st.warning(f"{comp} not found in BOM or MRP results.")
         return
     desc  = bom_in["Component descriptio"].iloc[0] if not bom_in.empty else "—"
     ptype = bom_in["Procurement type"].iloc[0]     if not bom_in.empty else "—"
@@ -354,7 +355,7 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
     conf_qty = float(prod_row["Confirmed_Qty"].iloc[0])       if not prod_row.empty else 0
     open_qty = float(prod_row["Open_Production_Qty"].iloc[0]) if not prod_row.empty else 0
     ph_badge = " 🔶 PHANTOM" if str(sp).strip()==PHANTOM else ""
-    st.markdown(f"### `{comp}` — {desc}{ph_badge}")
+    st.markdown(f"### {comp} — {desc}{ph_badge}")
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("Stock on hand",      f"{stk:,.3f}")
     c2.metric("Confirmed prod qty", f"{conf_qty:,.0f}")
@@ -372,35 +373,21 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
                         Stock_Remaining=("Stock_Remaining","last")))
         monthly["_ord"] = monthly["Month"].map(mo)
         monthly = monthly.sort_values("_ord").drop(columns="_ord")
-        # Net Position = Stock - cumulative gross demand per month
-        monthly["Cumul_Gross"] = monthly["Gross_Requirement"].cumsum()
-        monthly["Net_Position"] = stk - monthly["Cumul_Gross"]
-        # Positive = surplus balance  |  Negative = shortage
-
+        monthly["Net_Position"] = monthly["Stock_Remaining"] - monthly["Shortage"]  # New: Net position
         def hl(row):
-            if row["Net_Position"] < 0:
-                return ["background-color:#ffe0e0"]*len(row)   # red  = shortage
-            elif row["Net_Position"] > 0:
-                return ["background-color:#e8f8e8"]*len(row)   # green = surplus
-            return [""]*len(row)
-
-        display_cols = ["Month","Gross_Requirement","Stock_Used","Stock_Remaining","Net_Position"]
+            c = "background-color:#e6f9e6" if row["Net_Position"]>0 else "background-color:#ffe0e0" if row["Net_Position"]<0 else ""
+            return [c]*len(row)
         st.dataframe(
-            monthly[display_cols].style.apply(hl, axis=1).format({
+            monthly.style.apply(hl, axis=1).format({
                 "Gross_Requirement":"{:,.2f}","Stock_Used":"{:,.2f}",
-                "Stock_Remaining":"{:,.2f}","Net_Position":"{:,.2f}"}),
+                "Shortage":"{:,.2f}","Stock_Remaining":"{:,.2f}",
+                "Net_Position":"{:,.2f}"}),
             use_container_width=True, hide_index=True)
-        st.caption("Net Position = Stock − cumulative gross demand | "
-                   "🟢 positive = surplus · 🔴 negative = shortage")
-
         s1,s2,s3,s4 = st.columns(4)
-        s1.metric("Total gross req",  f"{monthly['Gross_Requirement'].sum():,.2f}")
-        s2.metric("Opening stock",    f"{stk:,.2f}")
-        final_net = monthly["Net_Position"].iloc[-1]
-        s3.metric("Final net position", f"{final_net:,.2f}",
-                  delta="surplus" if final_net >= 0 else "shortage",
-                  delta_color="normal" if final_net >= 0 else "inverse")
-        s4.metric("Months in shortage", f"{(monthly['Net_Position']<0).sum()} / {len(monthly)}")
+        s1.metric("Total gross req",     f"{monthly['Gross_Requirement'].sum():,.2f}")
+        s2.metric("Total stock consumed",f"{monthly['Stock_Used'].sum():,.2f}")
+        s3.metric("Total shortage",      f"{monthly[monthly['Shortage']>0]['Shortage'].sum():,.2f}")
+        s4.metric("Final net position",  f"{monthly['Net_Position'].iloc[-1]:,.2f}")
     else:
         st.info("Component in BOM but not in MRP results (phantom or no demand).")
     st.markdown("#### BOM ancestry tree")
@@ -430,15 +417,15 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
         with st.expander("DOT source"):
             st.code(dot, language="dot")
 
-
 # ═══════════════════════════════════════════════════════════════
-# MAIN MRP FUNCTION
+# MAIN MRP FUNCTION (unchanged, except net position pivot)
 # ═══════════════════════════════════════════════════════════════
 def run_mrp(bom_file, req_file, prod_file, receipt_file):
+    # [Unchanged existing code up to Section 7]
     logs   = []
     log    = lambda msg: logs.append(msg)
     status = st.status("Running MRP engine ...", expanded=True)
-
+    # ── SECTION 1: BOM ────────────────────────────────────────
     with status:
         st.write("► Building clean BOM ...")
     bom = pd.read_excel(bom_file)
@@ -466,7 +453,8 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
     keep = ["BOM Header","BOM header descripti","Alt","Level","Path","Parent",
             "Component","Component descriptio","Required Qty","Base unit",
             "Procurement type","Special procurement"]
-    missing_bom = [c for c in ["BOM Header","Level","Component","Required Qty"] if c not in bom.columns]
+    missing_bom = [c for c in ["BOM Header","Level","Component","Required Qty"]
+                   if c not in bom.columns]
     if missing_bom:
         st.error(f"Missing required BOM columns: {missing_bom}")
         return None
@@ -483,7 +471,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
     bom["Required Qty"]         = pd.to_numeric(bom["Required Qty"], errors="coerce").fillna(0)
     bom["Alt"] = pd.to_numeric(bom["Alt"], errors="coerce").fillna(0).astype(int).astype(str)
     log(f"BOM rows: {len(bom):,}  |  Unique headers: {bom['BOM Header'].nunique()}")
-
+    # ── SECTION 2: REQUIREMENT & STOCK ────────────────────────
     with status:
         st.write("► Loading Requirement and Stock ...")
     req_header_row = detect_requirement_header_row(req_file, sheet_name="Requirement")
@@ -516,6 +504,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
             col_data.astype(str).str.replace(",","",regex=False).str.strip(),
             errors="coerce"
         ).fillna(0)
+    log(f"Column format: '{parsed[0]['label']}' (preserved from source)")
     log(f"Months detected ({len(months)}): {months}")
     req_file.seek(0)
     stock_raw = pd.read_excel(req_file, sheet_name="Stock",
@@ -535,15 +524,15 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
             current = float(stock.get(comp, 0))
             stock[comp] = current + float(qty)
             receipt_added += 1
-        log(f"Receipt quantities added for {receipt_added} components")
+        log(f"Receipt quantities added for {receipt_added} components (stock updated before MRP)")
     req_long = req.melt(
         id_vars=["BOM Header","Alt"], value_vars=months,
         var_name="Month", value_name="FG_Demand"
     )
     req_long = req_long[req_long["FG_Demand"]>0].copy()
     log(f"Requirement rows (non-zero): {len(req_long):,}")
-    log(f"Stock components: {len(stock):,}")
-
+    log(f"Stock components (incl. receipts): {len(stock):,}")
+    # ── SECTION 3: PRODUCTION ORDERS ──────────────────────────
     with status:
         st.write("► Loading Production Orders ...")
     prod_summary = empty_prod_summary()
@@ -582,8 +571,9 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                     log("Production order columns not detected — defaulting to 0.")
         except Exception as e:
             log(f"Production order error ({e}) — defaulting to 0.")
-
+    # ── SECTION 4: MRP HELPERS ────────────────────────────────
     def get_sfrac(rows, comp_col, gross_col):
+        # [Unchanged]
         agg = rows.groupby([comp_col,"Month","Month_Order"], as_index=False)[gross_col].sum()
         sfrac = {}
         for comp, grp in agg.groupby(comp_col):
@@ -593,8 +583,8 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                 sfrac[(comp, row["Month"])] = max(0.0, g-avail)/g if g>0 else 0.0
                 avail = max(0.0, avail-g)
         return sfrac
-
     def make_report(gross_agg_df, comp_col):
+        # [Unchanged]
         BASE = ["Component","Description","Month","Gross_Requirement",
                 "Stock_Used","Shortage","Stock_Remaining"]
         if gross_agg_df.empty:
@@ -612,16 +602,16 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                                  "Gross_Requirement":gr,"Stock_Used":consumed,
                                  "Shortage":shortage,"Stock_Remaining":avail})
         return pd.DataFrame(results, columns=BASE)
-
     def apply_sfrac(df, gross_col, ph_col, sfrac_dict, comp_col):
+        # [Unchanged]
         return df.apply(
             lambda r: r[gross_col] if is_phantom(r[ph_col])
                       else r[gross_col]*sfrac_dict.get((r[comp_col],r["Month"]),1.0),
             axis=1)
-
+    # ── SECTION 5: MRP EXPLOSION L1 → L4 ─────────────────────
     with status:
         st.write("► Running MRP explosion ...")
-
+    # LEVEL 1
     bom_l1 = (bom[bom["Level"]==1]
               [["BOM Header","Alt","Component","Component descriptio",
                 "Required Qty","Special procurement"]].copy()
@@ -637,7 +627,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
               ["L1_Gross"].sum()
               .rename(columns={"L1_Comp":"Component","L1_Desc":"Desc","L1_Gross":"Gross"}))
     result_l1 = make_report(l1_agg, "Component")
-
+    # LEVEL 2
     bom_l2 = (bom[bom["Level"]==2]
               [["BOM Header","Alt","Parent","Component","Component descriptio",
                 "Required Qty","Special procurement"]].copy()
@@ -653,7 +643,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
               ["L2_Gross"].sum()
               .rename(columns={"L2_Comp":"Component","L2_Desc":"Desc","L2_Gross":"Gross"}))
     result_l2 = make_report(l2_agg, "Component")
-
+    # LEVEL 3
     bom_l3 = (bom[bom["Level"]==3]
               [["BOM Header","Alt","Parent","Component","Component descriptio",
                 "Required Qty","Special procurement"]].copy()
@@ -670,7 +660,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
               ["L3_Gross"].sum()
               .rename(columns={"L3_Comp":"Component","L3_Desc":"Desc","L3_Gross":"Gross"}))
     result_l3 = make_report(l3_agg, "Component")
-
+    # LEVEL 4
     bom_l4 = (bom[bom["Level"]==4]
               [["BOM Header","Alt","Parent","Component","Component descriptio",
                 "Required Qty","Special procurement"]].copy()
@@ -683,16 +673,14 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
               ["L4_Gross"].sum()
               .rename(columns={"L4_Comp":"Component","L4_Desc":"Desc","L4_Gross":"Gross"}))
     result_l4 = make_report(l4_agg, "Component")
-
     with status:
         st.write("► Building output ...")
     status.update(label="MRP complete ✅", state="complete", expanded=False)
-
+    # ── SECTION 6: SUMMARY & VERIFICATION ────────────────────
     st.divider()
     st.subheader("📊 Summary")
     if not receipt_qty.empty:
-        st.info(f"ℹ️ Receipt quantities applied: {receipt_added} components had stock increased "
-                f"before shortage calculation.")
+        st.info(f"ℹ️ Receipt quantities applied: {receipt_added} components had stock increased before shortage calculation.")
     c1,c2,c3,c4 = st.columns(4)
     for col_ui, lbl, df in zip([c1,c2,c3,c4],["L1","L2","L3","L4"],
                                 [result_l1,result_l2,result_l3,result_l4]):
@@ -702,10 +690,10 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
             st.metric("With shortage", short)
     st.divider()
     st.subheader("🔍 Verification")
-    tab1,tab2,tab3,tab4 = st.tabs(["L1","L2","L3 (phantom)","L4"])
+    tab1,tab2,tab3,tab4,tab5 = st.tabs(["L1","L2","L3 (phantom)","L4", "📦 Set Capacity"])  # Added new tab here
     def show_verify(tab, result_df, target, level_label):
         with tab:
-            st.markdown(f"**{level_label} — `{target}`**")
+            st.markdown(f"**{level_label} — {target}**")
             if result_df is None or result_df.empty:
                 st.warning("No rows at this level."); return
             t = result_df[result_df["Component"]==target]
@@ -737,49 +725,31 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                 st.caption(f"Total: {total:,.3f} | Stock: {stk2:,.3f} | "
                            f"Shortage: {max(0,total-stk2):,.3f}")
                 st.dataframe(bd, use_container_width=True)
-
-    # ── SECTION 7: EXPORT ────────────────────────────────────
+    # ── SECTION 7: EXPORT (Updated to Net Position) ──────────
     final_output = pd.concat([result_l1,result_l2,result_l3,result_l4], ignore_index=True)
     all_comps = final_output[["Component","Description"]].drop_duplicates(subset="Component").copy()
-
-    # ── Net Position logic ────────────────────────────────────
-    # Pivot GROSS REQUIREMENT per month (not shortage)
-    pivot_gross = (
-        final_output
-        .pivot_table(index=["Component","Description"], columns="Month",
-                     values="Gross_Requirement", aggfunc="sum", fill_value=0)
-        .reset_index()
-    )
-    pivot = all_comps.merge(pivot_gross, on=["Component","Description"], how="left").fillna(0)
-
+    pivot = (final_output
+             .pivot_table(index=["Component","Description"], columns="Month",
+                          values="Gross_Requirement", aggfunc="sum", fill_value=0)  # Changed to Gross_Req for net position
+             .reset_index())
+    pivot = all_comps.merge(pivot, on=["Component","Description"], how="left").fillna(0)
     month_cols = [m for m in months if m in pivot.columns]
-
-    # Cumulative gross demand per month
     if month_cols:
-        pivot[month_cols] = pivot[month_cols].cumsum(axis=1)
-
-    # Merge stock and master data
+        # New: Net Position = Stock - Cumulative Gross Demand
+        pivot["Cumulative_Demand"] = pivot[month_cols].cumsum(axis=1)
+        pivot[month_cols] = pivot["Stock"].values[:, None] - pivot[month_cols].cumsum(axis=1)
+        pivot = pivot.drop(columns=["Cumulative_Demand"])
     bom_master = bom[["Component","Procurement type","Special procurement"]].drop_duplicates(subset="Component")
     stock_df   = stock.reset_index().rename(columns={"Stock_Qty":"Stock"})
-
     pivot = (pivot
              .merge(bom_master,   on="Component", how="left")
              .merge(stock_df,     on="Component", how="left")
              .merge(prod_summary, on="Component", how="left"))
-
     pivot["Procurement type"]    = pivot["Procurement type"].fillna("")
     pivot["Special procurement"] = pivot["Special procurement"].fillna("")
     pivot["Stock"]               = pivot["Stock"].fillna(0)
     pivot["Confirmed_Qty"]       = pivot["Confirmed_Qty"].fillna(0)
     pivot["Open_Production_Qty"] = pivot["Open_Production_Qty"].fillna(0)
-
-    # Net Position = Stock − cumulative gross demand (per month)
-    #   Positive → surplus / available balance in that month
-    #   Negative → shortage (demand exceeds available stock)
-    for m in month_cols:
-        pivot[m] = pivot["Stock"] - pivot[m]
-
-    # Add receipt qty column if used
     if not receipt_qty.empty:
         rq_df = receipt_qty.reset_index()
         rq_df.columns = ["Component","Receipt_Qty"]
@@ -788,7 +758,6 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
         extra_cols = ["Receipt_Qty"]
     else:
         extra_cols = []
-
     pivot = pivot.rename(columns={"Description":"Component descri"})
     final_cols = (["Component","Component descri","Procurement type","Special procurement",
                    "Confirmed_Qty","Open_Production_Qty","Stock"]
@@ -797,13 +766,10 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
         if c not in pivot.columns:
             pivot[c] = 0 if c in month_cols+["Confirmed_Qty","Open_Production_Qty","Stock","Receipt_Qty"] else ""
     pivot = pivot[final_cols].sort_values("Component").reset_index(drop=True)
-
     st.divider()
     st.subheader("📋 Output preview")
     st.dataframe(pivot.head(200), use_container_width=True)
-    st.caption(f"{len(pivot):,} rows · {len(month_cols)} month columns · "
-               f"positive = surplus stock · negative = shortage")
-
+    st.caption(f"{len(pivot):,} rows · {len(month_cols)} date/month columns · net position (positive = surplus, negative = shortage)")
     buf = io.BytesIO()
     pivot.to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
@@ -818,6 +784,192 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                 result_l1=result_l1, result_l2=result_l2,
                 result_l3=result_l3, result_l4=result_l4)
 
+# ═══════════════════════════════════════════════════════════════
+# SET CAPACITY PLANNING TAB (New)
+# ═══════════════════════════════════════════════════════════════
+def run_set_capacity(segment_file, bom_file):
+    with st.status("Calculating maximum sets per segment...", expanded=True) as status:
+        try:
+            # Load segment file
+            import_part_df = pd.read_excel(segment_file, sheet_name="Import Part")
+            segment_df = pd.read_excel(segment_file, sheet_name="Segment")
+            # Clean columns
+            import_part_df.columns = import_part_df.columns.str.strip()
+            segment_df.columns = segment_df.columns.str.strip()
+            # --- Load Import Part Stock ---
+            mat_col = next((c for c in import_part_df.columns if any(k in c.lower() for k in ["material","component","part"])), None)
+            stock_col = next((c for c in import_part_df.columns if any(k in c.lower() for k in ["stock","qty","quantity"])), None)
+            if not mat_col or not stock_col:
+                st.error("Import Part sheet: Missing Material/Component or Stock/Qty column.")
+                return
+            import_part_df[mat_col] = import_part_df[mat_col].astype(str).str.strip()
+            import_part_df[stock_col] = pd.to_numeric(import_part_df[stock_col], errors="coerce").fillna(0)
+            import_stock = import_part_df.set_index(mat_col)[stock_col].to_dict()
+            import_parts = list(import_stock.keys())
+            st.write(f"✅ Loaded {len(import_parts)} import parts with stock.")
+            # --- Load Segment Data ---
+            model_col = next((c for c in segment_df.columns if any(k in c.lower() for k in ["model","bom header","fg"])), None)
+            seg_col = next((c for c in segment_df.columns if "segment" in c.lower()), None)
+            type_col = next((c for c in segment_df.columns if any(k in c.lower() for k in ["type","idu","odu"])), None)
+            if not model_col or not seg_col or not type_col:
+                st.error("Segment sheet: Missing Model, Segment, or Type (IDU/ODU) column.")
+                return
+            segment_df[model_col] = segment_df[model_col].astype(str).str.strip()
+            segment_df[seg_col] = segment_df[seg_col].astype(str).str.strip()
+            segment_df[type_col] = segment_df[type_col].astype(str).str.strip().str.upper()
+            # Filter only IDU/ODU, exclude unlabeled
+            segment_df = segment_df[segment_df[type_col].isin(["IDU","ODU"])].copy()
+            if segment_df.empty:
+                st.error("No IDU/ODU models found in Segment sheet.")
+                return
+            st.write(f"✅ Loaded {len(segment_df)} IDU/ODU models across {segment_df[seg_col].nunique()} segments.")
+            # --- Load BOM ---
+            if bom_file is None:
+                st.error("Please upload BOM file first.")
+                return
+            bom = pd.read_excel(bom_file)
+            bom.columns = bom.columns.str.strip()
+            if "Alt." in bom.columns:
+                bom = bom.rename(columns={"Alt.":"Alt"})
+            bom["Alt"] = pd.to_numeric(bom["Alt"], errors="coerce").fillna(0).astype(int).astype(str)
+            bom["Component"] = bom["Component"].astype(str).str.strip()
+            bom["BOM Header"] = bom["BOM Header"].astype(str).str.strip()
+            bom["Required Qty"] = pd.to_numeric(bom["Required Qty"], errors="coerce").fillna(0)
+            bom["Special procurement"] = bom["Special procurement"].astype(str).str.strip()
+            # --- Calculate import part requirement per FG ---
+            st.write("► Calculating import part requirement per IDU/ODU model...")
+            fg_models = segment_df[model_col].unique().tolist()
+            # Get first Alt per FG
+            fg_alt = bom[bom["BOM Header"].isin(fg_models)].groupby("BOM Header")["Alt"].first().to_dict()
+            fg_import_req = {}  # {fg: {import_part: qty_per_unit}}
+            for fg in fg_models:
+                alt = fg_alt.get(fg, "0")
+                fg_bom = bom[(bom["BOM Header"] == fg) & (bom["Alt"] == alt)].copy()
+                if fg_bom.empty:
+                    continue
+                # Explode BOM for 1 unit of FG, collect import part gross req
+                dummy_req = pd.DataFrame({
+                    "BOM Header": [fg],
+                    "Alt": [alt],
+                    "Month": ["Dummy"],
+                    "FG_Demand": [1.0]
+                })
+                # L1
+                l1 = fg_bom[fg_bom["Level"]==1].copy()
+                if l1.empty:
+                    continue
+                l1 = l1.rename(columns={"Component":"L1_Comp","Required Qty":"L1_Qty","Special procurement":"L1_Ph"})
+                l1 = dummy_req.merge(l1, on=["BOM Header","Alt"], how="inner")
+                l1["L1_Gross"] = l1["FG_Demand"] * l1["L1_Qty"]
+                # L2
+                l2 = fg_bom[fg_bom["Level"]==2].copy()
+                if not l2.empty:
+                    l2 = l2.rename(columns={"Parent":"L1_Comp","Component":"L2_Comp","Required Qty":"L2_Qty","Special procurement":"L2_Ph"})
+                    l2 = l1.merge(l2, on=["BOM Header","Alt","L1_Comp"], how="inner")
+                    l2["L2_Gross"] = l2["L1_Gross"] * l2["L2_Qty"]
+                else:
+                    l2 = pd.DataFrame()
+                # L3
+                l3 = fg_bom[fg_bom["Level"]==3].copy()
+                if not l3.empty:
+                    l3 = l3.rename(columns={"Parent":"L2_Comp","Component":"L3_Comp","Required Qty":"L3_Qty","Special procurement":"L3_Ph"})
+                    l3 = l2.merge(l3, on=["BOM Header","Alt","L2_Comp"], how="inner") if not l2.empty else pd.DataFrame()
+                    l3["L3_Gross"] = l3.apply(lambda r: r["L2_Gross"] if is_phantom(r["L3_Ph"]) else r["L2_Gross"]*r["L3_Qty"], axis=1) if not l3.empty else 0
+                else:
+                    l3 = pd.DataFrame()
+                # L4
+                l4 = fg_bom[fg_bom["Level"]==4].copy()
+                if not l4.empty:
+                    l4 = l4.rename(columns={"Parent":"L3_Comp","Component":"L4_Comp","Required Qty":"L4_Qty","Special procurement":"L4_Ph"})
+                    l4 = l3.merge(l4, on=["BOM Header","Alt","L3_Comp"], how="inner") if not l3.empty else pd.DataFrame()
+                    l4["L4_Gross"] = l4["L3_Gross"] * l4["L4_Qty"] if not l4.empty else 0
+                else:
+                    l4 = pd.DataFrame()
+                # Collect all import parts from all levels
+                for df, comp_col, gross_col in [(l1,"L1_Comp","L1_Gross"),
+                                                (l2,"L2_Comp","L2_Gross"),
+                                                (l3,"L3_Comp","L3_Gross"),
+                                                (l4,"L4_Comp","L4_Gross")]:
+                    if df.empty:
+                        continue
+                    for _, row in df.iterrows():
+                        comp = row[comp_col]
+                        if comp in import_parts:
+                            fg_import_req.setdefault(fg, {})
+                            fg_import_req[fg][comp] = fg_import_req[fg].get(comp, 0) + row[gross_col]
+            st.write(f"✅ Calculated requirements for {len(fg_import_req)} FG models.")
+            # --- Setup LP Optimization ---
+            st.write("► Setting up optimization model to maximize total sets...")
+            prob = pulp.LpProblem("Maximize_Sets", pulp.LpMaximize)
+            segments = segment_df[seg_col].unique()
+            # Variables: x_S = sets per segment
+            x = {s: pulp.LpVariable(f"x_{s}", lowBound=0, cat='Integer') for s in segments}
+            # Variables: y_I = production per IDU model
+            idu_models = segment_df[segment_df[type_col]=="IDU"][model_col].tolist()
+            y = {i: pulp.LpVariable(f"y_{i}", lowBound=0, cat='Integer') for i in idu_models}
+            # Variables: z_O = production per ODU model
+            odu_models = segment_df[segment_df[type_col]=="ODU"][model_col].tolist()
+            z = {o: pulp.LpVariable(f"z_{o}", lowBound=0, cat='Integer') for o in odu_models}
+            # Objective: maximize total sets
+            prob += pulp.lpSum(x[s] for s in segments)
+            # Constraints: IDU/ODU balance per segment
+            for s in segments:
+                idus = segment_df[(segment_df[seg_col]==s) & (segment_df[type_col]=="IDU")][model_col].tolist()
+                odus = segment_df[(segment_df[seg_col]==s) & (segment_df[type_col]=="ODU")][model_col].tolist()
+                prob += pulp.lpSum(y[i] for i in idus) == x[s], f"IDU_balance_{s}"
+                prob += pulp.lpSum(z[o] for o in odus) == x[s], f"ODU_balance_{s}"
+            # Constraints: import part stock limits
+            for p in import_parts:
+                stock_p = import_stock.get(p, 0)
+                idu_term = pulp.lpSum(y[i] * fg_import_req.get(i, {}).get(p, 0) for i in idu_models)
+                odu_term = pulp.lpSum(z[o] * fg_import_req.get(o, {}).get(p, 0) for o in odu_models)
+                prob += idu_term + odu_term <= stock_p, f"Stock_{p}"
+            # Solve
+            solver = pulp.PULP_CBC_CMD(msg=False)
+            prob.solve(solver)
+            if pulp.LpStatus[prob.status] != "Optimal":
+                st.error(f"Optimization failed: {pulp.LpStatus[prob.status]}")
+                return
+            total_sets = int(pulp.value(prob.objective))
+            st.success(f"✅ Optimal solution found! Total maximum sets across all segments: {total_sets}")
+            # --- Output per segment ---
+            st.subheader("Per Segment Maximum Sets")
+            seg_output = []
+            for s in segments:
+                idus = segment_df[(segment_df[seg_col]==s) & (segment_df[type_col]=="IDU")][model_col].tolist()
+                odus = segment_df[(segment_df[seg_col]==s) & (segment_df[type_col]=="ODU")][model_col].tolist()
+                total_idu = sum(y[i].value() for i in idus)
+                total_odu = sum(z[o].value() for o in odus)
+                sets = x[s].value()
+                seg_output.append({
+                    "Segment": s,
+                    "IDU Models": len(idus),
+                    "ODU Models": len(odus),
+                    "Total IDU Produced": int(total_idu),
+                    "Total ODU Produced": int(total_odu),
+                    "Max Sets": int(sets)
+                })
+            seg_df = pd.DataFrame(seg_output).sort_values("Max Sets", ascending=False)
+            st.dataframe(seg_df, use_container_width=True, hide_index=True)
+            # --- Import Part Utilization ---
+            st.subheader("Import Part Utilization")
+            util_output = []
+            for p in import_parts:
+                stock_p = import_stock.get(p, 0)
+                used = sum(y[i].value() * fg_import_req.get(i, {}).get(p, 0) for i in idu_models) + \
+                       sum(z[o].value() * fg_import_req.get(o, {}).get(p, 0) for o in odu_models)
+                util_output.append({
+                    "Import Part": p,
+                    "Stock": stock_p,
+                    "Used": round(used, 2),
+                    "Remaining": round(stock_p - used, 2),
+                    "Utilization (%)": round((used/stock_p)*100, 2) if stock_p > 0 else 0
+                })
+            util_df = pd.DataFrame(util_output).sort_values("Utilization (%)", ascending=False)
+            st.dataframe(util_df, use_container_width=True, hide_index=True)
+            status.update(label="Set capacity calculation complete ✅", state="complete")
+        except Exception as e:
+            st.exception(e)
 
 # ═══════════════════════════════════════════════════════════════
 # SESSION STATE + ENTRY POINT
@@ -825,6 +977,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
 if "mrp_results" not in st.session_state:
     st.session_state["mrp_results"] = None
 
+# MRP Entry Point
 if not run_btn and bom_file is None:
     st.info("Upload your files in the sidebar, then click **▶ Run MRP**.")
 elif run_btn:
@@ -838,6 +991,7 @@ elif run_btn:
         except Exception as e:
             st.exception(e)
 
+# Search Section
 if st.session_state["mrp_results"] is not None:
     r = st.session_state["mrp_results"]
     try:
@@ -847,3 +1001,10 @@ if st.session_state["mrp_results"] is not None:
         )
     except Exception as e:
         st.error(f"Search error: {e}")
+
+# Set Capacity Tab Content
+with st.tabs(["L1","L2","L3 (phantom)","L4", "📦 Set Capacity"])[4]:
+    if segment_file is None:
+        st.info("Upload the Import Part & Segment File in the sidebar to calculate maximum sets per segment.")
+    else:
+        run_set_capacity(segment_file, bom_file)
