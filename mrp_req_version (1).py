@@ -405,36 +405,54 @@ def load_segment_import(seg_imp_file):
     xl     = pd.ExcelFile(seg_imp_file)
     sheets = xl.sheet_names
 
+    # ── Import Part List sheet ────────────────────────────────────
+    # Columns: Component | RM Group | Source
     imp_sheet = next((s for s in sheets if "import" in s.lower()), sheets[0])
     imp_df    = pd.read_excel(seg_imp_file, sheet_name=imp_sheet, header=0)
     imp_df.columns = [str(c).strip() for c in imp_df.columns]
 
-    # Component column = first col; RM Group = second col if present
     comp_col = imp_df.columns[0]
     imp_df[comp_col] = imp_df[comp_col].astype(str).str.strip()
 
-    rm_col = next((c for c in imp_df.columns if "rm" in c.lower() or "group" in c.lower()), None)
+    rm_col = next((c for c in imp_df.columns
+                   if "rm" in c.lower() or "group" in c.lower()), None)
     if rm_col:
         imp_df[rm_col] = imp_df[rm_col].astype(str).str.strip()
-        rm_map = dict(zip(imp_df[comp_col], imp_df[rm_col]))  # {component: rm_group}
+        rm_map = dict(zip(imp_df[comp_col], imp_df[rm_col]))
     else:
         rm_map = {}
 
     import_parts = sorted(imp_df[comp_col].dropna().unique())
 
-    seg_sheet = next((s for s in sheets if "seg" in s.lower()), sheets[min(1, len(sheets)-1)])
+    # ── Segment sheet ─────────────────────────────────────────────
+    # Columns: Segment | FG code | IDU | COMPATIBLE ODU
+    # • IDU  is UNIQUE  — each FG has its own dedicated IDU
+    # • ODU  is COMMON  — multiple FGs can share the same ODU model
+    # Each row = one FG product with its specific IDU and compatible ODU.
+    seg_sheet = next((s for s in sheets if "seg" in s.lower()),
+                     sheets[min(1, len(sheets) - 1)])
     seg_df    = pd.read_excel(seg_imp_file, sheet_name=seg_sheet, header=0)
     seg_df.columns = [str(c).strip() for c in seg_df.columns]
-    seg_df = seg_df.rename(columns={seg_df.columns[0]:"Code", seg_df.columns[1]:"Segment"})
-    seg_df["Code"]    = seg_df["Code"].astype(str).str.strip()
-    seg_df["Segment"] = seg_df["Segment"].astype(str).str.strip()
 
-    seg_df["Unit_Type"] = "OTHER"
-    seg_df.loc[seg_df["Segment"].str.contains("IDU", case=False), "Unit_Type"] = "IDU"
-    seg_df.loc[seg_df["Segment"].str.contains("ODU", case=False), "Unit_Type"] = "ODU"
-    seg_df["PairKey"] = (seg_df["Segment"]
-        .str.replace("-IDU","",regex=False).str.replace("-ODU","",regex=False)
-        .str.replace(" IDU","",regex=False).str.replace(" ODU","",regex=False).str.strip())
+    # Map positional columns to fixed internal names
+    col_map = {seg_df.columns[0]: "Segment",
+               seg_df.columns[1]: "FG_Code",
+               seg_df.columns[2]: "IDU"}
+    if len(seg_df.columns) >= 4:
+        col_map[seg_df.columns[3]] = "Compatible_ODU"
+    seg_df = seg_df.rename(columns=col_map)
+    if "Compatible_ODU" not in seg_df.columns:
+        seg_df["Compatible_ODU"] = ""
+
+    for c in ("Segment", "FG_Code", "IDU", "Compatible_ODU"):
+        seg_df[c] = seg_df[c].astype(str).str.strip()
+
+    # Drop rows that are blank / NaN in key columns
+    seg_df = seg_df[
+        seg_df["Segment"].notna() & (seg_df["Segment"] != "") & (seg_df["Segment"] != "nan") &
+        seg_df["FG_Code"].notna() & (seg_df["FG_Code"] != "") & (seg_df["FG_Code"] != "nan") &
+        seg_df["IDU"].notna()     & (seg_df["IDU"]     != "") & (seg_df["IDU"]     != "nan")
+    ].copy().reset_index(drop=True)
 
     return import_parts, seg_df, rm_map
 
@@ -473,9 +491,29 @@ def explode_bom_for_seg(bom_header, bom_df, target_set, phantom=None):
 
 def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
     """
-    Run segment production capacity calculation.
-    Uses BOM and stock already loaded from the MRP run.
-    Returns result dict.
+    Segment production capacity — FG-level LP.
+
+    Data model (from Excel):
+        Segment | FG_Code | IDU (unique per FG) | Compatible_ODU (shared pool)
+
+    One LP variable per FG code  →  x[fg] = number of sets to produce.
+
+    Material constraints:
+        • IDU parts  : unique per FG  → each FG's IDU BOM contributes independently
+        • ODU parts  : shared pool    → all FGs that use the same ODU compete for
+                                        the same ODU import-part stock
+
+    Constraint per import part p:
+        Σ_fg  IDU_req[p, fg] × x[fg]
+      + Σ_odu ODU_req[p, odu] × (Σ_{fg using odu} x[fg])   ≤  stock[p]
+
+    Which simplifies to:
+        Σ_fg  (IDU_req[p, fg] + ODU_req[p, odu(fg)]) × x[fg]  ≤  stock[p]
+
+    Because ODU_req[p, odu] is the same for every FG that uses that ODU,
+    the combined coefficient per FG is simply IDU_part_qty + ODU_part_qty —
+    and two FGs sharing the same ODU naturally compete for ODU stock through
+    their shared ODU coefficient in the same constraint row.
     """
     status = st.status("Running Segment Capacity calculation ...", expanded=True)
 
@@ -483,57 +521,157 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
         st.write("► Loading Segment and Import Part data ...")
     import_parts, seg_df, rm_map = load_segment_import(seg_imp_file)
 
-    # Filter import parts to only active RM groups
-    # If no RM group data or all groups selected, use all parts
+    # Filter import parts by active RM groups
     all_rm_groups = sorted(set(rm_map.values())) if rm_map else []
     if active_rm_groups is None:
         active_rm_groups = all_rm_groups
     if rm_map and active_rm_groups:
         import_parts = [p for p in import_parts
                         if rm_map.get(p, "Unknown") in active_rm_groups]
-    target_set = set(import_parts)
+    target_set  = set(import_parts)
     bom_headers = set(bom["BOM Header"].unique())
 
     with status:
-        st.write("► Exploding BOM for each IDU / ODU model ...")
-    models_df  = seg_df[seg_df["Unit_Type"].isin(["IDU","ODU"])]
-    model_reqs = {}
+        st.write("► Exploding BOM for every IDU and ODU ...")
+
+    # ── Explode IDU BOMs (unique per FG) ──────────────────────────
+    idu_reqs  = {}   # {idu_code: {part: qty}}
     not_in_bom = []
-    for _, row in models_df.iterrows():
-        code = row["Code"]
-        if code in bom_headers:
-            model_reqs[code] = explode_bom_for_seg(code, bom, target_set)
+    for idu in seg_df["IDU"].unique():
+        if idu in bom_headers:
+            idu_reqs[idu] = explode_bom_for_seg(idu, bom, target_set)
         else:
-            not_in_bom.append(code)
+            not_in_bom.append(f"IDU {idu}")
+
+    # ── Explode ODU BOMs (shared pool — explode once per unique ODU) ─
+    odu_reqs = {}    # {odu_code: {part: qty}}
+    for odu in seg_df["Compatible_ODU"].unique():
+        if not odu or odu == "nan":
+            continue
+        if odu in bom_headers:
+            odu_reqs[odu] = explode_bom_for_seg(odu, bom, target_set)
+        else:
+            not_in_bom.append(f"ODU {odu}")
 
     if not_in_bom:
-        st.warning(f"Models not in BOM (excluded): {', '.join(not_in_bom)}")
+        st.warning(f"Not found in BOM (excluded): {', '.join(sorted(set(not_in_bom)))}")
 
     with status:
-        st.write("► Building segment requirements ...")
-    segments_data, skipped_segs = {}, []
+        st.write("► Building FG-level combined requirements ...")
 
-    for segment, grp in models_df.groupby("PairKey"):
-        idu_codes = grp[grp["Unit_Type"]=="IDU"]["Code"].tolist()
-        odu_codes = grp[grp["Unit_Type"]=="ODU"]["Code"].tolist()
-        if not idu_codes or not odu_codes:
-            skipped_segs.append(f"{segment} (missing {'ODU' if not odu_codes else 'IDU'})")
+    # ── Per-FG combined requirement ────────────────────────────────
+    # combined[fg][part] = IDU_qty[part] + ODU_qty[part]
+    # ODU parts shared: two FGs with same ODU both carry ODU_qty in their
+    # coefficient → the LP constraint automatically limits total ODU consumption.
+    fg_list        = []   # ordered list of FG codes (LP variable order)
+    fg_segment     = {}   # fg → segment name
+    fg_idu         = {}   # fg → IDU code
+    fg_odu         = {}   # fg → ODU code
+    fg_combined    = {}   # fg → {part: qty_per_set}
+    skipped_segs   = []
+
+    for _, row in seg_df.iterrows():
+        fg  = row["FG_Code"]
+        seg = row["Segment"]
+        idu = row["IDU"]
+        odu = row["Compatible_ODU"]
+
+        if not odu or odu == "nan":
+            skipped_segs.append(f"{fg} ({seg}): no compatible ODU")
             continue
-        idu_reqs = [model_reqs[c] for c in idu_codes if c in model_reqs and model_reqs[c]]
-        odu_reqs = [model_reqs[c] for c in odu_codes if c in model_reqs and model_reqs[c]]
-        if not idu_reqs or not odu_reqs:
-            skipped_segs.append(f"{segment} (no BOM data)")
+
+        idu_req = idu_reqs.get(idu, {})
+        odu_req = odu_reqs.get(odu, {})
+
+        if not idu_req and not odu_req:
+            skipped_segs.append(f"{fg} ({seg}): no import parts in BOM for IDU {idu} or ODU {odu}")
             continue
-        all_parts = set()
-        for r in idu_reqs + odu_reqs:
-            all_parts.update(r.keys())
-        combined = {}
-        for p in all_parts:
-            total = (max((r.get(p,0) for r in idu_reqs), default=0) +
-                     max((r.get(p,0) for r in odu_reqs), default=0))
-            if total > 0:
-                combined[p] = total
-        segments_data[segment] = {
+
+        # Combine: additive because 1 set needs 1 IDU's parts + 1 ODU's parts
+        all_parts = set(idu_req) | set(odu_req)
+        combined  = {p: idu_req.get(p, 0) + odu_req.get(p, 0)
+                     for p in all_parts
+                     if idu_req.get(p, 0) + odu_req.get(p, 0) > 0}
+
+        fg_list.append(fg)
+        fg_segment[fg]  = seg
+        fg_idu[fg]      = idu
+        fg_odu[fg]      = odu
+        fg_combined[fg] = combined
+
+    if not fg_list:
+        st.error("No FG codes with valid BOM data found. Check IDU/ODU codes against BOM.")
+        return None
+
+    with status:
+        st.write(f"► Running LP optimisation across {len(fg_list)} FG codes ...")
+
+    n_fg = len(fg_list)
+
+    # Build LP constraint matrix  A × x ≤ b
+    # One row per import part that appears in at least one FG's combined req
+    constrained_parts, A_rows, b_rows = [], [], []
+    for p in import_parts:
+        row_vec = [fg_combined[fg].get(p, 0) for fg in fg_list]
+        if any(v > 0 for v in row_vec):
+            constrained_parts.append(p)
+            A_rows.append(row_vec)
+            b_rows.append(float(stock.get(p, 0)))
+
+    A   = np.array(A_rows, dtype=float)
+    b   = np.array(b_rows, dtype=float)
+    c   = -np.ones(n_fg)          # maximise Σ x[fg]
+
+    res = linprog(c, A_ub=A, b_ub=b,
+                  bounds=[(0, None)] * n_fg,
+                  method="highs")
+
+    if res.status not in (0, 1):
+        st.error(f"LP did not converge: {res.message}")
+        return None
+
+    alloc_float = res.x
+    alloc_int   = np.floor(alloc_float).astype(int)
+    total_sets  = int(alloc_int.sum())
+
+    # ── FG-level results ──────────────────────────────────────────
+    fg_results = []
+    for fg, qty in zip(fg_list, alloc_int):
+        creq = fg_combined[fg]
+        lim_part, lim_ratio = "—", float("inf")
+        for p, req in creq.items():
+            if req > 0:
+                ratio = float(stock.get(p, 0)) / req
+                if ratio < lim_ratio:
+                    lim_ratio, lim_part = ratio, p
+        fg_results.append({
+            "Segment":        fg_segment[fg],
+            "FG_Code":        fg,
+            "IDU":            fg_idu[fg],
+            "Compatible_ODU": fg_odu[fg],
+            "Max_Sets":       int(qty),
+            "Limiting_Part":  lim_part,
+            "Limiting_Stock": int(stock.get(lim_part, 0)) if lim_part != "—" else 0,
+            "combined_req":   creq,
+        })
+
+    # ── Segment-level aggregation ─────────────────────────────────
+    seg_totals = defaultdict(int)
+    seg_fg_map = defaultdict(list)   # segment → list of fg result dicts
+    for fgr in fg_results:
+        seg_totals[fgr["Segment"]] += fgr["Max_Sets"]
+        seg_fg_map[fgr["Segment"]].append(fgr)
+
+    # segments_data kept for backward compat with display helpers
+    segments_data = {}
+    for seg, fgrs in seg_fg_map.items():
+        idu_codes = list({f["IDU"] for f in fgrs})
+        odu_codes = list({f["Compatible_ODU"] for f in fgrs})
+        # combined_req at segment level = worst-case across FGs (for display only)
+        all_parts = set(p for f in fgrs for p in f["combined_req"])
+        combined  = {p: max(f["combined_req"].get(p, 0) for f in fgrs)
+                     for p in all_parts}
+        segments_data[seg] = {
             "combined_req": combined,
             "idu_codes":    idu_codes,
             "odu_codes":    odu_codes,
@@ -541,51 +679,38 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
             "odu_count":    len(odu_codes),
         }
 
-    if not segments_data:
-        st.error("No segments with valid IDU+ODU BOM data found.")
-        return None
+    segs          = list(segments_data.keys())
+    seg_alloc_arr = np.array([seg_totals[s] for s in segs], dtype=int)
 
-    with status:
-        st.write("► Running LP optimisation (maximise total sets) ...")
-    segs  = list(segments_data.keys())
-    n_seg = len(segs)
-
-    constrained_parts, A_rows, b_rows = [], [], []
-    for p in import_parts:
-        row = [segments_data[s]["combined_req"].get(p,0) for s in segs]
-        if any(v>0 for v in row):
-            constrained_parts.append(p)
-            A_rows.append(row)
-            b_rows.append(float(stock.get(p,0)))
-
-    A   = np.array(A_rows, dtype=float)
-    b   = np.array(b_rows, dtype=float)
-    c   = -np.ones(n_seg)
-    res = linprog(c, A_ub=A, b_ub=b, bounds=[(0,None)]*n_seg, method="highs")
-
-    if res.status not in (0, 1):
-        st.error(f"LP did not converge: {res.message}")
-        return None
-
-    alloc_int  = np.floor(res.x).astype(int)
-    total_sets = int(alloc_int.sum())
-
+    # ── Part utilisation ──────────────────────────────────────────
     part_usage = {}
-    for p, row, avail in zip(constrained_parts, A_rows, b_rows):
-        used = sum(row[j]*alloc_int[j] for j in range(n_seg))
-        part_usage[p] = {"stock":avail,"used":used,
-                         "remain":max(0,avail-used),
-                         "pct":round(100*used/avail,1) if avail>0 else 0}
+    for p, row_vec, avail in zip(constrained_parts, A_rows, b_rows):
+        used = sum(row_vec[j] * alloc_int[j] for j in range(n_fg))
+        part_usage[p] = {
+            "stock":  avail,
+            "used":   used,
+            "remain": max(0, avail - used),
+            "pct":    round(100 * used / avail, 1) if avail > 0 else 0,
+        }
 
     with status:
         st.write("► Done.")
     status.update(label="Segment Capacity complete ✅", state="complete", expanded=False)
 
-    return dict(segs=segs, alloc_int=alloc_int, total_sets=total_sets,
-                segments_data=segments_data, import_parts=import_parts,
-                constrained_parts=constrained_parts, part_usage=part_usage,
-                stock=stock, skipped_segs=skipped_segs,
-                rm_map=rm_map, active_rm_groups=active_rm_groups)
+    return dict(
+        segs=segs,
+        alloc_int=seg_alloc_arr,
+        total_sets=total_sets,
+        segments_data=segments_data,
+        fg_results=fg_results,           # ← FG-level detail (new)
+        import_parts=import_parts,
+        constrained_parts=constrained_parts,
+        part_usage=part_usage,
+        stock=stock,
+        skipped_segs=skipped_segs,
+        rm_map=rm_map,
+        active_rm_groups=active_rm_groups,
+    )
 
 
 def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
@@ -596,97 +721,148 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
     part_usage    = r["part_usage"]
     stock         = r["stock"]
     import_parts  = r["import_parts"]
-
-    st.divider()
-    m1,m2,m3 = st.columns(3)
-    m1.metric("Total sets (all segments)", f"{total_sets:,}")
-    m2.metric("Segments with production",  f"{(alloc_int>0).sum()} / {len(segs)}")
-    m3.metric("Import parts constrained",  f"{len(r['constrained_parts'])}")
-
-    # ── RM Group filter ─────────────────────────────────────────────
+    fg_results    = r.get("fg_results", [])
     rm_map        = r.get("rm_map", {})
     active_groups = r.get("active_rm_groups", [])
     all_rm_groups = sorted(set(rm_map.values())) if rm_map else []
 
+    st.divider()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total FG sets producible",   f"{total_sets:,}")
+    m2.metric("FG codes with production",   f"{sum(1 for f in fg_results if f['Max_Sets'] > 0)} / {len(fg_results)}")
+    m3.metric("Segments with production",   f"{(alloc_int > 0).sum()} / {len(segs)}")
+    m4.metric("Import parts constrained",   f"{len(r['constrained_parts'])}")
+
+    # ── RM Group filter ───────────────────────────────────────────
     if all_rm_groups:
         st.divider()
         st.subheader("🔩 RM Group Filter")
-        st.caption(
-            "Uncheck a group to exclude those import parts from the constraint. "
-            "Click **Apply filter** to recalculate."
-        )
+        st.caption("Uncheck a group to exclude those import parts from the constraint. "
+                   "Click **Apply filter** to recalculate.")
         cols = st.columns(min(len(all_rm_groups), 5))
         selected_groups = []
         for i, grp in enumerate(all_rm_groups):
             with cols[i % len(cols)]:
-                checked = st.checkbox(
-                    grp,
-                    value=(grp in active_groups),
-                    key=f"rm_chk_{grp}"
-                )
-                if checked:
+                if st.checkbox(grp, value=(grp in active_groups), key=f"rm_chk_{grp}"):
                     selected_groups.append(grp)
 
-        apply_filter = st.button("🔄 Apply filter", type="primary")
-        if apply_filter and seg_imp_file is not None and bom is not None:
-            with st.spinner("Recalculating with selected RM groups ..."):
-                new_result = run_segment_capacity(
-                    bom, stock, seg_imp_file,
-                    active_rm_groups=selected_groups
-                )
-                if new_result is not None:
-                    st.session_state["seg_results"] = new_result
-                    st.rerun()
+        if st.button("🔄 Apply filter", type="primary"):
+            if seg_imp_file is not None and bom is not None:
+                with st.spinner("Recalculating with selected RM groups ..."):
+                    new_result = run_segment_capacity(
+                        bom, stock, seg_imp_file, active_rm_groups=selected_groups)
+                    if new_result is not None:
+                        st.session_state["seg_results"] = new_result
+                        st.rerun()
 
-        # Show which parts are currently excluded
         excluded_parts = [p for p, g in rm_map.items() if g not in active_groups]
         if excluded_parts:
             with st.expander(f"ℹ️ {len(excluded_parts)} import parts currently EXCLUDED"):
-                excl_df = pd.DataFrame([
-                    {"Component": p, "RM Group": rm_map[p]}
-                    for p in excluded_parts
-                ]).sort_values("RM Group")
+                excl_df = pd.DataFrame(
+                    [{"Component": p, "RM Group": rm_map[p]} for p in excluded_parts]
+                ).sort_values("RM Group")
                 st.dataframe(excl_df, use_container_width=True, hide_index=True)
 
     if r["skipped_segs"]:
-        with st.expander(f"⚠️ {len(r['skipped_segs'])} segments skipped"):
+        with st.expander(f"⚠️ {len(r['skipped_segs'])} FGs skipped"):
             for s in r["skipped_segs"]:
                 st.text(f"  • {s}")
 
-    # ── Sets per segment table ─────────────────────────────────
-    st.subheader("📊 Sets producible per segment")
-    rows = []
+    # ── FG-level results (primary table) ─────────────────────────
+    st.subheader("📦 Sets producible per FG code")
+    st.caption("Each row = one finished good. IDU is unique to that FG. "
+               "ODU parts are shared — two FGs with the same ODU compete for the same stock.")
+    if fg_results:
+        fg_df = pd.DataFrame([{
+            "Segment":        f["Segment"],
+            "FG Code":        f["FG_Code"],
+            "IDU":            f["IDU"],
+            "Compatible ODU": f["Compatible_ODU"],
+            "Max Sets":       f["Max_Sets"],
+            "Limiting Part":  f["Limiting_Part"],
+            "Limiting Stock": f["Limiting_Stock"],
+        } for f in fg_results]).sort_values(["Segment", "Max Sets"],
+                                             ascending=[True, False])
+
+        def hl_fg(row):
+            if row["Max Sets"] > 0:
+                return ["background-color:#e8f8e8"] * len(row)
+            return ["background-color:#fff3cd"] * len(row)
+
+        st.dataframe(
+            fg_df.style.apply(hl_fg, axis=1)
+                 .format({"Max Sets": "{:,}", "Limiting Stock": "{:,}"}),
+            use_container_width=True, hide_index=True)
+
+    # ── Segment rollup ────────────────────────────────────────────
+    st.subheader("📊 Segment rollup")
+    st.caption("Total sets = sum of all FG codes in that segment. "
+               "ODU stock is shared across FGs — already accounted for in LP.")
+    seg_rows = []
     for s, qty in zip(segs, alloc_int):
-        sd = segments_data[s]
-        limiting_part, min_ratio = "—", float("inf")
-        for p, req in sd["combined_req"].items():
-            if req > 0:
-                ratio = float(stock.get(p,0)) / req
-                if ratio < min_ratio:
-                    min_ratio, limiting_part = ratio, p
-        rows.append({
-            "Segment":           s,
-            "Max Sets":          qty,
-            "IDU models":        sd["idu_count"],
-            "ODU models":        sd["odu_count"],
-            "Import parts used": len(sd["combined_req"]),
-            "Limiting part":     limiting_part,
-            "Limiting stock":    int(stock.get(limiting_part,0)) if limiting_part!="—" else 0,
+        sd  = segments_data[s]
+        fgs = [f for f in fg_results if f["Segment"] == s]
+        seg_rows.append({
+            "Segment":        s,
+            "Total Sets":     int(qty),
+            "FG codes":       len(fgs),
+            "FGs producing":  sum(1 for f in fgs if f["Max_Sets"] > 0),
+            "Unique IDUs":    sd["idu_count"],
+            "Unique ODUs":    sd["odu_count"],
         })
+    seg_df_disp = pd.DataFrame(seg_rows).sort_values("Total Sets", ascending=False)
 
-    results_df = pd.DataFrame(rows).sort_values("Max Sets", ascending=False)
-
-    def hl_sets(row):
-        if row["Max Sets"] > 0:
-            return ["background-color:#e8f8e8"]*len(row)
-        return ["background-color:#f5f5f5;color:#999"]*len(row)
+    def hl_seg(row):
+        if row["Total Sets"] > 0:
+            return ["background-color:#e8f8e8"] * len(row)
+        return ["background-color:#f5f5f5;color:#999"] * len(row)
 
     st.dataframe(
-        results_df.style.apply(hl_sets, axis=1)
-                  .format({"Max Sets":"{:,}","Limiting stock":"{:,}"}),
+        seg_df_disp.style.apply(hl_seg, axis=1)
+                   .format({"Total Sets": "{:,}"}),
         use_container_width=True, hide_index=True)
 
-    # ── Import part utilisation ────────────────────────────────
+    # ── FG detail drill-down ──────────────────────────────────────
+    st.subheader("🔍 FG detail — import part breakdown")
+    fg_options = sorted(
+        [f["FG_Code"] for f in fg_results],
+        key=lambda fg: -next(f["Max_Sets"] for f in fg_results if f["FG_Code"] == fg))
+    selected_fg = st.selectbox("Select FG code", options=fg_options, key="fg_detail_select")
+    if selected_fg:
+        fgr  = next(f for f in fg_results if f["FG_Code"] == selected_fg)
+        sets = fgr["Max_Sets"]
+        st.markdown(
+            f"**{selected_fg}** · Segment: `{fgr['Segment']}` · "
+            f"IDU: `{fgr['IDU']}` · ODU: `{fgr['Compatible_ODU']}` · "
+            f"**Max sets: {sets:,}**")
+
+        imp_rows = []
+        for p, req in sorted(fgr["combined_req"].items(), key=lambda x: -x[1]):
+            avail  = float(stock.get(p, 0))
+            max_s  = int(avail / req) if req > 0 else 0
+            imp_rows.append({
+                "Import Part":       p,
+                "RM Group":          rm_map.get(p, "—"),
+                "Qty per set":       round(req, 4),
+                "Stock available":   int(avail),
+                "Max sets (alone)":  max_s,
+                "Binding?":          "🔴 YES" if max_s == sets and sets > 0 else "",
+            })
+        imp_df = pd.DataFrame(imp_rows)
+
+        def hl_imp(row):
+            return (["background-color:#ffe0e0"] * len(row)
+                    if row["Binding?"] == "🔴 YES" else [""] * len(row))
+
+        st.dataframe(
+            imp_df.style.apply(hl_imp, axis=1)
+                  .format({"Qty per set": "{:.4f}",
+                           "Stock available": "{:,}",
+                           "Max sets (alone)": "{:,}"}),
+            use_container_width=True, hide_index=True)
+        st.caption("🔴 Binding = this part alone limits the FG to the shown max sets")
+
+    # ── Import part utilisation ───────────────────────────────────
     st.subheader("🔩 Import part stock utilisation")
     pu_rows = []
     for p in import_parts:
@@ -694,73 +870,42 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
         pu_rows.append({
             "Import Part":  p,
             "RM Group":     rm_map.get(p, "—"),
-            "Stock":        int(stock.get(p,0)),
-            "Used":         int(pu.get("used",0)),
-            "Remaining":    int(pu.get("remain", stock.get(p,0))),
-            "Utilisation%": pu.get("pct",0),
+            "Stock":        int(stock.get(p, 0)),
+            "Used":         int(pu.get("used", 0)),
+            "Remaining":    int(pu.get("remain", stock.get(p, 0))),
+            "Utilisation%": pu.get("pct", 0),
         })
     pu_df = pd.DataFrame(pu_rows).sort_values("Utilisation%", ascending=False)
 
     def hl_util(row):
         pct = row["Utilisation%"]
-        if pct >= 90: return ["background-color:#ffe0e0"]*len(row)
-        elif pct >= 50: return ["background-color:#fff3cd"]*len(row)
-        elif pct > 0: return ["background-color:#e8f8e8"]*len(row)
-        return [""]*len(row)
+        if pct >= 90:   return ["background-color:#ffe0e0"] * len(row)
+        elif pct >= 50: return ["background-color:#fff3cd"] * len(row)
+        elif pct > 0:   return ["background-color:#e8f8e8"] * len(row)
+        return [""] * len(row)
 
-    tab_all, tab_const = st.tabs(["All import parts","Constrained only"])
+    tab_all, tab_const = st.tabs(["All import parts", "Constrained only"])
     with tab_all:
         st.dataframe(
             pu_df.style.apply(hl_util, axis=1)
-                 .format({"Stock":"{:,}","Used":"{:,}","Remaining":"{:,}","Utilisation%":"{:.1f}"}),
+                 .format({"Stock": "{:,}", "Used": "{:,}",
+                          "Remaining": "{:,}", "Utilisation%": "{:.1f}"}),
             use_container_width=True, hide_index=True)
     with tab_const:
         constrained = pu_df[pu_df["Import Part"].isin(r["constrained_parts"])]
         st.dataframe(
             constrained.style.apply(hl_util, axis=1)
-                       .format({"Stock":"{:,}","Used":"{:,}","Remaining":"{:,}","Utilisation%":"{:.1f}"}),
+                       .format({"Stock": "{:,}", "Used": "{:,}",
+                                "Remaining": "{:,}", "Utilisation%": "{:.1f}"}),
             use_container_width=True, hide_index=True)
 
-    # ── Segment detail ─────────────────────────────────────────
-    st.subheader("🔍 Segment detail")
-    selected = st.selectbox(
-        "Select segment", options=sorted(segs, key=lambda s:-alloc_int[segs.index(s)]),
-        key="seg_detail_select")
-    if selected:
-        sd   = segments_data[selected]
-        sets = alloc_int[segs.index(selected)]
-        st.markdown(f"**{selected}** — `{sets:,}` sets")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**IDU models:**")
-            for code in sd["idu_codes"]: st.text(f"  {code}")
-        with c2:
-            st.markdown("**ODU models:**")
-            for code in sd["odu_codes"]: st.text(f"  {code}")
-        st.markdown("**Import part requirements per set:**")
-        imp_rows = []
-        for p, req in sorted(sd["combined_req"].items(), key=lambda x:-x[1]):
-            avail = float(stock.get(p,0))
-            max_s = int(avail/req) if req>0 else 0
-            imp_rows.append({"Part":p,"Qty per set":round(req,4),
-                             "Stock available":int(avail),"Max sets (alone)":max_s})
-        imp_df = pd.DataFrame(imp_rows)
-        def hl_imp(row):
-            if row["Max sets (alone)"] == sets and sets > 0:
-                return ["background-color:#ffe0e0"]*len(row)
-            return [""]*len(row)
-        st.dataframe(
-            imp_df.style.apply(hl_imp, axis=1)
-                  .format({"Qty per set":"{:.4f}","Stock available":"{:,}","Max sets (alone)":"{:,}"}),
-            use_container_width=True, hide_index=True)
-        st.caption("🔴 Highlighted = binding constraint for this segment")
-
-    # ── Excel download ─────────────────────────────────────────
+    # ── Excel download ────────────────────────────────────────────
     st.divider()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        results_df.to_excel(writer, sheet_name="Sets per Segment", index=False)
-        pu_df.to_excel(writer, sheet_name="Import Part Utilisation", index=False)
+        fg_df.to_excel(writer,          sheet_name="FG Sets",              index=False)
+        seg_df_disp.to_excel(writer,    sheet_name="Segment Rollup",        index=False)
+        pu_df.to_excel(writer,          sheet_name="Import Part Utilisation", index=False)
     buf.seek(0)
     st.download_button(
         "⬇️ Download Segment Capacity (.xlsx)", data=buf,
