@@ -376,13 +376,27 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
     if not paths:
         st.info("No ancestry paths found.")
         return
+    # Build description lookup from BOM
+    desc_map = {}
+    if "BOM header descripti" in bom.columns:
+        desc_map = (bom[["BOM Header","BOM header descripti"]]
+                    .drop_duplicates("BOM Header")
+                    .set_index("BOM Header")["BOM header descripti"]
+                    .to_dict())
+
     fg_rows = []
     for p in paths:
         rows = req_df[(req_df["BOM Header"]==p["fg"])&(req_df["Alt"]==p["alt"])]
         total = rows[months].sum(numeric_only=True).sum() if not rows.empty else 0
         mv = {m: float(rows[m].sum()) if not rows.empty else 0 for m in months}
-        fg_rows.append({"FG code":p["fg"],"Alt":p["alt"],"BOM level":p["level"],
-                        "Total demand":f"{total:,.0f}", **{m:f"{mv[m]:,.0f}" for m in months}})
+        fg_rows.append({
+            "FG code":        p["fg"],
+            "Description":    desc_map.get(p["fg"], "—"),
+            "Alt":            p["alt"],
+            "BOM level":      p["level"],
+            "Total demand":   f"{total:,.0f}",
+            **{m: f"{mv[m]:,.0f}" for m in months}
+        })
     fg_df = pd.DataFrame(fg_rows).drop_duplicates(subset=["FG code","Alt"])
     st.dataframe(fg_df, use_container_width=True, hide_index=True)
     MAX_PATHS = 12
@@ -531,6 +545,16 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
     target_set  = set(import_parts)
     bom_headers = set(bom["BOM Header"].unique())
 
+    # Build FG/IDU/ODU code → description map from BOM
+    desc_col = "BOM header descripti" if "BOM header descripti" in bom.columns else None
+    if desc_col:
+        desc_map = (bom[["BOM Header", desc_col]]
+                    .drop_duplicates("BOM Header")
+                    .set_index("BOM Header")[desc_col]
+                    .to_dict())
+    else:
+        desc_map = {}
+
     with status:
         st.write("► Exploding BOM for every IDU and ODU ...")
 
@@ -647,8 +671,11 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
         fg_results.append({
             "Segment":        fg_segment[fg],
             "FG_Code":        fg,
+            "FG_Desc":        desc_map.get(fg, ""),
             "IDU":            fg_idu[fg],
+            "IDU_Desc":       desc_map.get(fg_idu[fg], ""),
             "Compatible_ODU": fg_odu[fg],
+            "ODU_Desc":       desc_map.get(fg_odu[fg], ""),
             "Max_Sets":       int(qty),
             "Limiting_Part":  lim_part,
             "Limiting_Stock": int(stock.get(lim_part, 0)) if lim_part != "—" else 0,
@@ -776,8 +803,11 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
         fg_df = pd.DataFrame([{
             "Segment":        f["Segment"],
             "FG Code":        f["FG_Code"],
+            "FG Description": f.get("FG_Desc", ""),
             "IDU":            f["IDU"],
+            "IDU Description":f.get("IDU_Desc", ""),
             "Compatible ODU": f["Compatible_ODU"],
+            "ODU Description":f.get("ODU_Desc", ""),
             "Max Sets":       f["Max_Sets"],
             "Limiting Part":  f["Limiting_Part"],
             "Limiting Stock": f["Limiting_Stock"],
@@ -832,8 +862,10 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
         fgr  = next(f for f in fg_results if f["FG_Code"] == selected_fg)
         sets = fgr["Max_Sets"]
         st.markdown(
-            f"**{selected_fg}** · Segment: `{fgr['Segment']}` · "
-            f"IDU: `{fgr['IDU']}` · ODU: `{fgr['Compatible_ODU']}` · "
+            f"**{selected_fg}** — {fgr.get('FG_Desc','')}\n"
+            f"Segment: `{fgr['Segment']}` · "
+            f"IDU: `{fgr['IDU']}` ({fgr.get('IDU_Desc','')}) · "
+            f"ODU: `{fgr['Compatible_ODU']}` ({fgr.get('ODU_Desc','')}) · "
             f"**Max sets: {sets:,}**")
 
         imp_rows = []
