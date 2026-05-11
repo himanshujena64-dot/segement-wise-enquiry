@@ -1595,29 +1595,40 @@ if run_aging_btn:
             with st.spinner("Running aging projection ..."):
                 aging_df = load_aging_data(aging_file)
 
-                # Build production consumption map from MRP results if available
-                prod_cons = {}
                 mrp_r = st.session_state.get("mrp_results")
-                if mrp_r is not None:
-                    # req is a long-format dataframe with columns: BOM Header, Component, month cols, Gross_Req etc.
-                    # We need component-level monthly gross requirement
-                    req_df = mrp_r.get("req")
-                    months = mrp_r.get("months", [])
-                    if req_df is not None and months:
-                        comp_col = "Component" if "Component" in req_df.columns else req_df.columns[0]
-                        for m in months:
-                            if m in req_df.columns:
-                                grp = req_df.groupby(comp_col)[m].sum()
-                                for mat, qty in grp.items():
-                                    if mat not in prod_cons: prod_cons[mat] = {}
-                                    prod_cons[mat][m] = float(qty)
 
-                # Receipt quantities
+                # ── Component-level monthly consumption from MRP ────────────
+                # result_l1..l4 have columns: Component, Month, Gross_Requirement
+                # Gross_Requirement = total demand on each component per month.
+                # This is the correct figure to deduct from aging stock buckets.
+                prod_cons = {}
+                if mrp_r is not None:
+                    all_levels = []
+                    for key in ["result_l1","result_l2","result_l3","result_l4"]:
+                        df = mrp_r.get(key)
+                        if df is not None and not df.empty:
+                            if all(c in df.columns for c in ["Component","Month","Gross_Requirement"]):
+                                all_levels.append(df[["Component","Month","Gross_Requirement"]].copy())
+                    if all_levels:
+                        cdf = pd.concat(all_levels, ignore_index=True)
+                        cdf = cdf.groupby(["Component","Month"],as_index=False)["Gross_Requirement"].sum()
+                        for _, row2 in cdf.iterrows():
+                            mat = str(row2["Component"]).strip()
+                            mon = str(row2["Month"]).strip()
+                            qty = float(row2["Gross_Requirement"])
+                            if qty > 0:
+                                if mat not in prod_cons: prod_cons[mat] = {}
+                                prod_cons[mat][mon] = prod_cons[mat].get(mon,0) + qty
+                        st.info(f"Consumption loaded from MRP: {len(prod_cons):,} components across all months.")
+                    else:
+                        st.warning("MRP results found but no component consumption data — run MRP first.")
+
+                # ── Receipt quantities ───────────────────────────────────────
                 recv_map = {}
-                mrp_r2 = st.session_state.get("mrp_results")
-                if mrp_r2 is not None and not mrp_r2.get("receipt_qty", pd.Series(dtype=float)).empty:
-                    rq = mrp_r2.get("receipt_qty", pd.Series(dtype=float))
-                    recv_map = rq.to_dict() if hasattr(rq, "to_dict") else {}
+                if mrp_r is not None:
+                    rq = mrp_r.get("receipt_qty")
+                    if rq is not None and not (hasattr(rq,"empty") and rq.empty):
+                        recv_map = rq.to_dict() if hasattr(rq,"to_dict") else {}
 
                 months_list = mrp_r.get("months", []) if mrp_r else []
                 if not months_list:
