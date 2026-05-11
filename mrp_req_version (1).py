@@ -52,6 +52,20 @@ with st.sidebar:
         help="Sheet 1: Import Part List  |  Sheet 2: Segment (IDU / ODU codes)")
     run_seg_btn  = st.button("▶ Run Segment Capacity", use_container_width=True)
 
+    st.divider()
+    st.subheader("Aging Material Analysis (optional)")
+    aging_file = st.file_uploader(
+        "Aging Material Details (.xlsx)",
+        type=["xlsx","xls"], key="aging",
+        help="Aging snapshot as on a given date. Buckets: 0-15, 16-30, 31-60, 61-90, "
+             "91-120, 121-150, 151-180, 181-360, Over361 (Qty & Value)")
+    aging_base_date = st.date_input(
+        "Aging data as-on date",
+        value=pd.Timestamp("2026-05-01"),
+        key="aging_date",
+        help="The date the aging snapshot was taken (e.g. May 1 2026)")
+    run_aging_btn = st.button("▶ Run Aging Projection", use_container_width=True)
+
 
 # ═══════════════════════════════════════════════════════════════
 # SHARED HELPERS — date/month parsing
@@ -741,6 +755,9 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
 
 
 def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
+    # Always read latest result so metrics update after RM filter rerun
+    r = st.session_state.get("seg_results", r)
+
     segs          = r["segs"]
     alloc_int     = r["alloc_int"]
     total_sets    = r["total_sets"]
@@ -1282,11 +1299,239 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                 result_l3=result_l3, result_l4=result_l4)
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# AGING MATERIAL PROJECTION ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+AGING_BUCKETS = ["0-15 Qty","16-30 Qty","31-60 Qty","61-90 Qty",
+                 "91-120 Qty","121-150 Qty","151-180 Qty","181-360 Qty","Over361 Qty"]
+AGING_VAL_BUCKETS = ["0-15 Value","16-30 Value","31-60 Value","61-90 Value",
+                     "91-120 Value","121-150 Value","151-180 Value","181-360 Value","Over361 Value"]
+AGING_THRESHOLD_IDX = 4   # index ≥ 4 (91-120+) = aging
+
+
+def load_aging_data(aging_file):
+    """Load aging Excel, aggregate by Material (sum across storage locations)."""
+    df = pd.read_excel(aging_file)
+    df.columns = [str(c).strip() for c in df.columns]
+    rename = {}
+    for c in df.columns:
+        cl = c.lower().replace(" ", "")
+        if cl == "material":              rename[c] = "Material"
+        elif "description" in cl:         rename[c] = "Material Description"
+        elif cl == "materialtype":        rename[c] = "Material Type"
+        elif "movingaverage" in cl or cl == "map": rename[c] = "MAP"
+    df = df.rename(columns=rename)
+    for col in AGING_BUCKETS + AGING_VAL_BUCKETS:
+        if col not in df.columns: df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    agg_cols = {c: "sum" for c in AGING_BUCKETS + AGING_VAL_BUCKETS}
+    if "Material Description" in df.columns: agg_cols["Material Description"] = "first"
+    if "MAP" in df.columns:                  agg_cols["MAP"] = "first"
+    if "Material Type" in df.columns:        agg_cols["Material Type"] = "first"
+    return df.groupby("Material", as_index=False).agg(agg_cols)
+
+
+def project_aging(aging_df, base_date, production_consumption, receipt_qty_map, months_list):
+    """
+    Project aging qty/value month-by-month using FIFO consumption.
+
+    Logic:
+      - Each month, every bucket ages by 1 band (~30 days).
+        61-90d stock -> 91-120d (becomes aging) starting Jun if base=May.
+        31-60d stock -> aging starting Jul. 16-30d -> Aug. 0-15d -> Sep/Oct.
+      - Receipts are added as new 0-15d stock at base_date (age alongside existing stock).
+      - Production consumes from newest bucket first (FIFO → preserves older stock is wrong;
+        in practice production uses whatever is available, but FIFO on newest minimises aging).
+      - Cumulative consumption up to each month is applied so stocks don't double-count.
+    """
+    base_ts = pd.Timestamp(base_date)
+
+    def month_offset(label):
+        try:
+            ts = pd.to_datetime(label, format="%b-%y")
+        except Exception:
+            try: ts = pd.to_datetime(label)
+            except Exception: return 0
+        return (ts.year - base_ts.year) * 12 + (ts.month - base_ts.month)
+
+    month_offsets = [max(0, month_offset(m)) for m in months_list]
+    records = []
+
+    for _, row in aging_df.iterrows():
+        mat      = str(row["Material"]).strip()
+        desc     = str(row.get("Material Description", ""))
+        mat_type = str(row.get("Material Type", ""))
+        map_px   = float(row.get("MAP", 0) or 0)
+        init_qtys = [float(row.get(b, 0) or 0) for b in AGING_BUCKETS]
+        receipt   = float(receipt_qty_map.get(mat, 0))
+
+        for m_idx, month_label in enumerate(months_list):
+            offset = month_offsets[m_idx]
+
+            # Age all initial stock by `offset` months
+            aged = [0.0] * len(AGING_BUCKETS)
+            for b_idx, qty in enumerate(init_qtys):
+                new_idx = min(b_idx + offset, len(AGING_BUCKETS) - 1)
+                aged[new_idx] += qty
+
+            # Age receipts by same offset (receipt arrived at base_date)
+            if receipt > 0:
+                recv_idx = min(offset, len(AGING_BUCKETS) - 1)
+                aged[recv_idx] += receipt
+
+            # Cumulative production consumption up to and including this month
+            # Consume from NEWEST bucket first (index 0) to minimise artificial aging
+            consumed = sum(
+                float(production_consumption.get(mat, {}).get(m, 0))
+                for m in months_list[:m_idx + 1]
+            )
+            rem = consumed
+            for b_idx in range(len(aged)):
+                take = min(aged[b_idx], rem)
+                aged[b_idx] -= take
+                rem -= take
+                if rem <= 0: break
+
+            aging_qty   = sum(aged[AGING_THRESHOLD_IDX:])
+            total_qty   = sum(aged)
+            aging_val   = aging_qty * map_px if map_px > 0 else 0.0
+            turning_nxt = aged[AGING_THRESHOLD_IDX - 1] if AGING_THRESHOLD_IDX > 0 else 0.0
+
+            records.append({
+                "Material": mat, "Description": desc, "Material Type": mat_type,
+                "Month": month_label,
+                "Total Stock Qty":           round(total_qty, 2),
+                "Aging Qty (>=91d)":         round(aging_qty, 2),
+                "Aging Value (Rs)":          round(aging_val, 2),
+                "Turning Aging Next Month":  round(turning_nxt, 2),
+                "Aging Pct":                 round(100 * aging_qty / total_qty, 1) if total_qty > 0 else 0.0,
+                "0-15 Qty":   round(aged[0], 2), "16-30 Qty": round(aged[1], 2),
+                "31-60 Qty":  round(aged[2], 2), "61-90 Qty": round(aged[3], 2),
+                "91-120 Qty": round(aged[4], 2), "121-150 Qty": round(aged[5], 2),
+                "151-180 Qty":round(aged[6], 2), "181-360 Qty": round(aged[7], 2),
+                "Over361 Qty":round(aged[8], 2),
+            })
+
+    return pd.DataFrame(records)
+
+
+def display_aging_results(aging_proj_df, months_list, base_date):
+    st.divider()
+    st.header("📦 Aging Material Projection")
+    st.caption(
+        f"Base snapshot: **{pd.Timestamp(base_date).strftime('%d %b %Y')}**  ·  "
+        "Aging threshold = 91 days  ·  FIFO consumption applied  ·  "
+        "Receipts treated as fresh (0-15d) stock added at snapshot date"
+    )
+    if aging_proj_df.empty:
+        st.warning("No aging projection data."); return
+
+    last_month = months_list[-1] if months_list else ""
+    final_df = aging_proj_df[aging_proj_df["Month"] == last_month]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Materials tracked",        f"{aging_proj_df['Material'].nunique():,}")
+    c2.metric(f"Aging Qty ({last_month})", f"{final_df['Aging Qty (>=91d)'].sum():,.0f}")
+    c3.metric(f"Aging Value ({last_month})",f"Rs {final_df['Aging Value (Rs)'].sum():,.0f}")
+    c4.metric(f"Materials aging ({last_month})",
+              f"{(final_df['Aging Qty (>=91d)'] > 0).sum():,}")
+
+    # ── Month-wise summary ────────────────────────────────────────
+    st.subheader("Month-wise Aging Summary")
+    months_ordered = [m for m in months_list if m in aging_proj_df["Month"].unique()]
+    msumm = (aging_proj_df.groupby("Month", sort=False)
+             .agg(Total_Stock=("Total Stock Qty","sum"),
+                  Aging_Qty=("Aging Qty (>=91d)","sum"),
+                  Aging_Val=("Aging Value (Rs)","sum"),
+                  Turning_Next=("Turning Aging Next Month","sum"),
+                  Mat_Aging=("Material",
+                             lambda x: (aging_proj_df.loc[x.index,"Aging Qty (>=91d)"]>0).sum()))
+             .reindex(months_ordered).reset_index())
+    msumm.columns = ["Month","Total Stock Qty","Aging Qty (>=91d)",
+                     "Aging Value (Rs)","Turning Aging Next Month","Materials Aging"]
+    msumm["Aging %"] = (100*msumm["Aging Qty (>=91d)"]/msumm["Total Stock Qty"]).round(1).fillna(0)
+
+    def hl_m(row):
+        p = row["Aging %"]
+        if p >= 30: return ["background-color:#ffe0e0"]*len(row)
+        if p >= 10: return ["background-color:#fff3cd"]*len(row)
+        if p > 0:   return ["background-color:#e8f8e8"]*len(row)
+        return [""]*len(row)
+
+    st.dataframe(
+        msumm.style.apply(hl_m, axis=1)
+             .format({"Total Stock Qty":"{:,.0f}","Aging Qty (>=91d)":"{:,.0f}",
+                      "Aging Value (Rs)":"Rs {:,.0f}","Turning Aging Next Month":"{:,.0f}",
+                      "Aging %":"{:.1f}%"}),
+        use_container_width=True, hide_index=True)
+    st.caption(
+        "**Turning Aging Next Month** = stock currently in 61-90d band that will cross 90d threshold next period  "
+        "| Highlighted: 🔴 >=30%  🟡 10-30%  🟢 >0%")
+
+    # ── Material detail ───────────────────────────────────────────
+    st.subheader("Material Aging Detail by Month")
+    sel_month = st.selectbox("Select month", months_list,
+                             index=len(months_list)-1, key="aging_month_sel")
+    mdf = aging_proj_df[aging_proj_df["Month"]==sel_month].copy()
+    mdf = mdf[mdf["Total Stock Qty"]>0].sort_values("Aging Qty (>=91d)", ascending=False)
+
+    t1, t2, t3 = st.tabs(["Currently Aging","All Materials","Turning Aging Next Month"])
+    bucket_fmt = {c:"{:,.0f}" for c in mdf.columns if "Qty" in c or "Value" in c or "Rs" in c}
+    bucket_fmt["Aging Pct"] = "{:.1f}%"
+
+    with t1:
+        af = mdf[mdf["Aging Qty (>=91d)"]>0]
+        st.caption(f"{len(af):,} materials with aging stock in {sel_month}")
+        show_c = ["Material","Description","Total Stock Qty","Aging Qty (>=91d)",
+                  "Aging Value (Rs)","Aging Pct","91-120 Qty","121-150 Qty",
+                  "151-180 Qty","181-360 Qty","Over361 Qty"]
+        st.dataframe(af[show_c].style.format(bucket_fmt), use_container_width=True, hide_index=True)
+
+    with t2:
+        all_c = ["Material","Description","Total Stock Qty","Aging Qty (>=91d)",
+                 "Aging Value (Rs)","Aging Pct","0-15 Qty","16-30 Qty","31-60 Qty",
+                 "61-90 Qty","91-120 Qty","121-150 Qty","151-180 Qty","181-360 Qty","Over361 Qty"]
+        st.dataframe(mdf[all_c].style.format(bucket_fmt), use_container_width=True, hide_index=True)
+
+    with t3:
+        tdf = mdf[mdf["Turning Aging Next Month"]>0].sort_values("Turning Aging Next Month", ascending=False)
+        st.caption(f"{len(tdf):,} materials will turn aging next month")
+        tc = ["Material","Description","Turning Aging Next Month","Aging Qty (>=91d)","Total Stock Qty"]
+        st.dataframe(tdf[tc].style.format({c:"{:,.0f}" for c in tc if "Qty" in c or "Month" in c}),
+                     use_container_width=True, hide_index=True)
+        if not tdf.empty:
+            st.warning(f"⚠️ {tdf['Turning Aging Next Month'].sum():,.0f} units across "
+                       f"{len(tdf)} materials will become aging in the month after {sel_month}.")
+
+    # ── Download ──────────────────────────────────────────────────
+    st.divider()
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        msumm.to_excel(writer, sheet_name="Monthly Summary", index=False)
+        aging_proj_df.to_excel(writer, sheet_name="Material Detail", index=False)
+        piv_qty = aging_proj_df.pivot_table(
+            index=["Material","Description"], columns="Month",
+            values="Aging Qty (>=91d)", aggfunc="sum").reset_index()
+        piv_qty.to_excel(writer, sheet_name="Aging Qty Pivot", index=False)
+        piv_val = aging_proj_df.pivot_table(
+            index=["Material","Description"], columns="Month",
+            values="Aging Value (Rs)", aggfunc="sum").reset_index()
+        piv_val.to_excel(writer, sheet_name="Aging Value Pivot", index=False)
+    buf.seek(0)
+    st.download_button(
+        "Download Aging Projection (.xlsx)", data=buf,
+        file_name="aging_material_projection.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True, type="primary")
+
 # ═══════════════════════════════════════════════════════════════
 # SESSION STATE + ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 if "mrp_results"  not in st.session_state: st.session_state["mrp_results"]  = None
 if "seg_results"  not in st.session_state: st.session_state["seg_results"]  = None
+if "aging_results" not in st.session_state: st.session_state["aging_results"] = None
 
 # ── MRP run ───────────────────────────────────────────────────
 if not run_mrp_btn and bom_file is None:
@@ -1340,3 +1585,64 @@ if st.session_state["seg_results"] is not None:
         )
     except Exception as e:
         st.error(f"Segment display error: {e}")
+
+# ── Aging Projection run ──────────────────────────────────────
+if run_aging_btn:
+    if aging_file is None:
+        st.warning("Please upload the Aging Material Details file.")
+    else:
+        try:
+            with st.spinner("Running aging projection ..."):
+                aging_df = load_aging_data(aging_file)
+
+                # Build production consumption map from MRP results if available
+                prod_cons = {}
+                mrp_r = st.session_state.get("mrp_results")
+                if mrp_r is not None:
+                    # req is a long-format dataframe with columns: BOM Header, Component, month cols, Gross_Req etc.
+                    # We need component-level monthly gross requirement
+                    req_df = mrp_r.get("req")
+                    months = mrp_r.get("months", [])
+                    if req_df is not None and months:
+                        comp_col = "Component" if "Component" in req_df.columns else req_df.columns[0]
+                        for m in months:
+                            if m in req_df.columns:
+                                grp = req_df.groupby(comp_col)[m].sum()
+                                for mat, qty in grp.items():
+                                    if mat not in prod_cons: prod_cons[mat] = {}
+                                    prod_cons[mat][m] = float(qty)
+
+                # Receipt quantities
+                recv_map = {}
+                mrp_r2 = st.session_state.get("mrp_results")
+                if mrp_r2 is not None and not mrp_r2.get("receipt_qty", pd.Series(dtype=float)).empty:
+                    rq = mrp_r2.get("receipt_qty", pd.Series(dtype=float))
+                    recv_map = rq.to_dict() if hasattr(rq, "to_dict") else {}
+
+                months_list = mrp_r.get("months", []) if mrp_r else []
+                if not months_list:
+                    # Fallback: generate 6 months from base date
+                    base = pd.Timestamp(aging_base_date)
+                    months_list = [(base + pd.DateOffset(months=i)).strftime("%b-%y")
+                                   for i in range(6)]
+
+                proj = project_aging(
+                    aging_df,
+                    base_date=aging_base_date,
+                    production_consumption=prod_cons,
+                    receipt_qty_map=recv_map,
+                    months_list=months_list,
+                )
+                st.session_state["aging_results"] = {
+                    "proj": proj, "months": months_list, "base_date": aging_base_date
+                }
+        except Exception as e:
+            st.exception(e)
+
+# Show aging results
+if st.session_state["aging_results"] is not None:
+    ag = st.session_state["aging_results"]
+    try:
+        display_aging_results(ag["proj"], ag["months"], ag["base_date"])
+    except Exception as e:
+        st.error(f"Aging display error: {e}")
