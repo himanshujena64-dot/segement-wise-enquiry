@@ -1290,7 +1290,8 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
     return dict(bom=bom, req=req, months=months, stock=stock,
                 prod_summary=prod_summary,
                 result_l1=result_l1, result_l2=result_l2,
-                result_l3=result_l3, result_l4=result_l4)
+                result_l3=result_l3, result_l4=result_l4,
+                raw_l1=l1_agg, raw_l2=l2_agg, raw_l3=l3_agg, raw_l4=l4_agg)
 
 
 
@@ -1624,27 +1625,38 @@ if run_aging_btn:
                 # result_l1..l4 have columns: Component, Month, Gross_Requirement
                 # Gross_Requirement = total demand on each component per month.
                 # This is the correct figure to deduct from aging stock buckets.
+                # ── Pure BOM-exploded demand — NO stock deduction ──────────
+                # raw_l1..l4 = gross requirement from BOM explosion BEFORE stock
+                # is applied. This is the correct consumption for aging:
+                # "how much of each material does production demand?" regardless
+                # of whether stock is available to cover it.
+                # Column names in raw_lN: Component, Month, Gross (summed qty)
                 prod_cons = {}
                 if mrp_r is not None:
-                    all_levels = []
-                    for key in ["result_l1","result_l2","result_l3","result_l4"]:
+                    all_raw = []
+                    for key in ["raw_l1","raw_l2","raw_l3","raw_l4"]:
                         df = mrp_r.get(key)
                         if df is not None and not df.empty:
-                            if all(c in df.columns for c in ["Component","Month","Gross_Requirement"]):
-                                all_levels.append(df[["Component","Month","Gross_Requirement"]].copy())
-                    if all_levels:
-                        cdf = pd.concat(all_levels, ignore_index=True)
-                        cdf = cdf.groupby(["Component","Month"],as_index=False)["Gross_Requirement"].sum()
+                            # raw_lN columns: Component, Desc, Month, Month_Order, Gross
+                            comp_col = "Component"
+                            gross_col = next((c for c in df.columns if c.lower() in ("gross","gross_requirement")), None)
+                            if comp_col in df.columns and "Month" in df.columns and gross_col:
+                                tmp = df[[comp_col,"Month",gross_col]].copy()
+                                tmp.columns = ["Component","Month","Gross"]
+                                all_raw.append(tmp)
+                    if all_raw:
+                        cdf = pd.concat(all_raw, ignore_index=True)
+                        cdf = cdf.groupby(["Component","Month"],as_index=False)["Gross"].sum()
                         for _, row2 in cdf.iterrows():
                             mat = str(row2["Component"]).strip()
                             mon = str(row2["Month"]).strip()
-                            qty = float(row2["Gross_Requirement"])
+                            qty = float(row2["Gross"])
                             if qty > 0:
                                 if mat not in prod_cons: prod_cons[mat] = {}
                                 prod_cons[mat][mon] = prod_cons[mat].get(mon,0) + qty
-                        st.info(f"Consumption loaded from MRP: {len(prod_cons):,} components across all months.")
+                        st.info(f"Pure BOM consumption loaded: {len(prod_cons):,} components (no stock deduction).")
                     else:
-                        st.warning("MRP results found but no component consumption data — run MRP first.")
+                        st.warning("Raw gross data not found — re-run MRP first, then run aging.")
 
                 # ── Receipt quantities ───────────────────────────────────────
                 recv_map = {}
