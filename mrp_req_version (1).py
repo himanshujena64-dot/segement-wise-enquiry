@@ -52,6 +52,30 @@ with st.sidebar:
         help="Sheet 1: Import Part List  |  Sheet 2: Segment (IDU / ODU codes)")
     run_seg_btn  = st.button("▶ Run Segment Capacity", use_container_width=True)
 
+    # ── RM Group filter (sidebar) ─────────────────────────────
+    seg_r = st.session_state.get('seg_results')
+    if seg_r is not None:
+        rm_map_s      = seg_r.get('rm_map', {})
+        active_grps_s = seg_r.get('active_rm_groups', [])
+        all_rm_grps   = sorted(set(rm_map_s.values())) if rm_map_s else []
+        if all_rm_grps:
+            st.divider()
+            st.subheader('🔩 RM Group Filter')
+            st.caption('Uncheck to exclude parts. Click **Apply** to recalculate.')
+            selected_groups_sb = []
+            for grp in all_rm_grps:
+                if st.checkbox(grp, value=(grp in active_grps_s), key=f'rm_sb_{grp}'):
+                    selected_groups_sb.append(grp)
+            apply_filter_btn = st.button('🔄 Apply filter', key='apply_rm_filter',
+                                         use_container_width=True, type='primary')
+        else:
+            selected_groups_sb = []
+            apply_filter_btn   = False
+    else:
+        selected_groups_sb = []
+        apply_filter_btn   = False
+
+
     st.divider()
     st.subheader("Aging Material Analysis (optional)")
     aging_file = st.file_uploader(
@@ -776,43 +800,6 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
     m2.metric("FG codes with production",   f"{sum(1 for f in fg_results if f['Max_Sets'] > 0)} / {len(fg_results)}")
     m3.metric("Segments with production",   f"{(alloc_int > 0).sum()} / {len(segs)}")
     m4.metric("Import parts constrained",   f"{len(r['constrained_parts'])}")
-
-    # ── RM Group filter ───────────────────────────────────────────
-    if all_rm_groups:
-        st.divider()
-        st.subheader("🔩 RM Group Filter")
-        st.caption("Uncheck a group to exclude those import parts from the constraint. "
-                   "Click **Apply filter** to recalculate.")
-        cols = st.columns(min(len(all_rm_groups), 5))
-        selected_groups = []
-        for i, grp in enumerate(all_rm_groups):
-            with cols[i % len(cols)]:
-                if st.checkbox(grp, value=(grp in active_groups), key=f"rm_chk_{grp}"):
-                    selected_groups.append(grp)
-
-        if st.button("🔄 Apply filter", type="primary"):
-            # Reload file from persisted bytes if the uploader widget is now None (after rerun)
-            _seg_file = seg_imp_file
-            if _seg_file is None and st.session_state.get("seg_imp_bytes"):
-                import io as _io
-                _seg_file = _io.BytesIO(st.session_state["seg_imp_bytes"])
-            if _seg_file is not None and bom is not None:
-                with st.spinner("Recalculating with selected RM groups ..."):
-                    new_result = run_segment_capacity(
-                        bom, stock, _seg_file, active_rm_groups=selected_groups)
-                    if new_result is not None:
-                        st.session_state["seg_results"] = new_result
-                        st.rerun()
-            else:
-                st.warning("Segment file not available — please re-upload and run segment capacity first.")
-
-        excluded_parts = [p for p, g in rm_map.items() if g not in active_groups]
-        if excluded_parts:
-            with st.expander(f"ℹ️ {len(excluded_parts)} import parts currently EXCLUDED"):
-                excl_df = pd.DataFrame(
-                    [{"Component": p, "RM Group": rm_map[p]} for p in excluded_parts]
-                ).sort_values("RM Group")
-                st.dataframe(excl_df, use_container_width=True, hide_index=True)
 
     if r["skipped_segs"]:
         with st.expander(f"⚠️ {len(r['skipped_segs'])} FGs skipped"):
@@ -1589,6 +1576,23 @@ if run_seg_btn:
                     st.session_state["seg_imp_bytes"] = seg_imp_file.read()
         except Exception as e:
             st.exception(e)
+
+# ── RM filter apply (sidebar button) ──────────────────────────
+if apply_filter_btn and st.session_state["seg_results"] is not None:
+    _mrp = st.session_state.get("mrp_results")
+    _bom   = _mrp["bom"]   if _mrp else None
+    _stock = _mrp["stock"] if _mrp else None
+    _seg_bytes = st.session_state.get("seg_imp_bytes")
+    _seg_f = io.BytesIO(_seg_bytes) if _seg_bytes else None
+    if _seg_f is not None and _bom is not None:
+        with st.spinner("Recalculating with selected RM groups ..."):
+            new_result = run_segment_capacity(
+                _bom, _stock, _seg_f, active_rm_groups=selected_groups_sb)
+            if new_result is not None:
+                st.session_state["seg_results"] = new_result
+                st.rerun()
+    else:
+        st.warning("Re-upload the Segment file and run Segment Capacity first.")
 
 # Show segment results if available
 if st.session_state["seg_results"] is not None:
