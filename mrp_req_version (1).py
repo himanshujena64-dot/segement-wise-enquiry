@@ -1386,15 +1386,16 @@ def project_aging(aging_df, base_date, production_consumption, months_list):
             offset   = month_offsets[m_idx]
             cum_consumption += float(mat_cons.get(month_label, 0))
 
-            # Aging pool = all buckets from aging_start_idx onwards
             start_idx  = aging_start_idx(offset)
-            aging_pool = sum(buckets[start_idx:])
+            aging_pool = sum(buckets[start_idx:])   # stock that is/will be aging
+            fresh_pool = sum(buckets[:start_idx])   # stock not yet aging (consumed first)
 
-            # Subtract cumulative consumption; floor at 0
-            aging_qty  = max(0.0, aging_pool - cum_consumption)
-            aging_val  = round(aging_qty * map_px, 2) if map_px > 0 else 0.0
+            # Production consumes FRESH stock first.
+            # Only consumption exceeding fresh pool eats into aging stock.
+            aging_consumed = max(0.0, cum_consumption - fresh_pool)
+            aging_qty      = max(0.0, aging_pool - aging_consumed)
+            aging_val      = round(aging_qty * map_px, 2) if map_px > 0 else 0.0
 
-            # "Turning aging next month" = bucket just above start_idx (will join next month)
             turning_next = buckets[start_idx - 1] if start_idx > 0 else 0.0
 
             records.append({
