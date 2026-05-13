@@ -5,6 +5,8 @@ Tab 1: Full L1-L4 MRP with phantom handling, NET propagation,
         date/month columns, receipt qty, component search + ancestry tree.
 Tab 2: Segment-wise set capacity (IDU+ODU) limited by import parts.
         Upload Segment & Import Part file (optional) to activate.
+
+UI: No sidebar — all configuration inline. Clean professional layout.
 """
 
 import io
@@ -17,78 +19,400 @@ import streamlit as st
 from scipy.optimize import linprog
 
 # ═══════════════════════════════════════════════════════════════
-# PAGE CONFIG
+# PAGE CONFIG + CUSTOM CSS
 # ═══════════════════════════════════════════════════════════════
-st.set_page_config(page_title="SAP MRP Engine", page_icon="⚙️", layout="wide")
-st.title("⚙️ SAP MRP Engine — L1 to L4")
-st.caption("Phantom handling · Alt-aware · NET propagation · Dynamic date/month columns")
+st.set_page_config(
+    page_title="SAP MRP Engine",
+    page_icon="⚙️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown("""
+<style>
+/* ── Hide default sidebar & hamburger ──────────────────────── */
+[data-testid="stSidebar"],
+[data-testid="collapsedControl"],
+section[data-testid="stSidebarContent"] { display: none !important; }
+
+/* ── Global font & background ──────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+}
+
+/* ── Top header bar ─────────────────────────────────────────── */
+.mrp-header {
+    background: #0f1117;
+    border-bottom: 1px solid #2d3142;
+    padding: 0 2rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin: -4rem -4rem 2rem -4rem;
+    height: 60px;
+}
+.mrp-logo {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 15px;
+    font-weight: 500;
+    color: #e8f4fd;
+    letter-spacing: 0.08em;
+    white-space: nowrap;
+}
+.mrp-logo span {
+    color: #4d9de0;
+}
+.mrp-tagline {
+    font-size: 12px;
+    color: #6b7280;
+    font-weight: 300;
+    border-left: 1px solid #2d3142;
+    padding-left: 1rem;
+    margin-left: 0.25rem;
+}
+
+/* ── Section cards ──────────────────────────────────────────── */
+.config-card {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.25rem;
+}
+.config-card-title {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #6b7280;
+    margin-bottom: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.config-card-title::before {
+    content: '';
+    display: inline-block;
+    width: 3px;
+    height: 12px;
+    background: #4d9de0;
+    border-radius: 2px;
+}
+
+/* ── File upload areas ──────────────────────────────────────── */
+[data-testid="stFileUploader"] {
+    border: 1.5px dashed #d1d5db !important;
+    border-radius: 8px !important;
+    background: #f9fafb !important;
+    transition: border-color 0.2s;
+}
+[data-testid="stFileUploader"]:hover {
+    border-color: #4d9de0 !important;
+}
+
+/* ── Primary buttons ────────────────────────────────────────── */
+.stButton > button[kind="primary"] {
+    background: #0f1117 !important;
+    color: #ffffff !important;
+    border: none !important;
+    border-radius: 7px !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.03em !important;
+    padding: 0.5rem 1.25rem !important;
+    transition: background 0.15s, transform 0.1s !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background: #1e293b !important;
+    transform: translateY(-1px) !important;
+}
+.stButton > button[kind="primary"]:active {
+    transform: translateY(0) !important;
+}
+
+/* ── Secondary buttons ──────────────────────────────────────── */
+.stButton > button:not([kind="primary"]) {
+    background: transparent !important;
+    border: 1px solid #d1d5db !important;
+    border-radius: 7px !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-size: 13px !important;
+    font-weight: 400 !important;
+    color: #374151 !important;
+    transition: background 0.15s, border-color 0.15s !important;
+}
+.stButton > button:not([kind="primary"]):hover {
+    background: #f3f4f6 !important;
+    border-color: #9ca3af !important;
+}
+
+/* ── Metric tiles ───────────────────────────────────────────── */
+[data-testid="stMetric"] {
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 0.75rem 1rem !important;
+}
+[data-testid="stMetricLabel"] {
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.06em !important;
+    text-transform: uppercase !important;
+    color: #6b7280 !important;
+}
+[data-testid="stMetricValue"] {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 20px !important;
+    font-weight: 500 !important;
+    color: #111827 !important;
+}
+
+/* ── Tabs ───────────────────────────────────────────────────── */
+[data-testid="stTabs"] button {
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+}
+
+/* ── Dataframes ─────────────────────────────────────────────── */
+[data-testid="stDataFrame"] {
+    border: 1px solid #e5e7eb !important;
+    border-radius: 8px !important;
+}
+
+/* ── Dividers ───────────────────────────────────────────────── */
+hr {
+    border-color: #e5e7eb !important;
+    margin: 1.5rem 0 !important;
+}
+
+/* ── Info / warning / error boxes ──────────────────────────── */
+[data-testid="stAlert"] {
+    border-radius: 8px !important;
+    border-left-width: 3px !important;
+    font-size: 13px !important;
+}
+
+/* ── Expanders ──────────────────────────────────────────────── */
+details summary {
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    color: #374151 !important;
+}
+
+/* ── Status boxes ───────────────────────────────────────────── */
+[data-testid="stStatusContainer"] {
+    border-radius: 8px !important;
+    font-size: 13px !important;
+}
+
+/* ── Download buttons ───────────────────────────────────────── */
+.stDownloadButton > button {
+    background: #f0f9ff !important;
+    border: 1px solid #bfdbfe !important;
+    border-radius: 7px !important;
+    color: #1d4ed8 !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+}
+.stDownloadButton > button:hover {
+    background: #dbeafe !important;
+}
+
+/* ── Text inputs ────────────────────────────────────────────── */
+[data-testid="stTextInput"] input {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 13px !important;
+    border-radius: 6px !important;
+    border-color: #d1d5db !important;
+}
+[data-testid="stTextInput"] input:focus {
+    border-color: #4d9de0 !important;
+    box-shadow: 0 0 0 2px rgba(77,157,224,0.15) !important;
+}
+
+/* ── Select boxes ───────────────────────────────────────────── */
+[data-testid="stSelectbox"] > div > div {
+    border-radius: 6px !important;
+    font-size: 13px !important;
+}
+
+/* ── Captions ───────────────────────────────────────────────── */
+[data-testid="stCaptionContainer"] p {
+    font-size: 12px !important;
+    color: #6b7280 !important;
+}
+
+/* ── Section subheaders ─────────────────────────────────────── */
+h2 {
+    font-size: 16px !important;
+    font-weight: 600 !important;
+    color: #111827 !important;
+    letter-spacing: -0.01em !important;
+    border-bottom: 1px solid #f3f4f6 !important;
+    padding-bottom: 0.5rem !important;
+    margin-bottom: 1rem !important;
+}
+h3 {
+    font-size: 14px !important;
+    font-weight: 600 !important;
+    color: #374151 !important;
+}
+
+/* ── Step badge ─────────────────────────────────────────────── */
+.step-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    background: #0f1117;
+    color: #ffffff;
+    border-radius: 50%;
+    font-size: 11px;
+    font-weight: 600;
+    margin-right: 6px;
+    flex-shrink: 0;
+}
+
+/* ── Workflow steps header ──────────────────────────────────── */
+.workflow-header {
+    background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    margin-bottom: 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+}
+.workflow-step {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #6b7280;
+    font-weight: 400;
+}
+.workflow-step.active {
+    color: #111827;
+    font-weight: 500;
+}
+.workflow-step .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #d1d5db;
+    flex-shrink: 0;
+}
+.workflow-step.active .dot {
+    background: #4d9de0;
+}
+.workflow-arrow {
+    color: #d1d5db;
+    font-size: 12px;
+}
+
+/* ── Tag pills ──────────────────────────────────────────────── */
+.tag-pill {
+    display: inline-block;
+    background: #f3f4f6;
+    border: 1px solid #e5e7eb;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 500;
+    color: #374151;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.tag-pill.required {
+    background: #fef3c7;
+    border-color: #fcd34d;
+    color: #92400e;
+}
+.tag-pill.optional {
+    background: #f0fdf4;
+    border-color: #bbf7d0;
+    color: #166534;
+}
+
+/* ── Section separator with label ──────────────────────────── */
+.section-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 2rem 0 1rem 0;
+}
+.section-label-text {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #9ca3af;
+    white-space: nowrap;
+}
+.section-label-line {
+    flex: 1;
+    height: 1px;
+    background: #e5e7eb;
+}
+
+/* ── Hide streamlit branding ────────────────────────────────── */
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding-top: 1rem !important; }
+</style>
+""", unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════
-# SIDEBAR
+# HEADER BAR
 # ═══════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.header("Configuration")
-    PHANTOM   = st.text_input("Phantom Sp. Procurement code", value="50")
-    VERIFY_L1 = st.text_input("Verify component L1",         value="0010748460")
-    VERIFY_L2 = st.text_input("Verify component L2",         value="0010748458")
-    VERIFY_L3 = st.text_input("Verify L3 (phantom)",         value="0010748814")
-    VERIFY_L4 = st.text_input("Verify component L4",         value="0010300601DEL")
-    st.divider()
-
-    st.subheader("MRP files")
-    bom_file     = st.file_uploader("BOM file (.xlsx) ✱",              type=["xlsx","xls"], key="bom")
-    req_file     = st.file_uploader("Req and Stock (.xlsx) ✱",         type=["xlsx","xls"], key="req")
-    prod_file    = st.file_uploader("Production Orders (.xlsx) — optional", type=["xlsx","xls"], key="prod")
-    receipt_file = st.file_uploader("Receipt Quantities (.xlsx) — optional",
-                                    type=["xlsx","xls"], key="receipt",
-                                    help="GR/receipt quantities added to stock before MRP")
-    run_mrp_btn  = st.button("▶ Run MRP", type="primary", use_container_width=True)
-
-    st.divider()
-    st.subheader("Segment Capacity (optional)")
-    seg_imp_file = st.file_uploader(
-        "Segment & Import Part file (.xlsx)",
-        type=["xlsx","xls"], key="seg",
-        help="Sheet 1: Import Part List  |  Sheet 2: Segment (IDU / ODU codes)")
-    run_seg_btn  = st.button("▶ Run Segment Capacity", use_container_width=True)
-
-    # ── RM Group filter (sidebar) ─────────────────────────────
-    seg_r = st.session_state.get('seg_results')
-    if seg_r is not None:
-        rm_map_s      = seg_r.get('rm_map', {})
-        active_grps_s = seg_r.get('active_rm_groups', [])
-        all_rm_grps   = sorted(set(rm_map_s.values())) if rm_map_s else []
-        if all_rm_grps:
-            st.divider()
-            st.subheader('🔩 RM Group Filter')
-            st.caption('Uncheck to exclude parts. Click **Apply** to recalculate.')
-            selected_groups_sb = []
-            for grp in all_rm_grps:
-                if st.checkbox(grp, value=(grp in active_grps_s), key=f'rm_sb_{grp}'):
-                    selected_groups_sb.append(grp)
-            apply_filter_btn = st.button('🔄 Apply filter', key='apply_rm_filter',
-                                         use_container_width=True, type='primary')
-        else:
-            selected_groups_sb = []
-            apply_filter_btn   = False
-    else:
-        selected_groups_sb = []
-        apply_filter_btn   = False
+st.markdown("""
+<div class="mrp-header">
+    <div class="mrp-logo">⚙ <span>SAP</span> MRP Engine</div>
+    <div class="mrp-tagline">L1–L4 BOM Explosion · Phantom Handling · NET Propagation · Segment Capacity</div>
+</div>
+""", unsafe_allow_html=True)
 
 
-    st.divider()
-    st.subheader("Aging Material Analysis (optional)")
-    aging_file = st.file_uploader(
-        "Aging Material Details (.xlsx)",
-        type=["xlsx","xls"], key="aging",
-        help="Aging snapshot as on a given date. Buckets: 0-15, 16-30, 31-60, 61-90, "
-             "91-120, 121-150, 151-180, 181-360, Over361 (Qty & Value)")
-    aging_base_date = st.date_input(
-        "Aging data as-on date",
-        value=pd.Timestamp("2026-05-01"),
-        key="aging_date",
-        help="The date the aging snapshot was taken (e.g. May 1 2026)")
-    run_aging_btn = st.button("▶ Run Aging Projection", use_container_width=True)
+# ═══════════════════════════════════════════════════════════════
+# HELPER: section label divider
+# ═══════════════════════════════════════════════════════════════
+def section_label(text):
+    st.markdown(f"""
+    <div class="section-label">
+        <span class="section-label-line"></span>
+        <span class="section-label-text">{text}</span>
+        <span class="section-label-line"></span>
+    </div>""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHANTOM CONFIG (top-level, collapsible)
+# ═══════════════════════════════════════════════════════════════
+with st.expander("⚙️  Engine configuration & verification codes", expanded=False):
+    st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
+    cfg1, cfg2, cfg3, cfg4, cfg5 = st.columns(5)
+    with cfg1:
+        PHANTOM = st.text_input(
+            "Phantom Sp. Procurement",
+            value="50",
+            help="Special procurement key that marks a BOM item as a phantom assembly",
+            key="cfg_phantom"
+        )
+    with cfg2:
+        VERIFY_L1 = st.text_input("Verify L1 component", value="0010748460", key="cfg_vl1")
+    with cfg3:
+        VERIFY_L2 = st.text_input("Verify L2 component", value="0010748458", key="cfg_vl2")
+    with cfg4:
+        VERIFY_L3 = st.text_input("Verify L3 (phantom)", value="0010748814", key="cfg_vl3")
+    with cfg5:
+        VERIFY_L4 = st.text_input("Verify L4 component", value="0010300601DEL", key="cfg_vl4")
+    st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -218,7 +542,7 @@ def load_receipt_qty(receipt_file):
             df[qty_col].astype(str).str.replace(",","",regex=False).str.strip(),
             errors="coerce").fillna(0)
         result = df.groupby(mat_col)[qty_col].sum()
-        st.sidebar.success(f"Receipt file: {len(result):,} components loaded.")
+        st.success(f"✓ Receipt file: {len(result):,} components loaded.")
         return result
     except Exception as e:
         st.warning(f"Receipt file error ({e}) — skipped.")
@@ -284,7 +608,7 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
         fg_id = f"FG_{fg}_A{alt}".replace("-","_").replace(".","_")
         node_attrs[fg_id] = (
             f'label="FG: {fg}\\nAlt: {alt}\\nTotal demand: {fg_demand.get((fg,alt),0):,.0f}"'
-            f' shape=box style="filled,rounded" fillcolor="#2e86c1" fontcolor=white fontsize=11'
+            f' shape=box style="filled,rounded" fillcolor="#1a1f2e" fontcolor="#e8f4fd" fontsize=11'
         )
         prev_id = fg_id
         for comp, desc, qty, sp in zip(path["path_comps"],path["path_descs"],path["path_qtys"],path["path_sp"]):
@@ -299,16 +623,16 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
                 label = (f"{trunc(comp)}\\n{trunc(desc)}\\nStock: {stk:,.0f} | Conf: {conf:,.0f}\\n"
                          f"Open PO: {oprod:,.0f}\\nGross: {gross:,.0f} | Short: {shortage:,.0f}")
                 node_attrs[nid] = (f'label="{label}" shape=box style="filled,rounded"'
-                                   f' fillcolor="#1e8449" fontcolor=white fontsize=11 penwidth=2.5')
+                                   f' fillcolor="#14532d" fontcolor="#dcfce7" fontsize=11 penwidth=2.5')
             elif is_ph:
                 label = f"PHANTOM\\n{trunc(comp)}\\n{trunc(desc)}\\nqty={qty:g} (pass-through)"
                 node_attrs[nid] = (f'label="{label}" shape=box style="filled,dashed"'
-                                   f' fillcolor="#f39c12" fontcolor="#333" fontsize=10')
+                                   f' fillcolor="#78350f" fontcolor="#fef3c7" fontsize=10')
             else:
                 label = (f"{trunc(comp)}\\n{trunc(desc)}\\nQty: {qty:g} | Stock: {stk:,.0f}\\n"
                          f"Gross: {gross:,.0f} | Short: {shortage:,.0f}")
                 node_attrs[nid] = (f'label="{label}" shape=box style="filled,rounded"'
-                                   f' fillcolor="#f9e79f" fontcolor="#333" fontsize=10')
+                                   f' fillcolor="#f8fafc" fontcolor="#1e293b" fontsize=10')
             ek = (prev_id, nid)
             if ek not in seen_edges:
                 edges.append((prev_id, nid, f"×{qty:g}"))
@@ -316,24 +640,28 @@ def build_dot_tree(component, paths, req_df, months, stock, prod_summary):
             prev_id = nid
 
     lines = ["digraph MRP {","  rankdir=TB;",
-             '  node [fontname="Arial"];','  edge [fontname="Arial" fontsize=10];',
-             "  graph [splines=ortho nodesep=0.6 ranksep=0.8];"]
+             '  node [fontname="IBM Plex Sans"];','  edge [fontname="IBM Plex Sans" fontsize=10];',
+             "  graph [splines=ortho nodesep=0.6 ranksep=0.8 bgcolor=transparent];"]
     for nid, attrs in node_attrs.items():
         lines.append(f'  "{nid}" [{attrs}];')
     for src, dst, lbl in edges:
-        lines.append(f'  "{src}" -> "{dst}" [label="{lbl}"];')
+        lines.append(f'  "{src}" -> "{dst}" [label="{lbl}" color="#9ca3af"];')
     lines.append("}")
     return "\n".join(lines)
 
 
 def show_search_section(bom, req_df, months, stock, prod_summary):
-    st.divider()
-    st.subheader("🔍 Component Search")
+    section_label("Component Search & Ancestry")
     st.caption("Enter any component code to see demand, shortage, production orders and BOM ancestry tree.")
-    scol, _ = st.columns([2,3])
-    with scol:
-        comp = st.text_input("Component code", placeholder="e.g. 0010748458",
-                             label_visibility="collapsed").strip()
+
+    search_col, _ = st.columns([2, 3])
+    with search_col:
+        comp = st.text_input(
+            "Component code",
+            placeholder="e.g. 0010748458",
+            label_visibility="collapsed",
+            key="comp_search_input"
+        ).strip()
     if not comp:
         return
 
@@ -357,8 +685,9 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
     conf_qty = float(prod_row["Confirmed_Qty"].iloc[0])       if not prod_row.empty else 0
     open_qty = float(prod_row["Open_Production_Qty"].iloc[0]) if not prod_row.empty else 0
 
-    ph_badge = " 🔶 PHANTOM" if str(sp).strip()==PHANTOM else ""
-    st.markdown(f"### `{comp}` — {desc}{ph_badge}")
+    ph_badge = " · 🔶 PHANTOM" if str(sp).strip()==PHANTOM else ""
+    st.markdown(f"**`{comp}`** — {desc}{ph_badge}")
+
     c1,c2,c3,c4,c5 = st.columns(5)
     c1.metric("Stock on hand",      f"{stk:,.3f}")
     c2.metric("Confirmed prod qty", f"{conf_qty:,.0f}")
@@ -377,17 +706,15 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
                         Stock_Remaining=("Stock_Remaining","last")))
         monthly["_ord"] = monthly["Month"].map(mo)
         monthly = monthly.sort_values("_ord").drop(columns="_ord")
-
-        # Net Position = Stock − cumulative gross demand
         monthly["Cumul_Gross"] = monthly["Gross_Requirement"].cumsum()
         monthly["Net_Position"] = stk - monthly["Cumul_Gross"]
 
         def hl(row):
             if row["Net_Position"] < 0:
-                return ["background-color:#ffe0e0"]*len(row)
+                return ["background-color:#fff0f0"] * len(row)
             elif row["Net_Position"] > 0:
-                return ["background-color:#e8f8e8"]*len(row)
-            return [""]*len(row)
+                return ["background-color:#f0fdf4"] * len(row)
+            return [""] * len(row)
 
         display_cols = ["Month","Gross_Requirement","Stock_Used","Stock_Remaining","Net_Position"]
         st.dataframe(
@@ -395,7 +722,7 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
                 "Gross_Requirement":"{:,.2f}","Stock_Used":"{:,.2f}",
                 "Stock_Remaining":"{:,.2f}","Net_Position":"{:,.2f}"}),
             use_container_width=True, hide_index=True)
-        st.caption("Net Position = Stock − cumulative gross demand | 🟢 positive = surplus · 🔴 negative = shortage")
+        st.caption("Net Position = Stock − cumulative gross demand · 🟢 surplus · 🔴 shortage")
 
         s1,s2,s3,s4 = st.columns(4)
         s1.metric("Total gross req",  f"{monthly['Gross_Requirement'].sum():,.2f}")
@@ -409,12 +736,12 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
         st.info("Component in BOM but not in MRP results (phantom or no demand).")
 
     st.markdown("#### BOM ancestry tree")
-    st.caption("🔵 FG   🟡 Intermediate   🟠 Phantom (pass-through)   🟢 Searched component")
+    st.caption("◼ FG   □ Intermediate   ▣ Phantom (pass-through)   ◉ Searched component")
     paths = get_ancestry_paths(comp, bom)
     if not paths:
         st.info("No ancestry paths found.")
         return
-    # Build description lookup from BOM
+
     desc_map = {}
     if "BOM header descripti" in bom.columns:
         desc_map = (bom[["BOM Header","BOM header descripti"]]
@@ -440,7 +767,7 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
     MAX_PATHS = 12
     display_paths = paths[:MAX_PATHS]
     if len(paths) > MAX_PATHS:
-        st.caption(f"⚠️ Showing {MAX_PATHS} of {len(paths)} ancestry paths.")
+        st.caption(f"⚠ Showing {MAX_PATHS} of {len(paths)} ancestry paths.")
     dot = build_dot_tree(comp, display_paths, req_df, months, stock, prod_summary)
     try:
         st.graphviz_chart(dot, use_container_width=True)
@@ -456,16 +783,11 @@ def show_search_section(bom, req_df, months, stock, prod_summary):
 def load_segment_import(seg_imp_file):
     xl     = pd.ExcelFile(seg_imp_file)
     sheets = xl.sheet_names
-
-    # ── Import Part List sheet ────────────────────────────────────
-    # Columns: Component | RM Group | Source
     imp_sheet = next((s for s in sheets if "import" in s.lower()), sheets[0])
     imp_df    = pd.read_excel(seg_imp_file, sheet_name=imp_sheet, header=0)
     imp_df.columns = [str(c).strip() for c in imp_df.columns]
-
     comp_col = imp_df.columns[0]
     imp_df[comp_col] = imp_df[comp_col].astype(str).str.strip()
-
     rm_col = next((c for c in imp_df.columns
                    if "rm" in c.lower() or "group" in c.lower()), None)
     if rm_col:
@@ -473,20 +795,11 @@ def load_segment_import(seg_imp_file):
         rm_map = dict(zip(imp_df[comp_col], imp_df[rm_col]))
     else:
         rm_map = {}
-
     import_parts = sorted(imp_df[comp_col].dropna().unique())
-
-    # ── Segment sheet ─────────────────────────────────────────────
-    # Columns: Segment | FG code | IDU | COMPATIBLE ODU
-    # • IDU  is UNIQUE  — each FG has its own dedicated IDU
-    # • ODU  is COMMON  — multiple FGs can share the same ODU model
-    # Each row = one FG product with its specific IDU and compatible ODU.
     seg_sheet = next((s for s in sheets if "seg" in s.lower()),
                      sheets[min(1, len(sheets) - 1)])
     seg_df    = pd.read_excel(seg_imp_file, sheet_name=seg_sheet, header=0)
     seg_df.columns = [str(c).strip() for c in seg_df.columns]
-
-    # Map positional columns to fixed internal names
     col_map = {seg_df.columns[0]: "Segment",
                seg_df.columns[1]: "FG_Code",
                seg_df.columns[2]: "IDU"}
@@ -495,22 +808,17 @@ def load_segment_import(seg_imp_file):
     seg_df = seg_df.rename(columns=col_map)
     if "Compatible_ODU" not in seg_df.columns:
         seg_df["Compatible_ODU"] = ""
-
     for c in ("Segment", "FG_Code", "IDU", "Compatible_ODU"):
         seg_df[c] = seg_df[c].astype(str).str.strip()
-
-    # Drop rows that are blank / NaN in key columns
     seg_df = seg_df[
         seg_df["Segment"].notna() & (seg_df["Segment"] != "") & (seg_df["Segment"] != "nan") &
         seg_df["FG_Code"].notna() & (seg_df["FG_Code"] != "") & (seg_df["FG_Code"] != "nan") &
         seg_df["IDU"].notna()     & (seg_df["IDU"]     != "") & (seg_df["IDU"]     != "nan")
     ].copy().reset_index(drop=True)
-
     return import_parts, seg_df, rm_map
 
 
 def explode_bom_for_seg(bom_header, bom_df, target_set, phantom=None):
-    """BOM explosion returning {import_part: qty_per_unit}. Uses primary Alt."""
     if phantom is None:
         phantom = PHANTOM
     alts = sorted(bom_df[bom_df["BOM Header"]==bom_header]["Alt"].unique())
@@ -518,13 +826,10 @@ def explode_bom_for_seg(bom_header, bom_df, target_set, phantom=None):
         return {}
     alt = alts[0]
     sub = bom_df[(bom_df["BOM Header"]==bom_header)&(bom_df["Alt"]==alt)]
-
     children_map = defaultdict(list)
     for _, r in sub.iterrows():
         children_map[r["Parent"]].append(r)
-
     result = {}
-
     def dfs(node, accum, depth=0):
         if depth > 12:
             return
@@ -536,44 +841,15 @@ def explode_bom_for_seg(bom_header, bom_df, target_set, phantom=None):
             if comp in target_set:
                 result[comp] = result.get(comp, 0) + eff
             dfs(comp, eff, depth+1)
-
     dfs(bom_header, 1.0)
     return result
 
 
 def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
-    """
-    Segment production capacity — FG-level LP.
-
-    Data model (from Excel):
-        Segment | FG_Code | IDU (unique per FG) | Compatible_ODU (shared pool)
-
-    One LP variable per FG code  →  x[fg] = number of sets to produce.
-
-    Material constraints:
-        • IDU parts  : unique per FG  → each FG's IDU BOM contributes independently
-        • ODU parts  : shared pool    → all FGs that use the same ODU compete for
-                                        the same ODU import-part stock
-
-    Constraint per import part p:
-        Σ_fg  IDU_req[p, fg] × x[fg]
-      + Σ_odu ODU_req[p, odu] × (Σ_{fg using odu} x[fg])   ≤  stock[p]
-
-    Which simplifies to:
-        Σ_fg  (IDU_req[p, fg] + ODU_req[p, odu(fg)]) × x[fg]  ≤  stock[p]
-
-    Because ODU_req[p, odu] is the same for every FG that uses that ODU,
-    the combined coefficient per FG is simply IDU_part_qty + ODU_part_qty —
-    and two FGs sharing the same ODU naturally compete for ODU stock through
-    their shared ODU coefficient in the same constraint row.
-    """
     status = st.status("Running Segment Capacity calculation ...", expanded=True)
-
     with status:
         st.write("► Loading Segment and Import Part data ...")
     import_parts, seg_df, rm_map = load_segment_import(seg_imp_file)
-
-    # Filter import parts by active RM groups
     all_rm_groups = sorted(set(rm_map.values())) if rm_map else []
     if active_rm_groups is None:
         active_rm_groups = all_rm_groups
@@ -582,8 +858,6 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
                         if rm_map.get(p, "Unknown") in active_rm_groups]
     target_set  = set(import_parts)
     bom_headers = set(bom["BOM Header"].unique())
-
-    # Build FG/IDU/ODU code → description map from BOM
     desc_col = "BOM header descripti" if "BOM header descripti" in bom.columns else None
     if desc_col:
         desc_map = (bom[["BOM Header", desc_col]]
@@ -592,21 +866,16 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
                     .to_dict())
     else:
         desc_map = {}
-
     with status:
         st.write("► Exploding BOM for every IDU and ODU ...")
-
-    # ── Explode IDU BOMs (unique per FG) ──────────────────────────
-    idu_reqs  = {}   # {idu_code: {part: qty}}
+    idu_reqs  = {}
     not_in_bom = []
     for idu in seg_df["IDU"].unique():
         if idu in bom_headers:
             idu_reqs[idu] = explode_bom_for_seg(idu, bom, target_set)
         else:
             not_in_bom.append(f"IDU {idu}")
-
-    # ── Explode ODU BOMs (shared pool — explode once per unique ODU) ─
-    odu_reqs = {}    # {odu_code: {part: qty}}
+    odu_reqs = {}
     for odu in seg_df["Compatible_ODU"].unique():
         if not odu or odu == "nan":
             continue
@@ -614,64 +883,44 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
             odu_reqs[odu] = explode_bom_for_seg(odu, bom, target_set)
         else:
             not_in_bom.append(f"ODU {odu}")
-
     if not_in_bom:
         st.warning(f"Not found in BOM (excluded): {', '.join(sorted(set(not_in_bom)))}")
-
     with status:
         st.write("► Building FG-level combined requirements ...")
-
-    # ── Per-FG combined requirement ────────────────────────────────
-    # combined[fg][part] = IDU_qty[part] + ODU_qty[part]
-    # ODU parts shared: two FGs with same ODU both carry ODU_qty in their
-    # coefficient → the LP constraint automatically limits total ODU consumption.
-    fg_list        = []   # ordered list of FG codes (LP variable order)
-    fg_segment     = {}   # fg → segment name
-    fg_idu         = {}   # fg → IDU code
-    fg_odu         = {}   # fg → ODU code
-    fg_combined    = {}   # fg → {part: qty_per_set}
+    fg_list        = []
+    fg_segment     = {}
+    fg_idu         = {}
+    fg_odu         = {}
+    fg_combined    = {}
     skipped_segs   = []
-
     for _, row in seg_df.iterrows():
         fg  = row["FG_Code"]
         seg = row["Segment"]
         idu = row["IDU"]
         odu = row["Compatible_ODU"]
-
         if not odu or odu == "nan":
             skipped_segs.append(f"{fg} ({seg}): no compatible ODU")
             continue
-
         idu_req = idu_reqs.get(idu, {})
         odu_req = odu_reqs.get(odu, {})
-
         if not idu_req and not odu_req:
             skipped_segs.append(f"{fg} ({seg}): no import parts in BOM for IDU {idu} or ODU {odu}")
             continue
-
-        # Combine: additive because 1 set needs 1 IDU's parts + 1 ODU's parts
         all_parts = set(idu_req) | set(odu_req)
         combined  = {p: idu_req.get(p, 0) + odu_req.get(p, 0)
                      for p in all_parts
                      if idu_req.get(p, 0) + odu_req.get(p, 0) > 0}
-
         fg_list.append(fg)
         fg_segment[fg]  = seg
         fg_idu[fg]      = idu
         fg_odu[fg]      = odu
         fg_combined[fg] = combined
-
     if not fg_list:
         st.error("No FG codes with valid BOM data found. Check IDU/ODU codes against BOM.")
         return None
-
     with status:
         st.write(f"► Running LP optimisation across {len(fg_list)} FG codes ...")
-
     n_fg = len(fg_list)
-
-    # Build LP constraint matrix  A × x ≤ b
-    # One row per import part that appears in at least one FG's combined req
     constrained_parts, A_rows, b_rows = [], [], []
     for p in import_parts:
         row_vec = [fg_combined[fg].get(p, 0) for fg in fg_list]
@@ -679,24 +928,16 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
             constrained_parts.append(p)
             A_rows.append(row_vec)
             b_rows.append(float(stock.get(p, 0)))
-
     A   = np.array(A_rows, dtype=float)
     b   = np.array(b_rows, dtype=float)
-    c   = -np.ones(n_fg)          # maximise Σ x[fg]
-
-    res = linprog(c, A_ub=A, b_ub=b,
-                  bounds=[(0, None)] * n_fg,
-                  method="highs")
-
+    c   = -np.ones(n_fg)
+    res = linprog(c, A_ub=A, b_ub=b, bounds=[(0, None)] * n_fg, method="highs")
     if res.status not in (0, 1):
         st.error(f"LP did not converge: {res.message}")
         return None
-
     alloc_float = res.x
     alloc_int   = np.floor(alloc_float).astype(int)
     total_sets  = int(alloc_int.sum())
-
-    # ── FG-level results ──────────────────────────────────────────
     fg_results = []
     for fg, qty in zip(fg_list, alloc_int):
         creq = fg_combined[fg]
@@ -719,23 +960,17 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
             "Limiting_Stock": int(stock.get(lim_part, 0)) if lim_part != "—" else 0,
             "combined_req":   creq,
         })
-
-    # ── Segment-level aggregation ─────────────────────────────────
     seg_totals = defaultdict(int)
-    seg_fg_map = defaultdict(list)   # segment → list of fg result dicts
+    seg_fg_map = defaultdict(list)
     for fgr in fg_results:
         seg_totals[fgr["Segment"]] += fgr["Max_Sets"]
         seg_fg_map[fgr["Segment"]].append(fgr)
-
-    # segments_data kept for backward compat with display helpers
     segments_data = {}
     for seg, fgrs in seg_fg_map.items():
         idu_codes = list({f["IDU"] for f in fgrs})
         odu_codes = list({f["Compatible_ODU"] for f in fgrs})
-        # combined_req at segment level = worst-case across FGs (for display only)
         all_parts = set(p for f in fgrs for p in f["combined_req"])
-        combined  = {p: max(f["combined_req"].get(p, 0) for f in fgrs)
-                     for p in all_parts}
+        combined  = {p: max(f["combined_req"].get(p, 0) for f in fgrs) for p in all_parts}
         segments_data[seg] = {
             "combined_req": combined,
             "idu_codes":    idu_codes,
@@ -743,11 +978,8 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
             "idu_count":    len(idu_codes),
             "odu_count":    len(odu_codes),
         }
-
     segs          = list(segments_data.keys())
     seg_alloc_arr = np.array([seg_totals[s] for s in segs], dtype=int)
-
-    # ── Part utilisation ──────────────────────────────────────────
     part_usage = {}
     for p, row_vec, avail in zip(constrained_parts, A_rows, b_rows):
         used = sum(row_vec[j] * alloc_int[j] for j in range(n_fg))
@@ -757,17 +989,15 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
             "remain": max(0, avail - used),
             "pct":    round(100 * used / avail, 1) if avail > 0 else 0,
         }
-
     with status:
         st.write("► Done.")
     status.update(label="Segment Capacity complete ✅", state="complete", expanded=False)
-
     return dict(
         segs=segs,
         alloc_int=seg_alloc_arr,
         total_sets=total_sets,
         segments_data=segments_data,
-        fg_results=fg_results,           # ← FG-level detail (new)
+        fg_results=fg_results,
         import_parts=import_parts,
         constrained_parts=constrained_parts,
         part_usage=part_usage,
@@ -778,10 +1008,8 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
     )
 
 
-def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
-    # Always read latest result so metrics update after RM filter rerun
+def display_segment_results(r):
     r = st.session_state.get("seg_results", r)
-
     segs          = r["segs"]
     alloc_int     = r["alloc_int"]
     total_sets    = r["total_sets"]
@@ -794,22 +1022,45 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
     active_groups = r.get("active_rm_groups", [])
     all_rm_groups = sorted(set(rm_map.values())) if rm_map else []
 
-    st.divider()
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total FG sets producible",   f"{total_sets:,}")
-    m2.metric("FG codes with production",   f"{sum(1 for f in fg_results if f['Max_Sets'] > 0)} / {len(fg_results)}")
-    m3.metric("Segments with production",   f"{(alloc_int > 0).sum()} / {len(segs)}")
-    m4.metric("Import parts constrained",   f"{len(r['constrained_parts'])}")
+    m1.metric("Total FG sets producible",  f"{total_sets:,}")
+    m2.metric("FG codes with production",  f"{sum(1 for f in fg_results if f['Max_Sets'] > 0)} / {len(fg_results)}")
+    m3.metric("Segments with production",  f"{(alloc_int > 0).sum()} / {len(segs)}")
+    m4.metric("Import parts constrained",  f"{len(r['constrained_parts'])}")
 
     if r["skipped_segs"]:
-        with st.expander(f"⚠️ {len(r['skipped_segs'])} FGs skipped"):
+        with st.expander(f"⚠ {len(r['skipped_segs'])} FGs skipped"):
             for s in r["skipped_segs"]:
-                st.text(f"  • {s}")
+                st.text(f"  · {s}")
 
-    # ── FG-level results (primary table) ─────────────────────────
-    st.subheader("📦 Sets producible per FG code")
-    st.caption("Each row = one finished good. IDU is unique to that FG. "
-               "ODU parts are shared — two FGs with the same ODU compete for the same stock.")
+    # ── RM Group filter (inline) ───────────────────────────────
+    if all_rm_groups:
+        section_label("RM Group Filter")
+        st.caption("Uncheck to exclude parts, then click **Apply** to recalculate.")
+        rm_cols = st.columns(min(len(all_rm_groups), 6))
+        selected_groups_inline = []
+        for i, grp in enumerate(all_rm_groups):
+            with rm_cols[i % len(rm_cols)]:
+                if st.checkbox(grp, value=(grp in active_groups), key=f'rm_inline_{grp}'):
+                    selected_groups_inline.append(grp)
+        if st.button("↻ Apply RM filter", key="apply_rm_filter_inline", type="primary"):
+            _mrp = st.session_state.get("mrp_results")
+            _bom   = _mrp["bom"]   if _mrp else None
+            _stock = _mrp["stock"] if _mrp else None
+            _seg_bytes = st.session_state.get("seg_imp_bytes")
+            _seg_f = io.BytesIO(_seg_bytes) if _seg_bytes else None
+            if _seg_f is not None and _bom is not None:
+                with st.spinner("Recalculating with selected RM groups ..."):
+                    new_result = run_segment_capacity(
+                        _bom, _stock, _seg_f, active_rm_groups=selected_groups_inline)
+                    if new_result is not None:
+                        st.session_state["seg_results"] = new_result
+                        st.rerun()
+            else:
+                st.warning("Re-upload the Segment file and run Segment Capacity first.")
+
+    section_label("Sets producible per FG code")
+    st.caption("Each row = one finished good. IDU is unique to that FG. ODU parts are shared — two FGs with the same ODU compete for the same stock.")
     if fg_results:
         fg_df = pd.DataFrame([{
             "Segment":        f["Segment"],
@@ -822,49 +1073,43 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
             "Max Sets":       f["Max_Sets"],
             "Limiting Part":  f["Limiting_Part"],
             "Limiting Stock": f["Limiting_Stock"],
-        } for f in fg_results]).sort_values(["Segment", "Max Sets"],
-                                             ascending=[True, False])
+        } for f in fg_results]).sort_values(["Segment", "Max Sets"], ascending=[True, False])
 
         def hl_fg(row):
             if row["Max Sets"] > 0:
-                return ["background-color:#e8f8e8"] * len(row)
-            return ["background-color:#fff3cd"] * len(row)
+                return ["background-color:#f0fdf4"] * len(row)
+            return ["background-color:#fffbeb"] * len(row)
 
         st.dataframe(
             fg_df.style.apply(hl_fg, axis=1)
                  .format({"Max Sets": "{:,}", "Limiting Stock": "{:,}"}),
             use_container_width=True, hide_index=True)
 
-    # ── Segment rollup ────────────────────────────────────────────
-    st.subheader("📊 Segment rollup")
-    st.caption("Total sets = sum of all FG codes in that segment. "
-               "ODU stock is shared across FGs — already accounted for in LP.")
+    section_label("Segment rollup")
     seg_rows = []
     for s, qty in zip(segs, alloc_int):
         sd  = segments_data[s]
         fgs = [f for f in fg_results if f["Segment"] == s]
         seg_rows.append({
-            "Segment":        s,
-            "Total Sets":     int(qty),
-            "FG codes":       len(fgs),
-            "FGs producing":  sum(1 for f in fgs if f["Max_Sets"] > 0),
-            "Unique IDUs":    sd["idu_count"],
-            "Unique ODUs":    sd["odu_count"],
+            "Segment":       s,
+            "Total Sets":    int(qty),
+            "FG codes":      len(fgs),
+            "FGs producing": sum(1 for f in fgs if f["Max_Sets"] > 0),
+            "Unique IDUs":   sd["idu_count"],
+            "Unique ODUs":   sd["odu_count"],
         })
     seg_df_disp = pd.DataFrame(seg_rows).sort_values("Total Sets", ascending=False)
 
     def hl_seg(row):
         if row["Total Sets"] > 0:
-            return ["background-color:#e8f8e8"] * len(row)
-        return ["background-color:#f5f5f5;color:#999"] * len(row)
+            return ["background-color:#f0fdf4"] * len(row)
+        return ["background-color:#f9fafb;color:#9ca3af"] * len(row)
 
     st.dataframe(
-        seg_df_disp.style.apply(hl_seg, axis=1)
-                   .format({"Total Sets": "{:,}"}),
+        seg_df_disp.style.apply(hl_seg, axis=1).format({"Total Sets": "{:,}"}),
         use_container_width=True, hide_index=True)
 
-    # ── FG detail drill-down ──────────────────────────────────────
-    st.subheader("🔍 FG detail — import part breakdown")
+    section_label("FG detail — import part breakdown")
     fg_options = sorted(
         [f["FG_Code"] for f in fg_results],
         key=lambda fg: -next(f["Max_Sets"] for f in fg_results if f["FG_Code"] == fg))
@@ -873,12 +1118,10 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
         fgr  = next(f for f in fg_results if f["FG_Code"] == selected_fg)
         sets = fgr["Max_Sets"]
         st.markdown(
-            f"**{selected_fg}** — {fgr.get('FG_Desc','')}\n"
+            f"**{selected_fg}** — {fgr.get('FG_Desc','')} · "
             f"Segment: `{fgr['Segment']}` · "
-            f"IDU: `{fgr['IDU']}` ({fgr.get('IDU_Desc','')}) · "
-            f"ODU: `{fgr['Compatible_ODU']}` ({fgr.get('ODU_Desc','')}) · "
+            f"IDU: `{fgr['IDU']}` · ODU: `{fgr['Compatible_ODU']}` · "
             f"**Max sets: {sets:,}**")
-
         imp_rows = []
         for p, req in sorted(fgr["combined_req"].items(), key=lambda x: -x[1]):
             avail  = float(stock.get(p, 0))
@@ -894,7 +1137,7 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
         imp_df = pd.DataFrame(imp_rows)
 
         def hl_imp(row):
-            return (["background-color:#ffe0e0"] * len(row)
+            return (["background-color:#fff0f0"] * len(row)
                     if row["Binding?"] == "🔴 YES" else [""] * len(row))
 
         st.dataframe(
@@ -905,26 +1148,25 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
             use_container_width=True, hide_index=True)
         st.caption("🔴 Binding = this part alone limits the FG to the shown max sets")
 
-    # ── Import part utilisation ───────────────────────────────────
-    st.subheader("🔩 Import part stock utilisation")
+    section_label("Import part stock utilisation")
     pu_rows = []
     for p in import_parts:
         pu = part_usage.get(p, {})
         pu_rows.append({
-            "Import Part":  p,
-            "RM Group":     rm_map.get(p, "—"),
-            "Stock":        int(stock.get(p, 0)),
-            "Used":         int(pu.get("used", 0)),
-            "Remaining":    int(pu.get("remain", stock.get(p, 0))),
-            "Utilisation%": pu.get("pct", 0),
+            "Import Part":   p,
+            "RM Group":      rm_map.get(p, "—"),
+            "Stock":         int(stock.get(p, 0)),
+            "Used":          int(pu.get("used", 0)),
+            "Remaining":     int(pu.get("remain", stock.get(p, 0))),
+            "Utilisation%":  pu.get("pct", 0),
         })
     pu_df = pd.DataFrame(pu_rows).sort_values("Utilisation%", ascending=False)
 
     def hl_util(row):
         pct = row["Utilisation%"]
-        if pct >= 90:   return ["background-color:#ffe0e0"] * len(row)
-        elif pct >= 50: return ["background-color:#fff3cd"] * len(row)
-        elif pct > 0:   return ["background-color:#e8f8e8"] * len(row)
+        if pct >= 90:   return ["background-color:#fff0f0"] * len(row)
+        elif pct >= 50: return ["background-color:#fffbeb"] * len(row)
+        elif pct > 0:   return ["background-color:#f0fdf4"] * len(row)
         return [""] * len(row)
 
     tab_all, tab_const = st.tabs(["All import parts", "Constrained only"])
@@ -942,16 +1184,15 @@ def display_segment_results(r, seg_imp_file=None, bom=None, stock=None):
                                 "Remaining": "{:,}", "Utilisation%": "{:.1f}"}),
             use_container_width=True, hide_index=True)
 
-    # ── Excel download ────────────────────────────────────────────
     st.divider()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        fg_df.to_excel(writer,          sheet_name="FG Sets",              index=False)
-        seg_df_disp.to_excel(writer,    sheet_name="Segment Rollup",        index=False)
-        pu_df.to_excel(writer,          sheet_name="Import Part Utilisation", index=False)
+        fg_df.to_excel(writer,          sheet_name="FG Sets",                index=False)
+        seg_df_disp.to_excel(writer,    sheet_name="Segment Rollup",          index=False)
+        pu_df.to_excel(writer,          sheet_name="Import Part Utilisation",  index=False)
     buf.seek(0)
     st.download_button(
-        "⬇️ Download Segment Capacity (.xlsx)", data=buf,
+        "⬇ Download Segment Capacity (.xlsx)", data=buf,
         file_name="segment_production_capacity.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True, type="primary")
@@ -1175,10 +1416,9 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
     status.update(label="MRP complete ✅", state="complete", expanded=False)
 
     # ── Summary ────────────────────────────────────────────────
-    st.divider()
-    st.subheader("📊 Summary")
+    section_label("MRP Run Summary")
     if not receipt_qty.empty:
-        st.info(f"ℹ️ Receipt: {receipt_added} components had stock increased before MRP.")
+        st.info(f"ℹ Receipt: {receipt_added} components had stock increased before MRP.")
     c1,c2,c3,c4 = st.columns(4)
     for col_ui,lbl,df in zip([c1,c2,c3,c4],["L1","L2","L3","L4"],
                               [result_l1,result_l2,result_l3,result_l4]):
@@ -1188,8 +1428,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
             st.metric("With shortage", short)
 
     # ── Verification ───────────────────────────────────────────
-    st.divider()
-    st.subheader("🔍 Verification")
+    section_label("Verification")
     tab1,tab2,tab3,tab4 = st.tabs(["L1","L2","L3 (phantom)","L4"])
     def show_verify(tab, result_df, target, level_label):
         with tab:
@@ -1228,8 +1467,6 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
     # ── Export ─────────────────────────────────────────────────
     final_output = pd.concat([result_l1,result_l2,result_l3,result_l4], ignore_index=True)
     all_comps = final_output[["Component","Description"]].drop_duplicates(subset="Component").copy()
-
-    # Pivot Gross_Requirement → cumsum → Net Position = Stock - cumulative demand
     pivot_gross = (final_output
                    .pivot_table(index=["Component","Description"], columns="Month",
                                 values="Gross_Requirement", aggfunc="sum", fill_value=0)
@@ -1238,23 +1475,18 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
     month_cols = [m for m in months if m in pivot.columns]
     if month_cols:
         pivot[month_cols] = pivot[month_cols].cumsum(axis=1)
-
     bom_master = bom[["Component","Procurement type","Special procurement"]].drop_duplicates(subset="Component")
     stock_df   = stock.reset_index().rename(columns={"Stock_Qty":"Stock"})
     pivot = (pivot.merge(bom_master, on="Component", how="left")
                   .merge(stock_df,   on="Component", how="left")
                   .merge(prod_summary, on="Component", how="left"))
-
     pivot["Procurement type"]    = pivot["Procurement type"].fillna("")
     pivot["Special procurement"] = pivot["Special procurement"].fillna("")
     pivot["Stock"]               = pivot["Stock"].fillna(0)
     pivot["Confirmed_Qty"]       = pivot["Confirmed_Qty"].fillna(0)
     pivot["Open_Production_Qty"] = pivot["Open_Production_Qty"].fillna(0)
-
-    # Net Position = Stock - cumulative gross demand per month
     for m in month_cols:
         pivot[m] = pivot["Stock"] - pivot[m]
-
     if not receipt_qty.empty:
         rq_df = receipt_qty.reset_index(); rq_df.columns = ["Component","Receipt_Qty"]
         pivot = pivot.merge(rq_df, on="Component", how="left")
@@ -1262,7 +1494,6 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
         extra_cols = ["Receipt_Qty"]
     else:
         extra_cols = []
-
     pivot = pivot.rename(columns={"Description":"Component descri"})
     final_cols = (["Component","Component descri","Procurement type","Special procurement",
                    "Confirmed_Qty","Open_Production_Qty","Stock"] + extra_cols + month_cols)
@@ -1271,16 +1502,14 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
             pivot[c] = 0 if c in month_cols+["Confirmed_Qty","Open_Production_Qty","Stock","Receipt_Qty"] else ""
     pivot = pivot[final_cols].sort_values("Component").reset_index(drop=True)
 
-    st.divider()
-    st.subheader("📋 Output preview")
+    section_label("Output Preview")
     st.dataframe(pivot.head(200), use_container_width=True)
-    st.caption(f"{len(pivot):,} rows · {len(month_cols)} month columns · "
-               f"positive = surplus stock · negative = shortage")
+    st.caption(f"{len(pivot):,} rows · {len(month_cols)} month columns · positive = surplus · negative = shortage")
 
     buf = io.BytesIO()
     pivot.to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
-    st.download_button("⬇️ Download mrp_final.xlsx", data=buf, file_name="mrp_final.xlsx",
+    st.download_button("⬇ Download mrp_final.xlsx", data=buf, file_name="mrp_final.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        use_container_width=True, type="primary")
 
@@ -1291,23 +1520,20 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                 prod_summary=prod_summary,
                 result_l1=result_l1, result_l2=result_l2,
                 result_l3=result_l3, result_l4=result_l4,
-                raw_l1=l1_agg, raw_l2=l2_agg, raw_l3=l3_agg, raw_l4=l4_agg)
-
+                raw_l1=l1_agg, raw_l2=l2_agg, raw_l3=l3_agg, raw_l4=l4_agg,
+                receipt_qty=receipt_qty)
 
 
 # ═══════════════════════════════════════════════════════════════
 # AGING MATERIAL PROJECTION ENGINE
 # ═══════════════════════════════════════════════════════════════
-
 AGING_BUCKETS = ["0-15 Qty","16-30 Qty","31-60 Qty","61-90 Qty",
                  "91-120 Qty","121-150 Qty","151-180 Qty","181-360 Qty","Over361 Qty"]
 AGING_VAL_BUCKETS = ["0-15 Value","16-30 Value","31-60 Value","61-90 Value",
                      "91-120 Value","121-150 Value","151-180 Value","181-360 Value","Over361 Value"]
-AGING_THRESHOLD_IDX = 4   # index ≥ 4 (91-120+) = aging
 
 
 def load_aging_data(aging_file):
-    """Load aging Excel, aggregate by Material (sum across storage locations)."""
     df = pd.read_excel(aging_file)
     df.columns = [str(c).strip() for c in df.columns]
     rename = {}
@@ -1329,20 +1555,6 @@ def load_aging_data(aging_file):
 
 
 def project_aging(aging_df, base_date, production_consumption, months_list):
-    """
-    Correct aging logic agreed with user:
-
-    Aging pool grows each month as more buckets cross the 91-day threshold:
-      May-end  : 61-90  + 91-120 + 121-150 + 151-180 + 181-360 + Over361
-      Jun-end  : 31-60  + 61-90  + 91-120  + ...
-      Jul-end  : 16-30  + 31-60  + 61-90   + ...
-      Aug-end+ : 0-15   + 16-30  + 31-60   + ...  (entire stock)
-
-    Aging Qty  = max(0,  aging_pool  −  cumulative consumption up to that month)
-    Aging Value = Aging Qty × MAP
-
-    If a material is already short (consumption > total stock), aging = 0.
-    """
     base_ts = pd.Timestamp(base_date)
 
     def month_offset(label):
@@ -1357,47 +1569,28 @@ def project_aging(aging_df, base_date, production_consumption, months_list):
 
     month_offsets = [max(0, month_offset(m)) for m in months_list]
 
-    # Bucket index boundaries (AGING_BUCKETS order):
-    # 0:0-15  1:16-30  2:31-60  3:61-90  4:91-120  5:121-150  6:151-180  7:181-360  8:Over361
-    # At offset N months from base_date, buckets that have crossed 91 days:
-    #   offset=0 (base)    : buckets 4..8  (already 91+)
-    #   offset=1 (month 1) : buckets 3..8  (61-90 crosses 91)
-    #   offset=2 (month 2) : buckets 2..8  (31-60 crosses 91)
-    #   offset=3 (month 3) : buckets 1..8  (16-30 crosses 91)
-    #   offset>=4 (month4+): buckets 0..8  (all stock crosses 91)
     def aging_start_idx(offset):
-        return max(0, 4 - offset)   # which bucket index starts the aging pool
+        return max(0, 4 - offset)
 
     records = []
-
     for _, row in aging_df.iterrows():
         mat      = str(row["Material"]).strip()
         desc     = str(row.get("Material Description", ""))
         mat_type = str(row.get("Material Type", ""))
         map_px   = float(row.get("MAP", 0) or 0)
         buckets  = [float(row.get(b, 0) or 0) for b in AGING_BUCKETS]
-        total_stock = sum(buckets)
-
-        # Cumulative consumption per month (pre-compute)
-        cum_consumption = 0.0
         mat_cons = production_consumption.get(mat, {})
-
+        cum_consumption = 0.0
         for m_idx, month_label in enumerate(months_list):
             offset   = month_offsets[m_idx]
             cum_consumption += float(mat_cons.get(month_label, 0))
-
             start_idx  = aging_start_idx(offset)
-            aging_pool = sum(buckets[start_idx:])   # stock that is/will be aging
-            fresh_pool = sum(buckets[:start_idx])   # stock not yet aging (consumed first)
-
-            # Production consumes FRESH stock first.
-            # Only consumption exceeding fresh pool eats into aging stock.
+            aging_pool = sum(buckets[start_idx:])
+            fresh_pool = sum(buckets[:start_idx])
             aging_consumed = max(0.0, cum_consumption - fresh_pool)
             aging_qty      = max(0.0, aging_pool - aging_consumed)
             aging_val      = round(aging_qty * map_px, 2) if map_px > 0 else 0.0
-
             turning_next = buckets[start_idx - 1] if start_idx > 0 else 0.0
-
             records.append({
                 "Material":               mat,
                 "Description":            desc,
@@ -1409,16 +1602,14 @@ def project_aging(aging_df, base_date, production_consumption, months_list):
                 "Aging Value (Rs)":       aging_val,
                 "Turning Aging Next Month": round(turning_next, 2),
             })
-
     return pd.DataFrame(records)
 
 
 def display_aging_results(aging_proj_df, months_list, base_date):
-    st.divider()
-    st.header("📦 Aging Material Projection")
+    section_label("Aging Material Projection")
     st.caption(
-        f"Snapshot: **{pd.Timestamp(base_date).strftime('%d %b %Y')}**  ·  "
-        "Aging = stock ≥ 91 days  ·  Cumulative production consumption deducted each month"
+        f"Snapshot: **{pd.Timestamp(base_date).strftime('%d %b %Y')}** · "
+        "Aging = stock ≥ 91 days · Cumulative production consumption deducted each month"
     )
     if aging_proj_df.empty:
         st.warning("No aging projection data."); return
@@ -1429,7 +1620,6 @@ def display_aging_results(aging_proj_df, months_list, base_date):
     final_df       = aging_proj_df[aging_proj_df["Month"] == last_month]
     first_df       = aging_proj_df[aging_proj_df["Month"] == first_month]
 
-    # ── Metrics: first and last month aging value ─────────────────
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(f"Aging Value — {first_month}",
               f"Rs {first_df['Aging Value (Rs)'].sum():,.0f}")
@@ -1441,8 +1631,7 @@ def display_aging_results(aging_proj_df, months_list, base_date):
               f"{(final_df['Aging Value (Rs)'] > 0).sum():,}")
     c4.metric("Materials tracked", f"{aging_proj_df['Material'].nunique():,}")
 
-    # ── Month-wise summary — VALUE ONLY ──────────────────────────
-    st.subheader("Aging Value by Month-End")
+    section_label("Aging value by month-end")
     msumm = (aging_proj_df.groupby("Month", sort=False)
              .agg(Aging_Val   =("Aging Value (Rs)", "sum"),
                   Mat_Aging   =("Material",
@@ -1454,28 +1643,24 @@ def display_aging_results(aging_proj_df, months_list, base_date):
 
     def hl_val(row):
         v = row["Aging Value (Rs)"]
-        if v > 10_000_000: return ["background-color:#ffe0e0"] * len(row)
-        if v > 1_000_000:  return ["background-color:#fff3cd"] * len(row)
-        if v > 0:          return ["background-color:#e8f8e8"] * len(row)
+        if v > 10_000_000: return ["background-color:#fff0f0"] * len(row)
+        if v > 1_000_000:  return ["background-color:#fffbeb"] * len(row)
+        if v > 0:          return ["background-color:#f0fdf4"] * len(row)
         return [""] * len(row)
 
     st.dataframe(
         msumm.style.apply(hl_val, axis=1)
-             .format({"Aging Value (Rs)":              "Rs {:,.0f}",
-                      "Qty Turning Aging Next Month":  "{:,.0f}"}),
+             .format({"Aging Value (Rs)": "Rs {:,.0f}",
+                      "Qty Turning Aging Next Month": "{:,.0f}"}),
         use_container_width=True, hide_index=True)
-    st.caption("**Qty Turning Aging Next Month** = stock in the bucket just below the aging threshold — "
-               "will become aging in the next period regardless of consumption.")
 
-    # ── Material × Month aging value pivot ───────────────────────
-    st.subheader("Aging Value — Material × Month")
+    section_label("Aging value — material × month")
     piv = (aging_proj_df
            .pivot_table(index=["Material","Description"],
                         columns="Month", values="Aging Value (Rs)", aggfunc="sum")
            .reindex(columns=months_ordered, fill_value=0)
            .reset_index())
     aging_rows = piv[piv[months_ordered].max(axis=1) > 0].copy()
-    # Sort by last month aging value descending
     aging_rows = aging_rows.sort_values(last_month, ascending=False)
     piv_fmt = {m: "Rs {:,.0f}" for m in months_ordered}
     st.caption(f"{len(aging_rows):,} materials have aging value in at least one month")
@@ -1484,25 +1669,23 @@ def display_aging_results(aging_proj_df, months_list, base_date):
                   .background_gradient(subset=months_ordered, cmap="YlOrRd"),
         use_container_width=True, hide_index=True)
 
-    # ── Material detail for selected month ───────────────────────
-    st.subheader("Material Detail — Select Month")
+    section_label("Material detail — select month")
     sel_month = st.selectbox("View aging as of:", months_ordered,
                              index=len(months_ordered)-1, key="aging_month_sel")
     mdf = (aging_proj_df[aging_proj_df["Month"] == sel_month]
            .query("`Aging Value (Rs)` > 0")
            .sort_values("Aging Value (Rs)", ascending=False)
            .copy())
-
-    st.caption(f"{len(mdf):,} materials with aging value as of {sel_month}  ·  "
+    st.caption(f"{len(mdf):,} materials with aging value as of {sel_month} · "
                f"Total: Rs {mdf['Aging Value (Rs)'].sum():,.0f}")
-
     show_c = ["Material", "Description", "Material Type",
               "Aging Pool Qty", "Cumulative Consumption",
               "Aging Qty (>=91d)", "Aging Value (Rs)"]
+
     def hl_row(row):
         v = row["Aging Value (Rs)"]
-        if v > 500_000: return ["background-color:#ffe0e0"] * len(row)
-        if v > 100_000: return ["background-color:#fff3cd"] * len(row)
+        if v > 500_000: return ["background-color:#fff0f0"] * len(row)
+        if v > 100_000: return ["background-color:#fffbeb"] * len(row)
         return [""] * len(row)
 
     rs_fmt = {"Aging Pool Qty":         "{:,.0f}",
@@ -1511,208 +1694,249 @@ def display_aging_results(aging_proj_df, months_list, base_date):
               "Aging Value (Rs)":       "Rs {:,.0f}"}
     st.dataframe(mdf[show_c].style.apply(hl_row, axis=1).format(rs_fmt),
                  use_container_width=True, hide_index=True)
-    st.caption("🔴 > Rs 5L  🟡 Rs 1-5L  | "
-               "Aging Pool = stock that has/will cross 91d by this month-end  ·  "
-               "Consumption = cumulative production demand deducted")
 
-    # ── Download ──────────────────────────────────────────────────
     st.divider()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        msumm.to_excel(writer, sheet_name="Monthly Summary", index=False)
-        aging_rows.to_excel(writer, sheet_name="Aging Value Pivot", index=False)
-        aging_proj_df.to_excel(writer, sheet_name="Full Detail", index=False)
+        msumm.to_excel(writer,      sheet_name="Monthly Summary",    index=False)
+        aging_rows.to_excel(writer, sheet_name="Aging Value Pivot",  index=False)
+        aging_proj_df.to_excel(writer, sheet_name="Full Detail",     index=False)
     buf.seek(0)
     st.download_button(
-        "⬇️ Download Aging Projection (.xlsx)", data=buf,
+        "⬇ Download Aging Projection (.xlsx)", data=buf,
         file_name="aging_material_projection.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True, type="primary")
 
 
 # ═══════════════════════════════════════════════════════════════
-# SESSION STATE + ENTRY POINT
+# MAIN LAYOUT — 3 workflow tabs
 # ═══════════════════════════════════════════════════════════════
-if "mrp_results"  not in st.session_state: st.session_state["mrp_results"]  = None
-if "seg_results"  not in st.session_state: st.session_state["seg_results"]  = None
+if "mrp_results"   not in st.session_state: st.session_state["mrp_results"]   = None
+if "seg_results"   not in st.session_state: st.session_state["seg_results"]   = None
 if "aging_results" not in st.session_state: st.session_state["aging_results"] = None
 
-# ── MRP run ───────────────────────────────────────────────────
-if not run_mrp_btn and bom_file is None:
-    st.info("Upload your files in the sidebar, then click **▶ Run MRP**.")
-elif run_mrp_btn:
-    if bom_file is None or req_file is None:
-        st.warning("Please upload at least the BOM file and the Req & Stock file.")
-    else:
-        try:
-            results = run_mrp(bom_file, req_file, prod_file, receipt_file)
-            if results is not None:
-                st.session_state["mrp_results"] = results
-        except Exception as e:
-            st.exception(e)
+tab_mrp, tab_seg, tab_aging = st.tabs([
+    "📋  MRP Explosion (L1–L4)",
+    "🏭  Segment Capacity",
+    "📦  Aging Material Projection",
+])
 
-# Show MRP search if results available
-if st.session_state["mrp_results"] is not None:
-    r = st.session_state["mrp_results"]
-    try:
-        show_search_section(bom=r["bom"], req_df=r["req"], months=r["months"],
-                            stock=r["stock"], prod_summary=r["prod_summary"])
-    except Exception as e:
-        st.error(f"Search error: {e}")
+# ────────────────────────────────────────────────────────────────
+# TAB 1: MRP
+# ────────────────────────────────────────────────────────────────
+with tab_mrp:
+    section_label("File uploads")
 
-# ── Segment Capacity run ───────────────────────────────────────
-if run_seg_btn:
-    if seg_imp_file is None:
-        st.warning("Please upload the Segment & Import Part file to run Segment Capacity.")
+    u1, u2 = st.columns(2)
+    with u1:
+        st.markdown("**BOM file** <span class='tag-pill required'>required</span>", unsafe_allow_html=True)
+        bom_file = st.file_uploader("BOM", type=["xlsx","xls"], key="bom", label_visibility="collapsed")
+    with u2:
+        st.markdown("**Req & Stock file** <span class='tag-pill required'>required</span>", unsafe_allow_html=True)
+        req_file = st.file_uploader("Req", type=["xlsx","xls"], key="req", label_visibility="collapsed")
+
+    u3, u4 = st.columns(2)
+    with u3:
+        st.markdown("**Production Orders** <span class='tag-pill optional'>optional</span>", unsafe_allow_html=True)
+        prod_file = st.file_uploader("Prod", type=["xlsx","xls"], key="prod", label_visibility="collapsed")
+    with u4:
+        st.markdown("**Receipt Quantities** <span class='tag-pill optional'>optional</span>", unsafe_allow_html=True)
+        receipt_file = st.file_uploader("Receipts", type=["xlsx","xls"], key="receipt", label_visibility="collapsed")
+
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    run_col, _ = st.columns([1, 3])
+    with run_col:
+        run_mrp_btn = st.button("▶  Run MRP", type="primary", use_container_width=True, key="run_mrp")
+
+    if run_mrp_btn:
+        if bom_file is None or req_file is None:
+            st.warning("Please upload at least the BOM file and the Req & Stock file.")
+        else:
+            try:
+                results = run_mrp(bom_file, req_file, prod_file, receipt_file)
+                if results is not None:
+                    st.session_state["mrp_results"] = results
+            except Exception as e:
+                st.exception(e)
     elif st.session_state["mrp_results"] is None:
-        st.warning("Please run MRP first — Segment Capacity uses the same BOM and Stock data.")
-    else:
+        st.markdown("""
+        <div style="margin-top:3rem;text-align:center;padding:3rem 2rem;background:#f8fafc;
+                    border:1px dashed #d1d5db;border-radius:12px;color:#6b7280;">
+            <div style="font-size:32px;margin-bottom:12px;">⚙</div>
+            <div style="font-size:15px;font-weight:500;color:#374151;margin-bottom:6px;">Ready to run</div>
+            <div style="font-size:13px;">Upload your BOM and Req &amp; Stock files above, then click Run MRP</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    if st.session_state["mrp_results"] is not None:
+        r = st.session_state["mrp_results"]
         try:
-            r = st.session_state["mrp_results"]
-            seg_result = run_segment_capacity(r["bom"], r["stock"], seg_imp_file)
-            if seg_result is not None:
-                st.session_state["seg_results"] = seg_result
-                # Persist file bytes so RM filter rerun can reload the file
-                if seg_imp_file is not None:
-                    seg_imp_file.seek(0)
-                    st.session_state["seg_imp_bytes"] = seg_imp_file.read()
+            show_search_section(bom=r["bom"], req_df=r["req"], months=r["months"],
+                                stock=r["stock"], prod_summary=r["prod_summary"])
         except Exception as e:
-            st.exception(e)
+            st.error(f"Search error: {e}")
 
-# ── RM filter apply (sidebar button) ──────────────────────────
-if apply_filter_btn and st.session_state["seg_results"] is not None:
-    _mrp = st.session_state.get("mrp_results")
-    _bom   = _mrp["bom"]   if _mrp else None
-    _stock = _mrp["stock"] if _mrp else None
-    _seg_bytes = st.session_state.get("seg_imp_bytes")
-    _seg_f = io.BytesIO(_seg_bytes) if _seg_bytes else None
-    if _seg_f is not None and _bom is not None:
-        with st.spinner("Recalculating with selected RM groups ..."):
-            new_result = run_segment_capacity(
-                _bom, _stock, _seg_f, active_rm_groups=selected_groups_sb)
-            if new_result is not None:
-                st.session_state["seg_results"] = new_result
-                st.rerun()
+
+# ────────────────────────────────────────────────────────────────
+# TAB 2: SEGMENT CAPACITY
+# ────────────────────────────────────────────────────────────────
+with tab_seg:
+    if st.session_state["mrp_results"] is None:
+        st.info("ℹ Run MRP first (Tab 1) — Segment Capacity uses the same BOM and Stock data.")
     else:
-        st.warning("Re-upload the Segment file and run Segment Capacity first.")
+        section_label("Segment & Import Part file")
+        seg_col, _ = st.columns([2, 2])
+        with seg_col:
+            st.markdown("**Segment & Import Part file** <span class='tag-pill required'>required</span>", unsafe_allow_html=True)
+            seg_imp_file = st.file_uploader(
+                "Segment",
+                type=["xlsx","xls"], key="seg", label_visibility="collapsed",
+                help="Sheet 1: Import Part List  |  Sheet 2: Segment (IDU / ODU codes)")
 
-# Show segment results if available
-if st.session_state["seg_results"] is not None:
-    st.divider()
-    st.header("🏭 Segment Production Capacity")
-    st.caption("IDU + ODU sets per segment · LP-optimised across all segments · import parts as constraint")
-    try:
-        display_segment_results(
-            st.session_state["seg_results"],
-            seg_imp_file=seg_imp_file,
-            bom=st.session_state.get("mrp_results", {}).get("bom"),
-            stock=st.session_state.get("mrp_results", {}).get("stock"),
-        )
-    except Exception as e:
-        st.error(f"Segment display error: {e}")
+        run_seg_col, _ = st.columns([1, 3])
+        with run_seg_col:
+            run_seg_btn = st.button("▶  Run Segment Capacity", type="primary",
+                                    use_container_width=True, key="run_seg")
 
-# ── Aging Projection run ──────────────────────────────────────
-if run_aging_btn:
-    if aging_file is None:
-        st.warning("Please upload the Aging Material Details file.")
-    else:
+        if run_seg_btn:
+            if seg_imp_file is None:
+                st.warning("Please upload the Segment & Import Part file.")
+            else:
+                try:
+                    r = st.session_state["mrp_results"]
+                    seg_result = run_segment_capacity(r["bom"], r["stock"], seg_imp_file)
+                    if seg_result is not None:
+                        st.session_state["seg_results"] = seg_result
+                        seg_imp_file.seek(0)
+                        st.session_state["seg_imp_bytes"] = seg_imp_file.read()
+                except Exception as e:
+                    st.exception(e)
+
+        if st.session_state["seg_results"] is not None:
+            try:
+                display_segment_results(st.session_state["seg_results"])
+            except Exception as e:
+                st.error(f"Segment display error: {e}")
+        elif not run_seg_btn:
+            st.markdown("""
+            <div style="margin-top:3rem;text-align:center;padding:3rem 2rem;background:#f8fafc;
+                        border:1px dashed #d1d5db;border-radius:12px;color:#6b7280;">
+                <div style="font-size:32px;margin-bottom:12px;">🏭</div>
+                <div style="font-size:15px;font-weight:500;color:#374151;margin-bottom:6px;">Segment Capacity</div>
+                <div style="font-size:13px;">Upload the Segment &amp; Import Part file and click Run Segment Capacity</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+
+# ────────────────────────────────────────────────────────────────
+# TAB 3: AGING
+# ────────────────────────────────────────────────────────────────
+with tab_aging:
+    section_label("Aging material file")
+    aging_col1, aging_col2 = st.columns([2, 1])
+    with aging_col1:
+        st.markdown("**Aging Material Details** <span class='tag-pill required'>required</span>", unsafe_allow_html=True)
+        aging_file = st.file_uploader(
+            "Aging",
+            type=["xlsx","xls"], key="aging", label_visibility="collapsed",
+            help="Aging snapshot. Buckets: 0-15, 16-30, 31-60, 61-90, 91-120, 121-150, 151-180, 181-360, Over361 (Qty & Value)")
+    with aging_col2:
+        st.markdown("**Aging data as-on date**")
+        aging_base_date = st.date_input(
+            "Aging date",
+            value=pd.Timestamp("2026-05-01"),
+            key="aging_date",
+            label_visibility="collapsed",
+            help="The date the aging snapshot was taken")
+
+    run_aging_col, _ = st.columns([1, 3])
+    with run_aging_col:
+        run_aging_btn = st.button("▶  Run Aging Projection", type="primary",
+                                  use_container_width=True, key="run_aging")
+
+    if run_aging_btn:
+        if aging_file is None:
+            st.warning("Please upload the Aging Material Details file.")
+        else:
+            try:
+                with st.spinner("Running aging projection ..."):
+                    aging_df = load_aging_data(aging_file)
+                    mrp_r = st.session_state.get("mrp_results")
+                    prod_cons = {}
+                    if mrp_r is not None:
+                        all_raw = []
+                        for key in ["raw_l1","raw_l2","raw_l3","raw_l4"]:
+                            df = mrp_r.get(key)
+                            if df is not None and not df.empty:
+                                comp_col  = "Component"
+                                gross_col = next((c for c in df.columns if c.lower() in ("gross","gross_requirement")), None)
+                                if comp_col in df.columns and "Month" in df.columns and gross_col:
+                                    tmp = df[[comp_col,"Month",gross_col]].copy()
+                                    tmp.columns = ["Component","Month","Gross"]
+                                    all_raw.append(tmp)
+                        if all_raw:
+                            cdf = pd.concat(all_raw, ignore_index=True)
+                            cdf = cdf.groupby(["Component","Month"],as_index=False)["Gross"].sum()
+                            for _, row2 in cdf.iterrows():
+                                mat = str(row2["Component"]).strip()
+                                mon = str(row2["Month"]).strip()
+                                qty = float(row2["Gross"])
+                                if qty > 0:
+                                    if mat not in prod_cons: prod_cons[mat] = {}
+                                    prod_cons[mat][mon] = prod_cons[mat].get(mon,0) + qty
+                            st.info(f"Pure BOM consumption loaded: {len(prod_cons):,} components.")
+                        else:
+                            st.warning("Raw gross data not found — run MRP first for better accuracy.")
+
+                    raw_months = mrp_r.get("months", []) if mrp_r else []
+                    if not raw_months:
+                        base = pd.Timestamp(aging_base_date)
+                        raw_months = [(base + pd.DateOffset(months=i)) for i in range(6)]
+
+                    def to_month_end_label(m):
+                        try:
+                            ts = pd.to_datetime(m, dayfirst=True)
+                        except Exception:
+                            return str(m)
+                        return ts.strftime("%b-%y")
+
+                    months_list = [to_month_end_label(m) for m in raw_months]
+
+                    if prod_cons:
+                        new_prod_cons = {}
+                        for mat, monthly in prod_cons.items():
+                            new_prod_cons[mat] = {}
+                            for raw_m, qty in monthly.items():
+                                clean_m = to_month_end_label(raw_m)
+                                new_prod_cons[mat][clean_m] = new_prod_cons[mat].get(clean_m, 0) + qty
+                        prod_cons = new_prod_cons
+
+                    proj = project_aging(
+                        aging_df,
+                        base_date=aging_base_date,
+                        production_consumption=prod_cons,
+                        months_list=months_list,
+                    )
+                    st.session_state["aging_results"] = {
+                        "proj": proj, "months": months_list, "base_date": aging_base_date
+                    }
+            except Exception as e:
+                st.exception(e)
+
+    if st.session_state["aging_results"] is not None:
+        ag = st.session_state["aging_results"]
         try:
-            with st.spinner("Running aging projection ..."):
-                aging_df = load_aging_data(aging_file)
-
-                mrp_r = st.session_state.get("mrp_results")
-
-                # ── Component-level monthly consumption from MRP ────────────
-                # result_l1..l4 have columns: Component, Month, Gross_Requirement
-                # Gross_Requirement = total demand on each component per month.
-                # This is the correct figure to deduct from aging stock buckets.
-                # ── Pure BOM-exploded demand — NO stock deduction ──────────
-                # raw_l1..l4 = gross requirement from BOM explosion BEFORE stock
-                # is applied. This is the correct consumption for aging:
-                # "how much of each material does production demand?" regardless
-                # of whether stock is available to cover it.
-                # Column names in raw_lN: Component, Month, Gross (summed qty)
-                prod_cons = {}
-                if mrp_r is not None:
-                    all_raw = []
-                    for key in ["raw_l1","raw_l2","raw_l3","raw_l4"]:
-                        df = mrp_r.get(key)
-                        if df is not None and not df.empty:
-                            # raw_lN columns: Component, Desc, Month, Month_Order, Gross
-                            comp_col = "Component"
-                            gross_col = next((c for c in df.columns if c.lower() in ("gross","gross_requirement")), None)
-                            if comp_col in df.columns and "Month" in df.columns and gross_col:
-                                tmp = df[[comp_col,"Month",gross_col]].copy()
-                                tmp.columns = ["Component","Month","Gross"]
-                                all_raw.append(tmp)
-                    if all_raw:
-                        cdf = pd.concat(all_raw, ignore_index=True)
-                        cdf = cdf.groupby(["Component","Month"],as_index=False)["Gross"].sum()
-                        for _, row2 in cdf.iterrows():
-                            mat = str(row2["Component"]).strip()
-                            mon = str(row2["Month"]).strip()
-                            qty = float(row2["Gross"])
-                            if qty > 0:
-                                if mat not in prod_cons: prod_cons[mat] = {}
-                                prod_cons[mat][mon] = prod_cons[mat].get(mon,0) + qty
-                        st.info(f"Pure BOM consumption loaded: {len(prod_cons):,} components (no stock deduction).")
-                    else:
-                        st.warning("Raw gross data not found — re-run MRP first, then run aging.")
-
-                # ── Receipt quantities ───────────────────────────────────────
-                recv_map = {}
-                if mrp_r is not None:
-                    rq = mrp_r.get("receipt_qty")
-                    if rq is not None and not (hasattr(rq,"empty") and rq.empty):
-                        recv_map = rq.to_dict() if hasattr(rq,"to_dict") else {}
-
-                # Build clean month-end labels: "31-May-26", "30-Jun-26", etc.
-                # MRP months may be raw timestamps — we convert each to month-end.
-                raw_months = mrp_r.get("months", []) if mrp_r else []
-                if not raw_months:
-                    base = pd.Timestamp(aging_base_date)
-                    raw_months = [(base + pd.DateOffset(months=i)) for i in range(6)]
-
-                # Also include months from base_date onward that are in the MRP window
-                # and generate month-end date labels for each
-                def to_month_end_label(m):
-                    """Return clean 'May-26' month label from any date-like input."""
-                    try:
-                        ts = pd.to_datetime(m, dayfirst=True)
-                    except Exception:
-                        return str(m)
-                    return ts.strftime("%b-%y")   # e.g. "May-26"
-
-                months_list = [to_month_end_label(m) for m in raw_months]
-                # Keep mapping from clean label -> raw label for consumption lookup
-                month_label_map = {to_month_end_label(m): str(m) for m in raw_months}
-
-                # Remap prod_cons keys to clean labels
-                if prod_cons:
-                    new_prod_cons = {}
-                    for mat, monthly in prod_cons.items():
-                        new_prod_cons[mat] = {}
-                        for raw_m, qty in monthly.items():
-                            clean_m = to_month_end_label(raw_m)
-                            new_prod_cons[mat][clean_m] = new_prod_cons[mat].get(clean_m, 0) + qty
-                    prod_cons = new_prod_cons
-
-                proj = project_aging(
-                    aging_df,
-                    base_date=aging_base_date,
-                    production_consumption=prod_cons,
-                    months_list=months_list,
-                )
-                st.session_state["aging_results"] = {
-                    "proj": proj, "months": months_list, "base_date": aging_base_date
-                }
+            display_aging_results(ag["proj"], ag["months"], ag["base_date"])
         except Exception as e:
-            st.exception(e)
-
-# Show aging results
-if st.session_state["aging_results"] is not None:
-    ag = st.session_state["aging_results"]
-    try:
-        display_aging_results(ag["proj"], ag["months"], ag["base_date"])
-    except Exception as e:
-        st.error(f"Aging display error: {e}")
+            st.error(f"Aging display error: {e}")
+    elif not run_aging_btn:
+        st.markdown("""
+        <div style="margin-top:3rem;text-align:center;padding:3rem 2rem;background:#f8fafc;
+                    border:1px dashed #d1d5db;border-radius:12px;color:#6b7280;">
+            <div style="font-size:32px;margin-bottom:12px;">📦</div>
+            <div style="font-size:15px;font-weight:500;color:#374151;margin-bottom:6px;">Aging Projection</div>
+            <div style="font-size:13px;">Upload the aging details file and click Run Aging Projection.<br>
+            Optionally run MRP first for consumption-adjusted projections.</div>
+        </div>
+        """, unsafe_allow_html=True)
