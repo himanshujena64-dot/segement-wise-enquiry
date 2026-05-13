@@ -27,71 +27,32 @@ st.caption("Phantom handling · Alt-aware · NET propagation · Dynamic date/mon
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.header("MRP CONFIG") # Mimicking the image's header
-
-    # Navigation buttons
-    nav_options = ["Home", "Upload Files", "Run MRP", "Summary", "Settings"]
-    selected_page = st.radio("Navigation", nav_options, key="nav")
-
-    st.divider() # Separator
-
-    # Configuration settings (moved from original sidebar)
-    st.subheader("Configuration")
+    st.header("Configuration")
     PHANTOM   = st.text_input("Phantom Sp. Procurement code", value="50")
     VERIFY_L1 = st.text_input("Verify component L1",         value="0010748460")
     VERIFY_L2 = st.text_input("Verify component L2",         value="0010748458")
     VERIFY_L3 = st.text_input("Verify L3 (phantom)",         value="0010748814")
     VERIFY_L4 = st.text_input("Verify component L4",         value="0010300601DEL")
-
     st.divider()
 
-    # MRP File Uploads (as per the image layout)
-    st.subheader("Upload Configuration & Data Files")
-    st.caption("Upload all required files to run the MRP process")
-
-    # Using columns to mimic the image's 2x2 grid for file uploads
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("#### **BOM File**")
-        st.caption("Upload your BOM file (XLSX, XLS)")
-        bom_file     = st.file_uploader(" ",              type=["xlsx","xls"], key="bom")
-        st.caption("Accepted: XLSX, XLS")
-
-        st.markdown("#### **Production Orders**")
-        st.caption("Upload your production orders file")
-        prod_file    = st.file_uploader(" ", type=["xlsx","xls"], key="prod")
-        st.caption("Accepted: XLSX, XLS")
-
-
-    with col2:
-        st.markdown("#### **Req. & Stock File**")
-        st.caption("Upload your requirement & stock file")
-        req_file     = st.file_uploader(" ",         type=["xlsx","xls"], key="req")
-        st.caption("Accepted: XLSX, XLS")
-
-        st.markdown("#### **Receipt Quantities**")
-        st.caption("Upload your receipt quantities file")
-        receipt_file = st.file_uploader(" ",
+    st.subheader("MRP files")
+    bom_file     = st.file_uploader("BOM file (.xlsx) ✱",              type=["xlsx","xls"], key="bom")
+    req_file     = st.file_uploader("Req and Stock (.xlsx) ✱",         type=["xlsx","xls"], key="req")
+    prod_file    = st.file_uploader("Production Orders (.xlsx) — optional", type=["xlsx","xls"], key="prod")
+    receipt_file = st.file_uploader("Receipt Quantities (.xlsx) — optional",
                                     type=["xlsx","xls"], key="receipt",
                                     help="GR/receipt quantities added to stock before MRP")
-        st.caption("Accepted: XLSX, XLS")
-
-
-    st.divider()
-    st.button("▶ Run MRP", type="primary", use_container_width=True, key="run_mrp_btn")
-
+    run_mrp_btn  = st.button("▶ Run MRP", type="primary", use_container_width=True)
 
     st.divider()
-    # Optional sections (Segment Capacity and Aging Material Analysis)
-    st.subheader("Optional Analyses")
+    st.subheader("Segment Capacity (optional)")
     seg_imp_file = st.file_uploader(
         "Segment & Import Part file (.xlsx)",
         type=["xlsx","xls"], key="seg",
         help="Sheet 1: Import Part List  |  Sheet 2: Segment (IDU / ODU codes)")
-    run_seg_btn  = st.button("▶ Run Segment Capacity", use_container_width=True, key="run_seg_btn")
+    run_seg_btn  = st.button("▶ Run Segment Capacity", use_container_width=True)
 
-    # RM Group filter (sidebar)
+    # ── RM Group filter (sidebar) ─────────────────────────────
     seg_r = st.session_state.get('seg_results')
     if seg_r is not None:
         rm_map_s      = seg_r.get('rm_map', {})
@@ -110,8 +71,13 @@ with st.sidebar:
         else:
             selected_groups_sb = []
             apply_filter_btn   = False
+    else:
+        selected_groups_sb = []
+        apply_filter_btn   = False
 
 
+    st.divider()
+    st.subheader("Aging Material Analysis (optional)")
     aging_file = st.file_uploader(
         "Aging Material Details (.xlsx)",
         type=["xlsx","xls"], key="aging",
@@ -122,11 +88,7 @@ with st.sidebar:
         value=pd.Timestamp("2026-05-01"),
         key="aging_date",
         help="The date the aging snapshot was taken (e.g. May 1 2026)")
-    run_aging_btn = st.button("▶ Run Aging Projection", use_container_width=True, key="run_aging_btn")
-
-    st.divider() # Separator for "Need help?" section
-    st.markdown("#### Need help?")
-    st.markdown("Contact support") # Mimicking the "Contact support" link
+    run_aging_btn = st.button("▶ Run Aging Projection", use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -745,13 +707,13 @@ def run_segment_capacity(bom, stock, seg_imp_file, active_rm_groups=None):
                 if ratio < lim_ratio:
                     lim_ratio, lim_part = ratio, p
         fg_results.append({
-            "Segment":        seg,
+            "Segment":        fg_segment[fg],
             "FG_Code":        fg,
             "FG_Desc":        desc_map.get(fg, ""),
-            "IDU":            idu,
-            "IDU_Desc":       desc_map.get(idu, ""),
-            "Compatible_ODU": odu,
-            "ODU_Desc":       desc_map.get(odu, ""),
+            "IDU":            fg_idu[fg],
+            "IDU_Desc":       desc_map.get(fg_idu[fg], ""),
+            "Compatible_ODU": fg_odu[fg],
+            "ODU_Desc":       desc_map.get(fg_odu[fg], ""),
             "Max_Sets":       int(qty),
             "Limiting_Part":  lim_part,
             "Limiting_Stock": int(stock.get(lim_part, 0)) if lim_part != "—" else 0,
@@ -1329,7 +1291,7 @@ def run_mrp(bom_file, req_file, prod_file, receipt_file):
                 prod_summary=prod_summary,
                 result_l1=result_l1, result_l2=result_l2,
                 result_l3=result_l3, result_l4=result_l4,
-                raw_l1=l1_agg, raw_l2=l2_agg, raw_l3=l3_agg, raw_l4=l4_agg, recep_qty = receipt_qty) # Added receipt_qty for export
+                raw_l1=l1_agg, raw_l2=l2_agg, raw_l3=l3_agg, raw_l4=l4_agg)
 
 
 
@@ -1385,15 +1347,10 @@ def project_aging(aging_df, base_date, production_consumption, months_list):
 
     def month_offset(label):
         try:
-            # Use raw month from MRP results if available
-            raw_month_str = st.session_state.get("mrp_results", {}).get("month_label_map", {}).get(label, label)
-            ts = pd.to_datetime(raw_month_str, dayfirst=True)
-            ts = ts.replace(day=1) # Ensure it is start of month for consistent offset
+            ts = pd.to_datetime(label, format="%b-%y")
         except Exception:
             try:
-                # Fallback for any other date format
-                ts = pd.to_datetime(label, dayfirst=True)
-                ts = ts.replace(day=1)
+                ts = pd.to_datetime(label); ts = ts.replace(day=1)
             except Exception:
                 return 0
         return (ts.year - base_ts.year) * 12 + (ts.month - base_ts.month)
@@ -1466,15 +1423,9 @@ def display_aging_results(aging_proj_df, months_list, base_date):
     if aging_proj_df.empty:
         st.warning("No aging projection data."); return
 
-    # Ensure months_list is used for ordering, and query the DF for available months
-    available_months = aging_proj_df["Month"].unique()
-    months_ordered = [m for m in months_list if m in available_months]
-
-    if not months_ordered:
-        st.warning("No matching months found in the aging projection data."); return
-
-    last_month     = months_ordered[-1]
-    first_month    = months_ordered[0]
+    months_ordered = [m for m in months_list if m in aging_proj_df["Month"].unique()]
+    last_month     = months_ordered[-1] if months_ordered else ""
+    first_month    = months_ordered[0]  if months_ordered else ""
     final_df       = aging_proj_df[aging_proj_df["Month"] == last_month]
     first_df       = aging_proj_df[aging_proj_df["Month"] == first_month]
 
@@ -1518,7 +1469,6 @@ def display_aging_results(aging_proj_df, months_list, base_date):
 
     # ── Material × Month aging value pivot ───────────────────────
     st.subheader("Aging Value — Material × Month")
-    # Ensure pivot uses only the months present in the ordered list
     piv = (aging_proj_df
            .pivot_table(index=["Material","Description"],
                         columns="Month", values="Aging Value (Rs)", aggfunc="sum")
@@ -1588,35 +1538,33 @@ if "seg_results"  not in st.session_state: st.session_state["seg_results"]  = No
 if "aging_results" not in st.session_state: st.session_state["aging_results"] = None
 
 # ── MRP run ───────────────────────────────────────────────────
-# This block handles the logic for when the "Run MRP" button is clicked.
-# It checks for necessary file uploads and calls the run_mrp function.
-if st.session_state.get("run_mrp_btn", False): # Check if button was clicked
+if not run_mrp_btn and bom_file is None:
+    st.info("Upload your files in the sidebar, then click **▶ Run MRP**.")
+elif run_mrp_btn:
     if bom_file is None or req_file is None:
         st.warning("Please upload at least the BOM file and the Req & Stock file.")
     else:
         try:
-            st.session_state["mrp_results"] = run_mrp(bom_file, req_file, prod_file, receipt_file)
+            results = run_mrp(bom_file, req_file, prod_file, receipt_file)
+            if results is not None:
+                st.session_state["mrp_results"] = results
         except Exception as e:
             st.exception(e)
 
 # Show MRP search if results available
-if st.session_state.get("mrp_results") is not None:
+if st.session_state["mrp_results"] is not None:
     r = st.session_state["mrp_results"]
     try:
-        # Map month labels for aging projection helper
-        month_label_map = {m: m for m in r["months"]} # Direct mapping for now, can be enhanced
-        st.session_state["mrp_results"]["month_label_map"] = month_label_map
-
         show_search_section(bom=r["bom"], req_df=r["req"], months=r["months"],
                             stock=r["stock"], prod_summary=r["prod_summary"])
     except Exception as e:
         st.error(f"Search error: {e}")
 
 # ── Segment Capacity run ───────────────────────────────────────
-if st.session_state.get("run_seg_btn", False): # Check if button was clicked
+if run_seg_btn:
     if seg_imp_file is None:
         st.warning("Please upload the Segment & Import Part file to run Segment Capacity.")
-    elif st.session_state.get("mrp_results") is None:
+    elif st.session_state["mrp_results"] is None:
         st.warning("Please run MRP first — Segment Capacity uses the same BOM and Stock data.")
     else:
         try:
@@ -1632,7 +1580,7 @@ if st.session_state.get("run_seg_btn", False): # Check if button was clicked
             st.exception(e)
 
 # ── RM filter apply (sidebar button) ──────────────────────────
-if st.session_state.get("apply_rm_filter", False) and st.session_state.get("seg_results") is not None:
+if apply_filter_btn and st.session_state["seg_results"] is not None:
     _mrp = st.session_state.get("mrp_results")
     _bom   = _mrp["bom"]   if _mrp else None
     _stock = _mrp["stock"] if _mrp else None
@@ -1649,14 +1597,14 @@ if st.session_state.get("apply_rm_filter", False) and st.session_state.get("seg_
         st.warning("Re-upload the Segment file and run Segment Capacity first.")
 
 # Show segment results if available
-if st.session_state.get("seg_results") is not None:
+if st.session_state["seg_results"] is not None:
     st.divider()
     st.header("🏭 Segment Production Capacity")
     st.caption("IDU + ODU sets per segment · LP-optimised across all segments · import parts as constraint")
     try:
         display_segment_results(
             st.session_state["seg_results"],
-            seg_imp_file=seg_imp_file, # Pass the file uploader widget
+            seg_imp_file=seg_imp_file,
             bom=st.session_state.get("mrp_results", {}).get("bom"),
             stock=st.session_state.get("mrp_results", {}).get("stock"),
         )
@@ -1664,7 +1612,7 @@ if st.session_state.get("seg_results") is not None:
         st.error(f"Segment display error: {e}")
 
 # ── Aging Projection run ──────────────────────────────────────
-if st.session_state.get("run_aging_btn", False): # Check if button was clicked
+if run_aging_btn:
     if aging_file is None:
         st.warning("Please upload the Aging Material Details file.")
     else:
@@ -1674,15 +1622,23 @@ if st.session_state.get("run_aging_btn", False): # Check if button was clicked
 
                 mrp_r = st.session_state.get("mrp_results")
 
+                # ── Component-level monthly consumption from MRP ────────────
+                # result_l1..l4 have columns: Component, Month, Gross_Requirement
+                # Gross_Requirement = total demand on each component per month.
+                # This is the correct figure to deduct from aging stock buckets.
+                # ── Pure BOM-exploded demand — NO stock deduction ──────────
+                # raw_l1..l4 = gross requirement from BOM explosion BEFORE stock
+                # is applied. This is the correct consumption for aging:
+                # "how much of each material does production demand?" regardless
+                # of whether stock is available to cover it.
+                # Column names in raw_lN: Component, Month, Gross (summed qty)
                 prod_cons = {}
-                months_list = [] # Initialize months_list here
-
                 if mrp_r is not None:
-                    # ── Component-level monthly consumption from MRP ────────────
                     all_raw = []
                     for key in ["raw_l1","raw_l2","raw_l3","raw_l4"]:
                         df = mrp_r.get(key)
                         if df is not None and not df.empty:
+                            # raw_lN columns: Component, Desc, Month, Month_Order, Gross
                             comp_col = "Component"
                             gross_col = next((c for c in df.columns if c.lower() in ("gross","gross_requirement")), None)
                             if comp_col in df.columns and "Month" in df.columns and gross_col:
@@ -1694,7 +1650,7 @@ if st.session_state.get("run_aging_btn", False): # Check if button was clicked
                         cdf = cdf.groupby(["Component","Month"],as_index=False)["Gross"].sum()
                         for _, row2 in cdf.iterrows():
                             mat = str(row2["Component"]).strip()
-                            mon = str(row2["Month"]).strip() # Use the label from MRP results
+                            mon = str(row2["Month"]).strip()
                             qty = float(row2["Gross"])
                             if qty > 0:
                                 if mat not in prod_cons: prod_cons[mat] = {}
@@ -1703,20 +1659,43 @@ if st.session_state.get("run_aging_btn", False): # Check if button was clicked
                     else:
                         st.warning("Raw gross data not found — re-run MRP first, then run aging.")
 
+                # ── Receipt quantities ───────────────────────────────────────
+                recv_map = {}
+                if mrp_r is not None:
+                    rq = mrp_r.get("receipt_qty")
+                    if rq is not None and not (hasattr(rq,"empty") and rq.empty):
+                        recv_map = rq.to_dict() if hasattr(rq,"to_dict") else {}
 
-                    # Get the months from MRP results for consistent date handling
-                    months_list = mrp_r.get("months", [])
-                    # Map for aging projection helper to get raw month string
-                    month_label_map = {}
-                    if months_list:
-                        month_label_map = {m: m for m in months_list} # Assuming months are already in desired label format
-                    st.session_state["mrp_results"]["month_label_map"] = month_label_map
-
-
-                # If MRP was not run, generate placeholder months for aging
-                if not months_list:
+                # Build clean month-end labels: "31-May-26", "30-Jun-26", etc.
+                # MRP months may be raw timestamps — we convert each to month-end.
+                raw_months = mrp_r.get("months", []) if mrp_r else []
+                if not raw_months:
                     base = pd.Timestamp(aging_base_date)
-                    months_list = [(base + pd.DateOffset(months=i)).strftime("%b-%y") for i in range(6)] # Default to 6 months
+                    raw_months = [(base + pd.DateOffset(months=i)) for i in range(6)]
+
+                # Also include months from base_date onward that are in the MRP window
+                # and generate month-end date labels for each
+                def to_month_end_label(m):
+                    """Return clean 'May-26' month label from any date-like input."""
+                    try:
+                        ts = pd.to_datetime(m, dayfirst=True)
+                    except Exception:
+                        return str(m)
+                    return ts.strftime("%b-%y")   # e.g. "May-26"
+
+                months_list = [to_month_end_label(m) for m in raw_months]
+                # Keep mapping from clean label -> raw label for consumption lookup
+                month_label_map = {to_month_end_label(m): str(m) for m in raw_months}
+
+                # Remap prod_cons keys to clean labels
+                if prod_cons:
+                    new_prod_cons = {}
+                    for mat, monthly in prod_cons.items():
+                        new_prod_cons[mat] = {}
+                        for raw_m, qty in monthly.items():
+                            clean_m = to_month_end_label(raw_m)
+                            new_prod_cons[mat][clean_m] = new_prod_cons[mat].get(clean_m, 0) + qty
+                    prod_cons = new_prod_cons
 
                 proj = project_aging(
                     aging_df,
@@ -1731,7 +1710,7 @@ if st.session_state.get("run_aging_btn", False): # Check if button was clicked
             st.exception(e)
 
 # Show aging results
-if st.session_state.get("aging_results") is not None:
+if st.session_state["aging_results"] is not None:
     ag = st.session_state["aging_results"]
     try:
         display_aging_results(ag["proj"], ag["months"], ag["base_date"])
