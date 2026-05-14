@@ -731,30 +731,88 @@ def load_aging(f):
     return df.groupby("Material",as_index=False).agg(agg)
 
 def project_aging(aging_df,base_date,prod_cons,months_list):
+    """
+    Aging projection logic:
+    ─────────────────────────────────────────────────────────────────
+    Snapshot date = base_date (e.g. 1-May).  Each bucket represents
+    how old that stock is ON the snapshot date.
+
+    Bucket indices (AGING_BUCKETS):
+      0: 0-15 d   1: 16-30 d   2: 31-60 d   3: 61-90 d
+      4: 91-120d  5: 121-150d  6: 151-180d  7: 181-360d  8: Over361d
+
+    90-day aging threshold crosses as time passes from snapshot:
+      off=0 (base month) → already-aging = buckets [4:]  (91-120, …)
+      off=1 (1 month on) → newly aging  = bucket [3]  (61-90 → 91+)
+      off=2 (2 months)   → newly aging  = bucket [2]  (31-60 → 91+)
+      off=3 (3 months)   → newly aging  = bucket [1]  (16-30 → 91+)
+      off=4+ (4+ months) → newly aging  = bucket [0]  (0-15  → 91+)
+
+    Consumption = pure cumulative GROSS BOM requirement for this
+    material (from BOM explosion, NOT netted against any stock).
+    It is applied DIRECTLY against the aging pool — not first
+    offset by younger/non-aging stock.
+
+    Aging Qty = max(0,  aging_pool  −  cumulative_BOM_consumption)
+    ─────────────────────────────────────────────────────────────────
+    """
     base_ts=pd.Timestamp(base_date)
+
     def mo(label):
         try: ts=pd.to_datetime(label,format="%b-%y")
         except:
             try: ts=pd.to_datetime(label).replace(day=1)
             except: return 0
         return (ts.year-base_ts.year)*12+(ts.month-base_ts.month)
+
     offsets=[max(0,mo(m)) for m in months_list]
+
+    # first bucket index that will be >=90 days old after `off` months
     def asi(off): return max(0,4-off)
+
     records=[]
     for _,row in aging_df.iterrows():
-        mat=str(row["Material"]).strip(); desc=str(row.get("Material Description",""))
-        mtype=str(row.get("Material Type","")); mapx=float(row.get("MAP",0) or 0)
+        mat=str(row["Material"]).strip()
+        desc=str(row.get("Material Description",""))
+        mtype=str(row.get("Material Type",""))
+        mapx=float(row.get("MAP",0) or 0)
         bkts=[float(row.get(b,0) or 0) for b in AGING_BUCKETS]
-        mcons=prod_cons.get(mat,{}); cum=0.0
+        mcons=prod_cons.get(mat,{})
+        cum=0.0   # cumulative gross BOM consumption (no stock netting)
+
         for mi,ml in enumerate(months_list):
-            off=offsets[mi]; cum+=float(mcons.get(ml,0))
-            si=asi(off); ap=sum(bkts[si:]); fp=sum(bkts[:si])
-            ac=max(0.0,cum-fp); aq=max(0.0,ap-ac); av=round(aq*mapx,2) if mapx>0 else 0.0
+            off=offsets[mi]
+            # accumulate PURE gross BOM requirement month by month
+            cum+=float(mcons.get(ml,0))
+
+            si=asi(off)
+            # Aging pool = all stock that will be >=90 days old by this month-end
+            ap=sum(bkts[si:])
+
+            # Bucket that just crossed the 90-day line this month
+            # (at off=0 these were already aging, so newly_aging=0 for base month)
+            newly=bkts[si] if (off>0 and si<len(bkts)) else 0.0
+
+            # KEY: consumption applied DIRECTLY to the aging pool
+            # (no offset by younger stock — pure BOM gross requirement)
+            aq=max(0.0,ap-cum)
+            av=round(aq*mapx,2) if mapx>0 else 0.0
+
+            # Qty in the bucket just below threshold → will turn aging next month
             tn=bkts[si-1] if si>0 else 0.0
-            records.append({"Material":mat,"Description":desc,"Material Type":mtype,"Month":ml,
-                            "Aging Pool Qty":round(ap,2),"Cumulative Consumption":round(cum,2),
-                            "Aging Qty (>=91d)":round(aq,2),"Aging Value (Rs)":av,
-                            "Turning Aging Next Month":round(tn,2)})
+
+            records.append({
+                "Material":mat,
+                "Description":desc,
+                "Material Type":mtype,
+                "Month":ml,
+                "Aging Pool Qty":round(ap,2),
+                "Newly Aging This Month":round(newly,2),
+                "Cumulative BOM Consumption":round(cum,2),
+                "Aging Qty (>=91d)":round(aq,2),
+                "Aging Value (Rs)":av,
+                "Turning Aging Next Month":round(tn,2),
+            })
     return pd.DataFrame(records)
 
 
@@ -1274,16 +1332,18 @@ elif st.session_state["page"] == "aging":
         msumm=(proj.groupby("Month",sort=False)
                .agg(Aging_Val=("Aging Value (Rs)","sum"),
                     Mat_Aging=("Material",lambda x:(proj.loc[x.index,"Aging Value (Rs)"]>0).sum()),
+                    Newly_Aging=("Newly Aging This Month","sum"),
+                    BOM_Cons=("Cumulative BOM Consumption","sum"),
                     Turning_Next=("Turning Aging Next Month","sum"))
                .reindex(mo).reset_index())
-        msumm.columns=["Month","Aging Value (Rs)","Materials with Aging Value","Qty Turning Aging Next Month"]
+        msumm.columns=["Month","Aging Value (Rs)","Materials with Aging Value","Newly Aging Qty This Month","Total BOM Consumption (Cumul)","Qty Turning Aging Next Month"]
         def hv(row):
             v=row["Aging Value (Rs)"]
             if v>10_000_000: return ["background-color:#fff0f0"]*len(row)
             if v>1_000_000: return ["background-color:#fffbeb"]*len(row)
             if v>0: return ["background-color:#f0fdf4"]*len(row)
             return [""]*len(row)
-        st.dataframe(msumm.style.apply(hv,axis=1).format({"Aging Value (Rs)":"Rs {:,.0f}","Qty Turning Aging Next Month":"{:,.0f}"}),use_container_width=True,hide_index=True)
+        st.dataframe(msumm.style.apply(hv,axis=1).format({"Aging Value (Rs)":"Rs {:,.0f}","Newly Aging Qty This Month":"{:,.0f}","Total BOM Consumption (Cumul)":"{:,.0f}","Qty Turning Aging Next Month":"{:,.0f}"}),use_container_width=True,hide_index=True)
 
         sec("Aging value — material × month")
         piv=(proj.pivot_table(index=["Material","Description"],columns="Month",values="Aging Value (Rs)",aggfunc="sum")
@@ -1296,13 +1356,13 @@ elif st.session_state["page"] == "aging":
         sm=st.selectbox("View as of:",mo,index=len(mo)-1,key="ag_sel")
         mdf=proj[proj["Month"]==sm].query("`Aging Value (Rs)` > 0").sort_values("Aging Value (Rs)",ascending=False).copy()
         st.caption(f"{len(mdf):,} materials · Total: Rs {mdf['Aging Value (Rs)'].sum():,.0f}")
-        shc=["Material","Description","Material Type","Aging Pool Qty","Cumulative Consumption","Aging Qty (>=91d)","Aging Value (Rs)"]
+        shc=["Material","Description","Material Type","Aging Pool Qty","Newly Aging This Month","Cumulative BOM Consumption","Aging Qty (>=91d)","Aging Value (Rs)"]
         def hr2(row):
             v=row["Aging Value (Rs)"]
             if v>500_000: return ["background-color:#fff0f0"]*len(row)
             if v>100_000: return ["background-color:#fffbeb"]*len(row)
             return [""]*len(row)
-        st.dataframe(mdf[shc].style.apply(hr2,axis=1).format({"Aging Pool Qty":"{:,.0f}","Cumulative Consumption":"{:,.0f}","Aging Qty (>=91d)":"{:,.0f}","Aging Value (Rs)":"Rs {:,.0f}"}),use_container_width=True,hide_index=True)
+        st.dataframe(mdf[shc].style.apply(hr2,axis=1).format({"Aging Pool Qty":"{:,.0f}","Newly Aging This Month":"{:,.0f}","Cumulative BOM Consumption":"{:,.0f}","Aging Qty (>=91d)":"{:,.0f}","Aging Value (Rs)":"Rs {:,.0f}"}),use_container_width=True,hide_index=True)
 
         buf=io.BytesIO()
         with pd.ExcelWriter(buf,engine="openpyxl") as w:
