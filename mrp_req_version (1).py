@@ -1529,17 +1529,81 @@ elif st.session_state["page"] == "segment":
 elif st.session_state["page"] == "aging":
     topbar("Aging Material Projection", "Forecast aging stock with cumulative production consumption offset")
 
-    sec("Aging Data File")
-    ac1,ac2=st.columns([2,1])
-    with ac1:
-        af=st.file_uploader("Aging Material Details (.xlsx)",type=["xlsx","xls"],key="ag_f")
-    with ac2:
-        st.markdown("**Aging snapshot date**")
-        abd=st.date_input("Date",value=pd.Timestamp("2026-05-01"),key="ag_dt",label_visibility="collapsed")
+    sec("Input Files")
+    fc1, fc2 = st.columns(2)
+    with fc1:
+        af = st.file_uploader("Aging Material Details (.xlsx) *Required*",
+                              type=["xlsx","xls"], key="ag_f")
+        if af:
+            st.session_state["_aging"] = af.read()
+    with fc2:
+        bom_ag_f = st.file_uploader("BOM File (.xlsx) — leave blank to use MRP session BOM",
+                                    type=["xlsx","xls"], key="ag_bom_f")
+        if bom_ag_f:
+            st.session_state["_ag_bom"] = bom_ag_f.read()
+        if not st.session_state.get("_ag_bom") and st.session_state.get("_bom"):
+            st.caption("✓ Will use BOM already loaded in MRP session")
 
-    rb,_=st.columns([1,4])
+    fc3, fc4 = st.columns(2)
+    with fc3:
+        req_ag_f = st.file_uploader("Requirement File (.xlsx) — leave blank to use MRP session Req",
+                                    type=["xlsx","xls"], key="ag_req_f")
+        if req_ag_f:
+            st.session_state["_ag_req"] = req_ag_f.read()
+        if not st.session_state.get("_ag_req") and st.session_state.get("_req"):
+            st.caption("✓ Will use Req & Stock already loaded in MRP session")
+    with fc4:
+        st.markdown("**Aging snapshot date**")
+        st.caption("Date the aging file was extracted from SAP")
+        abd = st.date_input("Snapshot date", value=pd.Timestamp("2026-05-01"),
+                            key="ag_dt", label_visibility="collapsed")
+
+    rb, _ = st.columns([1,4])
     with rb:
-        run_ag=st.button("▶ Run Aging Projection",type="primary",use_container_width=True,key="run_ag")
+        run_ag = st.button("▶ Run Aging Projection", type="primary",
+                           use_container_width=True, key="run_ag")
+
+    if run_ag:
+        ag_bytes  = st.session_state.get("_aging")
+        bom_bytes = st.session_state.get("_ag_bom") or st.session_state.get("_bom")
+        req_bytes = st.session_state.get("_ag_req") or st.session_state.get("_req")
+
+        missing = []
+        if not ag_bytes:  missing.append("Aging Material Details")
+        if not bom_bytes: missing.append("BOM File")
+        if not req_bytes: missing.append("Requirement File")
+        if missing:
+            st.warning(f"Please upload: {', '.join(missing)}")
+        else:
+            try:
+                status_ag = st.status("Running Aging Projection ...", expanded=True)
+                with status_ag:
+                    st.write("► Step 1 — Consolidating aging file (storage location → material) ...")
+                    agdf = load_aging(io.BytesIO(ag_bytes))
+                    n_mats    = len(agdf)
+                    n_aging90 = int((agdf[["91-120 Qty","121-150 Qty","151-180 Qty",
+                                           "181-360 Qty","Over361 Qty"]].sum(axis=1) > 0).sum())
+                    st.write(f"   → {n_mats:,} unique materials · {n_aging90:,} with current 90+ day aging")
+
+                    st.write("► Step 2 — Exploding BOM (L1–L4) to get gross component consumption ...")
+                    prod_cons, months_from_req = compute_bom_consumption(
+                        bom_bytes, req_bytes,
+                        phantom_code=str(st.session_state.get("cfg_phantom","50")).strip())
+                    st.write(f"   → {len(prod_cons):,} components with BOM consumption · "
+                             f"{len(months_from_req)} months: {', '.join(months_from_req)}")
+
+                    st.write("► Step 3 — Projecting aging month-by-month ...")
+                    proj = project_aging(agdf, base_date=abd,
+                                         prod_cons=prod_cons, months_list=months_from_req)
+
+                    st.session_state["aging_results"] = {
+                        "proj": proj, "months": months_from_req, "base_date": abd,
+                        "n_mats": n_mats, "n_aging90": n_aging90,
+                        "prod_cons": prod_cons,
+                    }
+                status_ag.update(label="Aging Projection complete ✅", state="complete", expanded=False)
+            except Exception as e:
+                st.exception(e)
 
     ag = st.session_state.get("aging_results")
     if ag is None:
