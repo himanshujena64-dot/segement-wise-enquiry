@@ -295,6 +295,7 @@ for k, v in {
     "cfg_phantom": "50", "cfg_vl1": "0010748460",
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_prod": None, "_receipt": None,
+    "_aging": None, "_ag_bom": None, "_ag_req": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -709,110 +710,381 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
 # ═══════════════════════════════════════════════════════════════
 # AGING ENGINE
 # ═══════════════════════════════════════════════════════════════
-AGING_BUCKETS=["0-15 Qty","16-30 Qty","31-60 Qty","61-90 Qty","91-120 Qty","121-150 Qty","151-180 Qty","181-360 Qty","Over361 Qty"]
+AGING_BUCKETS   = ["0-15 Qty","16-30 Qty","31-60 Qty","61-90 Qty",
+                   "91-120 Qty","121-150 Qty","151-180 Qty","181-360 Qty","Over361 Qty"]
+AGING_VAL_BKTS  = ["0-15 Value","16-30 Value","31-60 Value","61-90 Value",
+                   "91-120 Value","121-150 Value","151-180 Value","181-360 Value","Over361 Value"]
 
 def load_aging(f):
-    df=pd.read_excel(f); df.columns=[str(c).strip() for c in df.columns]
-    rename={}
-    for c in df.columns:
-        cl=c.lower().replace(" ","")
-        if cl=="material": rename[c]="Material"
-        elif "description" in cl: rename[c]="Material Description"
-        elif cl=="materialtype": rename[c]="Material Type"
-        elif "movingaverage" in cl or cl=="map": rename[c]="MAP"
-    df=df.rename(columns=rename)
-    for col in AGING_BUCKETS:
-        if col not in df.columns: df[col]=0.0
-        df[col]=pd.to_numeric(df[col],errors="coerce").fillna(0)
-    agg={c:"sum" for c in AGING_BUCKETS}
-    if "Material Description" in df.columns: agg["Material Description"]="first"
-    if "MAP" in df.columns: agg["MAP"]="first"
-    if "Material Type" in df.columns: agg["Material Type"]="first"
-    return df.groupby("Material",as_index=False).agg(agg)
+    """
+    Load aging file, consolidate storage-location rows → one row per material.
+    Keeps both qty AND value buckets for accurate value computation.
+    """
+    df = pd.read_excel(f)
+    df.columns = [str(c).strip() for c in df.columns]
 
-def project_aging(aging_df,base_date,prod_cons,months_list):
+    # Normalise key column names
+    rename = {}
+    for c in df.columns:
+        cl = c.lower().replace(" ", "")
+        if cl == "material":
+            rename[c] = "Material"
+        elif "description" in cl and "material" in cl:
+            rename[c] = "Material Description"
+        elif cl == "materialtype":
+            rename[c] = "Material Type"
+        elif "movingaverage" in cl or cl == "map":
+            rename[c] = "MAP"
+    df = df.rename(columns=rename)
+
+    # Ensure all qty and value bucket columns exist and are numeric
+    for col in AGING_BUCKETS + AGING_VAL_BKTS:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    if "MAP" in df.columns:
+        df["MAP"] = pd.to_numeric(df["MAP"], errors="coerce").fillna(0)
+
+    # Group by Material (consolidate storage locations → one row per component)
+    agg = {c: "sum" for c in AGING_BUCKETS + AGING_VAL_BKTS}
+    if "Material Description" in df.columns: agg["Material Description"] = "first"
+    if "MAP"                  in df.columns: agg["MAP"]                  = "first"
+    if "Material Type"        in df.columns: agg["Material Type"]        = "first"
+
+    return df.groupby("Material", as_index=False).agg(agg)
+
+
+def compute_bom_consumption(bom_bytes, req_bytes, phantom_code="50"):
+    """
+    Standalone BOM explosion to get GROSS component requirement per month.
+    Returns: dict  {material_code: {month_label: gross_qty}}
+    Uses the same alt-BOM-aware explosion as the main MRP engine,
+    but skips stock netting — pure gross consumption only.
+    """
+    import io, re
+
+    MONTH_ABBR_L = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                    "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+
+    def _parse_col(col, default_year=2026):
+        if isinstance(col, pd.Timestamp): return col.replace(day=1), col.strftime("%b-%y")
+        if hasattr(col, "year"):
+            ts = pd.Timestamp(col); return ts.replace(day=1), ts.strftime("%b-%y")
+        if pd.isna(col): return None, None
+        s = str(col).strip()
+        m = re.match(r'^([A-Za-z]{3})[-\'\s_](\d{2,4})$', s)
+        if m:
+            mon_s, yr_s = m.group(1).lower(), m.group(2)
+            mn = MONTH_ABBR_L.get(mon_s)
+            if mn:
+                yr = int(yr_s) + (2000 if len(yr_s) == 2 else 0)
+                return pd.Timestamp(year=yr, month=mn, day=1), s
+        try:
+            ts = pd.to_datetime(s, dayfirst=True, errors="raise")
+            return ts.replace(day=1), ts.strftime("%b-%y")
+        except:
+            return None, None
+
+    def _std(v):
+        if pd.isna(v): return ""
+        s = str(v).strip()
+        return {"alt.": "Alt", "alternative": "Alt", "bom header": "BOM Header"}.get(s.lower(), s)
+
+    def _detect_hrow(f_bytes, sheet="Requirement", scan=20):
+        raw = pd.read_excel(io.BytesIO(f_bytes), sheet_name=sheet, header=None, nrows=scan)
+        best_r, best_s = 0, -1
+        for i in range(len(raw)):
+            cleaned = [_std(x) for x in raw.iloc[i].tolist()]
+            score = (10 if "BOM Header" in cleaned else 0) + (5 if "Alt" in cleaned else 0) \
+                  + sum(1 for x in cleaned if _parse_col(x)[0] is not None)
+            if score > best_s: best_s, best_r = score, i
+        if best_s < 10:
+            raise ValueError("Could not detect header row in Requirement sheet.")
+        return best_r
+
+    # ── BOM ──────────────────────────────────────────────────────
+    bom = pd.read_excel(io.BytesIO(bom_bytes))
+    bom.columns = bom.columns.str.strip()
+    if "Alt." in bom.columns: bom = bom.rename(columns={"Alt.": "Alt"})
+    bom["Level"] = pd.to_numeric(bom["Level"], errors="coerce").fillna(0).astype(int)
+    bom["Component"]      = bom["Component"].astype(str).str.strip()
+    bom["BOM Header"]     = bom["BOM Header"].astype(str).str.strip()
+    bom["Special procurement"] = bom.get("Special procurement", pd.Series([""] * len(bom))).astype(str).str.strip()
+    bom["Required Qty"]   = pd.to_numeric(bom["Required Qty"], errors="coerce").fillna(0)
+    bom["Alt"]            = pd.to_numeric(bom.get("Alt", pd.Series([0]*len(bom))), errors="coerce").fillna(0).astype(int).astype(str)
+
+    # Build Parent column
+    parents, stack = [], {}
+    for i in range(len(bom)):
+        lvl = bom.loc[i, "Level"]
+        parent = bom.loc[i, "BOM Header"] if lvl == 1 else stack.get(lvl - 1)
+        stack = {k: v for k, v in stack.items() if k <= lvl}
+        stack[lvl] = bom.loc[i, "Component"]
+        parents.append(parent)
+    bom["Parent"] = parents
+
+    # ── Requirement ───────────────────────────────────────────────
+    hrrow = _detect_hrow(req_bytes)
+    req   = pd.read_excel(io.BytesIO(req_bytes), sheet_name="Requirement", header=None)
+    req.columns = [_std(x) for x in req.iloc[hrrow].tolist()]
+    req   = req.iloc[hrrow + 1:].reset_index(drop=True)
+    req   = req.loc[:, [str(c).strip() != "" for c in req.columns]]
+    req   = req.loc[:, ~pd.Index(req.columns).duplicated(keep="first")]
+    req["BOM Header"] = req["BOM Header"].astype(str).str.strip()
+    req["Alt"]        = pd.to_numeric(req.get("Alt", pd.Series(["0"] * len(req))),
+                                      errors="coerce").fillna(0).astype(int).astype(str)
+
+    # Parse month columns
+    skip = {"BOM Header", "Alt"}
+    cands = [c for c in req.columns if c not in skip]
+    parsed = []
+    for col in cands:
+        ts, lbl = _parse_col(col)
+        if ts is not None:
+            parsed.append({"orig": col, "ts": ts, "label": lbl})
+    parsed.sort(key=lambda x: x["ts"])
+    # deduplicate
+    seen, unique = [], []
+    for p in parsed:
+        if p["ts"] not in seen: seen.append(p["ts"]); unique.append(p)
+    parsed = unique
+
+    rename_map = {p["orig"]: p["label"] for p in parsed if p["orig"] != p["label"]}
+    if rename_map: req = req.rename(columns=rename_map)
+    months = [p["label"] for p in parsed]
+    MONTH_ORDER = {m: i for i, m in enumerate(months)}
+
+    for m in months:
+        col_data = req[m]
+        if isinstance(col_data, pd.DataFrame): col_data = col_data.iloc[:, 0]
+        req[m] = pd.to_numeric(col_data.astype(str).str.replace(",", "", regex=False).str.strip(),
+                               errors="coerce").fillna(0)
+
+    req_long = req.melt(id_vars=["BOM Header", "Alt"], value_vars=months,
+                        var_name="Month", value_name="FG_Demand")
+    req_long = req_long[req_long["FG_Demand"] > 0].copy()
+    req_long["Month_Order"] = req_long["Month"].map(MONTH_ORDER)
+
+    def _is_ph(val): return str(val).strip() == phantom_code
+
+    # ── BOM explosion helpers ─────────────────────────────────────
+    def _explode(bom_level, join_cols, parent_col, child_comp_col, child_qty_col,
+                 child_ph_col, child_desc_col, demand_col, prev_df):
+        bl = (bom[bom["Level"] == bom_level]
+              [[*join_cols, "Parent", "Component", "Component descriptio",
+                "Required Qty", "Special procurement"]].copy()
+              .rename(columns={"Parent": parent_col, "Component": child_comp_col,
+                               "Component descriptio": child_desc_col,
+                               "Required Qty": child_qty_col,
+                               "Special procurement": child_ph_col}))
+        merged = prev_df.merge(bl, on=list(join_cols), how="inner")
+        merged[demand_col] = merged[demand_col.replace("_Gross","_Eff") if bom_level > 1 else "FG_Demand"] \
+                             * merged[child_qty_col]
+        # Phantom pass-through: if phantom, set gross = parent effective qty
+        if bom_level > 1:
+            eff_src = demand_col.replace("_Gross", "_Eff")
+            merged.loc[merged[child_ph_col].apply(_is_ph), demand_col] = \
+                merged.loc[merged[child_ph_col].apply(_is_ph), eff_src]
+
+        # Compute effective (stock-free — just gross for non-phantoms)
+        eff_col = demand_col.replace("_Gross", "_Eff")
+        merged[eff_col] = merged[demand_col]  # no stock netting for aging consumption
+
+        # Aggregate non-phantom results
+        non_ph = merged[~merged[child_ph_col].apply(_is_ph)].copy()
+        agg = (non_ph.groupby([child_comp_col, child_desc_col, "Month", "Month_Order"],
+                               as_index=False)[demand_col].sum()
+               .rename(columns={child_comp_col: "Component", child_desc_col: "Desc",
+                                demand_col: "Gross"}))
+        return merged, agg
+
+    # L1
+    l1, a1 = _explode(1, ["BOM Header", "Alt"], None, "L1_Comp", "L1_Qty",
+                      "L1_Ph", "L1_Desc", "L1_Gross", req_long)
+    # Fix: L1 parent col doesn't exist in join, use BOM Header directly
+    bl1 = (bom[bom["Level"] == 1]
+           [["BOM Header", "Alt", "Component", "Component descriptio",
+             "Required Qty", "Special procurement"]].copy()
+           .rename(columns={"Component": "L1_Comp", "Component descriptio": "L1_Desc",
+                            "Required Qty": "L1_Qty", "Special procurement": "L1_Ph"}))
+    l1 = req_long.merge(bl1, on=["BOM Header", "Alt"], how="inner")
+    l1["L1_Gross"] = l1["FG_Demand"] * l1["L1_Qty"]
+    l1["L1_Eff"]   = l1["L1_Gross"]
+    a1 = (l1[~l1["L1_Ph"].apply(_is_ph)]
+          .groupby(["L1_Comp", "L1_Desc", "Month", "Month_Order"], as_index=False)["L1_Gross"]
+          .sum().rename(columns={"L1_Comp": "Component", "L1_Desc": "Desc", "L1_Gross": "Gross"}))
+
+    # L2
+    bl2 = (bom[bom["Level"] == 2]
+           [["BOM Header", "Alt", "Parent", "Component", "Component descriptio",
+             "Required Qty", "Special procurement"]].copy()
+           .rename(columns={"Parent": "L1_Comp", "Component": "L2_Comp",
+                            "Component descriptio": "L2_Desc",
+                            "Required Qty": "L2_Qty", "Special procurement": "L2_Ph"}))
+    l2 = l1.merge(bl2, on=["BOM Header", "Alt", "L1_Comp"], how="inner")
+    l2["L2_Gross"] = l2["L1_Eff"] * l2["L2_Qty"]
+    l2["L2_Eff"]   = l2["L2_Gross"]
+    a2 = (l2[~l2["L2_Ph"].apply(_is_ph)]
+          .groupby(["L2_Comp", "L2_Desc", "Month", "Month_Order"], as_index=False)["L2_Gross"]
+          .sum().rename(columns={"L2_Comp": "Component", "L2_Desc": "Desc", "L2_Gross": "Gross"}))
+
+    # L3
+    bl3 = (bom[bom["Level"] == 3]
+           [["BOM Header", "Alt", "Parent", "Component", "Component descriptio",
+             "Required Qty", "Special procurement"]].copy()
+           .rename(columns={"Parent": "L2_Comp", "Component": "L3_Comp",
+                            "Component descriptio": "L3_Desc",
+                            "Required Qty": "L3_Qty", "Special procurement": "L3_Ph"}))
+    l3 = l2.merge(bl3, on=["BOM Header", "Alt", "L2_Comp"], how="inner")
+    l3["L3_Gross"] = l3.apply(
+        lambda r: r["L2_Eff"] if _is_ph(r["L3_Ph"]) else r["L2_Eff"] * r["L3_Qty"], axis=1)
+    l3["L3_Eff"] = l3["L3_Gross"]
+    a3 = (l3[~l3["L3_Ph"].apply(_is_ph)]
+          .groupby(["L3_Comp", "L3_Desc", "Month", "Month_Order"], as_index=False)["L3_Gross"]
+          .sum().rename(columns={"L3_Comp": "Component", "L3_Desc": "Desc", "L3_Gross": "Gross"}))
+
+    # L4
+    bl4 = (bom[bom["Level"] == 4]
+           [["BOM Header", "Alt", "Parent", "Component", "Component descriptio",
+             "Required Qty", "Special procurement"]].copy()
+           .rename(columns={"Parent": "L3_Comp", "Component": "L4_Comp",
+                            "Component descriptio": "L4_Desc",
+                            "Required Qty": "L4_Qty", "Special procurement": "L4_Ph"}))
+    l4 = l3.merge(bl4, on=["BOM Header", "Alt", "L3_Comp"], how="inner")
+    l4["L4_Gross"] = l4["L3_Eff"] * l4["L4_Qty"]
+    a4 = (l4.groupby(["L4_Comp", "L4_Desc", "Month", "Month_Order"], as_index=False)["L4_Gross"]
+          .sum().rename(columns={"L4_Comp": "Component", "L4_Desc": "Desc", "L4_Gross": "Gross"}))
+
+    # Combine all levels and sum gross per component per month
+    all_levels = pd.concat([a1, a2, a3, a4], ignore_index=True)
+    combined   = (all_levels.groupby(["Component", "Month"], as_index=False)["Gross"].sum())
+
+    # Build consumption dict  {material: {month_label: gross_qty}}
+    cons = {}
+    for _, row in combined.iterrows():
+        mat = str(row["Component"]).strip()
+        mon = str(row["Month"]).strip()
+        qty = float(row["Gross"])
+        if qty > 0:
+            if mat not in cons: cons[mat] = {}
+            cons[mat][mon] = cons[mat].get(mon, 0) + qty
+
+    return cons, months
+
+
+def project_aging(aging_df, base_date, prod_cons, months_list):
     """
     Aging projection logic:
     ─────────────────────────────────────────────────────────────────
-    Snapshot date = base_date (e.g. 1-May).  Each bucket represents
+    Snapshot date = base_date (e.g. 1-May-26). Each bucket represents
     how old that stock is ON the snapshot date.
 
-    Bucket indices (AGING_BUCKETS):
+    Bucket index → age band on snapshot date:
       0: 0-15 d   1: 16-30 d   2: 31-60 d   3: 61-90 d
       4: 91-120d  5: 121-150d  6: 151-180d  7: 181-360d  8: Over361d
 
-    90-day aging threshold crosses as time passes from snapshot:
-      off=0 (base month) → already-aging = buckets [4:]  (91-120, …)
-      off=1 (1 month on) → newly aging  = bucket [3]  (61-90 → 91+)
-      off=2 (2 months)   → newly aging  = bucket [2]  (31-60 → 91+)
-      off=3 (3 months)   → newly aging  = bucket [1]  (16-30 → 91+)
-      off=4+ (4+ months) → newly aging  = bucket [0]  (0-15  → 91+)
+    Current 90-day aging (off=0):
+      Pool = buckets[4:]  i.e. 91-120 and above
 
-    Consumption = pure cumulative GROSS BOM requirement for this
-    material (from BOM explosion, NOT netted against any stock).
-    It is applied DIRECTLY against the aging pool — not first
-    offset by younger/non-aging stock.
+    May-31 closing / Jun-01 opening (off=1, ~1 month after snapshot):
+      Pool = buckets[3:]  i.e. 61-90 + 91+ (will all be ≥90 days)
+      Less : May gross BOM consumption (cumulative from month 1)
 
-    Aging Qty = max(0,  aging_pool  −  cumulative_BOM_consumption)
+    Jun-30 closing (off=2):
+      Pool = buckets[2:]  i.e. 31-60 + 61-90 + 91+
+      Less : cumulative May+Jun gross BOM consumption
+
+    Jul-31 closing (off=3):
+      Pool = buckets[1:]  i.e. 16-30 + …
+      Less : cumulative May+Jun+Jul consumption
+
+    Aug-31 closing and beyond (off≥4):
+      Pool = all buckets[0:]
+      Less : cumulative consumption up to that month
+
+    Aging Value:
+      • For current snapshot (off=0): sum of actual Value columns (91-120 Value + …)
+      • For forecast months       : Aging_Qty × MAP
     ─────────────────────────────────────────────────────────────────
     """
-    base_ts=pd.Timestamp(base_date)
+    base_ts = pd.Timestamp(base_date)
 
-    def mo(label):
-        try: ts=pd.to_datetime(label,format="%b-%y")
+    def _month_offset(label):
+        try:    ts = pd.to_datetime(label, format="%b-%y")
         except:
-            try: ts=pd.to_datetime(label).replace(day=1)
+            try: ts = pd.to_datetime(label).replace(day=1)
             except: return 0
-        return (ts.year-base_ts.year)*12+(ts.month-base_ts.month)
+        return (ts.year - base_ts.year) * 12 + (ts.month - base_ts.month)
 
-    offsets=[max(0,mo(m)) for m in months_list]
+    offsets = [max(0, _month_offset(m)) for m in months_list]
 
-    # first bucket index that will be >=90 days old after `off` months
-    def asi(off): return max(0,4-off)
+    # First bucket index whose stock will be ≥90 days old after `off` months
+    def _aging_start_idx(off): return max(0, 4 - off)
 
-    records=[]
-    for _,row in aging_df.iterrows():
-        mat=str(row["Material"]).strip()
-        desc=str(row.get("Material Description",""))
-        mtype=str(row.get("Material Type",""))
-        mapx=float(row.get("MAP",0) or 0)
-        bkts=[float(row.get(b,0) or 0) for b in AGING_BUCKETS]
-        mcons=prod_cons.get(mat,{})
-        cum=0.0   # cumulative gross BOM consumption (no stock netting)
+    records = []
+    for _, row in aging_df.iterrows():
+        mat   = str(row["Material"]).strip()
+        desc  = str(row.get("Material Description", ""))
+        mtype = str(row.get("Material Type", ""))
+        mapx  = float(row.get("MAP", 0) or 0)
 
-        for mi,ml in enumerate(months_list):
-            off=offsets[mi]
-            # accumulate PURE gross BOM requirement month by month
-            cum+=float(mcons.get(ml,0))
+        # Quantity buckets
+        bkts_q = [float(row.get(b, 0) or 0) for b in AGING_BUCKETS]
+        # Value buckets (actual SAP values — used for snapshot month)
+        bkts_v = [float(row.get(b, 0) or 0) for b in AGING_VAL_BKTS]
 
-            si=asi(off)
-            # Aging pool = all stock that will be >=90 days old by this month-end
-            ap=sum(bkts[si:])
+        mcons = prod_cons.get(mat, {})
+        cum   = 0.0   # cumulative gross BOM consumption (no stock netting)
 
-            # Bucket that just crossed the 90-day line this month
-            # (at off=0 these were already aging, so newly_aging=0 for base month)
-            newly=bkts[si] if (off>0 and si<len(bkts)) else 0.0
+        for mi, ml in enumerate(months_list):
+            off = offsets[mi]
+            si  = _aging_start_idx(off)
 
-            # KEY: consumption applied DIRECTLY to the aging pool
-            # (no offset by younger stock — pure BOM gross requirement)
-            aq=max(0.0,ap-cum)
-            av=round(aq*mapx,2) if mapx>0 else 0.0
+            # Accumulate gross BOM requirement for this month
+            month_cons = float(mcons.get(ml, 0))
+            cum += month_cons
+
+            # Aging pool = qty that will be ≥90 days by this month-end
+            aging_pool_qty = sum(bkts_q[si:])
+            aging_pool_val = sum(bkts_v[si:])   # actual SAP value (for snapshot)
+
+            # Qty that just crossed the 90-day line this month
+            newly_aging = bkts_q[si] if (off > 0 and si < len(bkts_q)) else 0.0
+
+            # Net aging qty after BOM consumption deduction
+            aging_qty = max(0.0, aging_pool_qty - cum)
+
+            # Aging value:
+            #   off=0 → use actual SAP value columns (then reduce proportionally)
+            #   off>0 → use MAP × aging_qty (forecast)
+            if off == 0:
+                # Proportional reduction of actual value
+                if aging_pool_qty > 0:
+                    val_rate = aging_pool_val / aging_pool_qty
+                else:
+                    val_rate = mapx
+                aging_val = round(aging_qty * val_rate, 2)
+            else:
+                aging_val = round(aging_qty * mapx, 2) if mapx > 0 else 0.0
 
             # Qty in the bucket just below threshold → will turn aging next month
-            tn=bkts[si-1] if si>0 else 0.0
+            turning_next = bkts_q[si - 1] if si > 0 else 0.0
 
             records.append({
-                "Material":mat,
-                "Description":desc,
-                "Material Type":mtype,
-                "Month":ml,
-                "Aging Pool Qty":round(ap,2),
-                "Newly Aging This Month":round(newly,2),
-                "Cumulative BOM Consumption":round(cum,2),
-                "Aging Qty (>=91d)":round(aq,2),
-                "Aging Value (Rs)":av,
-                "Turning Aging Next Month":round(tn,2),
+                "Material":                    mat,
+                "Description":                 desc,
+                "Material Type":               mtype,
+                "Month":                       ml,
+                "Aging Pool Qty":              round(aging_pool_qty, 2),
+                "Newly Aging This Month":      round(newly_aging, 2),
+                "Month BOM Consumption":       round(month_cons, 2),
+                "Cumulative BOM Consumption":  round(cum, 2),
+                "Aging Qty (>=91d)":           round(aging_qty, 2),
+                "Aging Value (Rs)":            aging_val,
+                "Turning Aging Next Month":    round(turning_next, 2),
             })
+
     return pd.DataFrame(records)
 
 
@@ -1269,109 +1541,166 @@ elif st.session_state["page"] == "aging":
     with rb:
         run_ag=st.button("▶ Run Aging Projection",type="primary",use_container_width=True,key="run_ag")
 
-    if run_ag:
-        if af is None: st.warning("Upload Aging Material Details file first.")
-        else:
-            try:
-                with st.spinner("Running aging projection ..."):
-                    agdf=load_aging(af); mrp_r=st.session_state.get("mrp_results"); pc={}
-                    if mrp_r:
-                        ar=[]
-                        for k in ["raw_l1","raw_l2","raw_l3","raw_l4"]:
-                            df=mrp_r.get(k)
-                            if df is not None and not df.empty:
-                                gc=next((c for c in df.columns if c.lower() in ("gross","gross_requirement")),None)
-                                if "Component" in df.columns and "Month" in df.columns and gc:
-                                    tmp=df[["Component","Month",gc]].copy(); tmp.columns=["Component","Month","Gross"]; ar.append(tmp)
-                        if ar:
-                            cdf=pd.concat(ar,ignore_index=True).groupby(["Component","Month"],as_index=False)["Gross"].sum()
-                            for _,rw in cdf.iterrows():
-                                mat=str(rw["Component"]).strip(); mon=str(rw["Month"]).strip(); qty=float(rw["Gross"])
-                                if qty>0:
-                                    if mat not in pc: pc[mat]={}
-                                    pc[mat][mon]=pc[mat].get(mon,0)+qty
-                    raw_months=mrp_r.get("months",[]) if mrp_r else []
-                    if not raw_months:
-                        base=pd.Timestamp(abd); raw_months=[(base+pd.DateOffset(months=i)) for i in range(6)]
-                    def lbl(m):
-                        try: return pd.to_datetime(m,dayfirst=True).strftime("%b-%y")
-                        except: return str(m)
-                    ml=[lbl(m) for m in raw_months]
-                    if pc:
-                        npc={}
-                        for mat,mo in pc.items():
-                            npc[mat]={}
-                            for rm,qty in mo.items(): cm=lbl(rm); npc[mat][cm]=npc[mat].get(cm,0)+qty
-                        pc=npc
-                    proj=project_aging(agdf,base_date=abd,prod_cons=pc,months_list=ml)
-                    st.session_state["aging_results"]={"proj":proj,"months":ml,"base_date":abd}
-            except Exception as e: st.exception(e)
-
-    ag=st.session_state.get("aging_results")
+    ag = st.session_state.get("aging_results")
     if ag is None:
         if not run_ag:
             st.markdown("""<div class="empty"><div class="empty-icon">📦</div>
             <div class="empty-ttl">No aging data yet</div>
-            <div class="empty-sub">Upload the aging file and click Run Aging Projection.</div></div>""",
+            <div class="empty-sub">Upload Aging file + BOM + Requirement, then click Run Aging Projection.</div></div>""",
             unsafe_allow_html=True)
     else:
-        proj=ag["proj"]; ml=ag["months"]; bd=ag["base_date"]
-        mo=[m for m in ml if m in proj["Month"].unique()]
-        lm=mo[-1] if mo else ""; fm=mo[0] if mo else ""
-        fd=proj[proj["Month"]==lm]; ffd=proj[proj["Month"]==fm]
+        proj = ag["proj"]; ml = ag["months"]; bd = ag["base_date"]
+        prod_cons = ag.get("prod_cons", {})
+        mo = [m for m in ml if m in proj["Month"].unique()]
+        lm = mo[-1] if mo else ""; fm = mo[0] if mo else ""
+        fd  = proj[proj["Month"] == lm]
+        ffd = proj[proj["Month"] == fm]
 
+        # ── Overview metrics ────────────────────────────────────
         sec("Overview")
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric(f"Aging Value — {fm}",f"Rs {ffd['Aging Value (Rs)'].sum():,.0f}")
-        c2.metric(f"Aging Value — {lm}",f"Rs {fd['Aging Value (Rs)'].sum():,.0f}",
-                  delta=f"Rs {fd['Aging Value (Rs)'].sum()-ffd['Aging Value (Rs)'].sum():,.0f}",delta_color="inverse")
-        c3.metric(f"Materials aging — {lm}",f"{(fd['Aging Value (Rs)']>0).sum():,}")
-        c4.metric("Materials tracked",f"{proj['Material'].nunique():,}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(f"Current Aging Value ({fm})",
+                  f"Rs {ffd['Aging Value (Rs)'].sum():,.0f}",
+                  help="90+ day aging value at snapshot date (actual SAP values)")
+        c2.metric(f"Projected Aging Value ({lm})",
+                  f"Rs {fd['Aging Value (Rs)'].sum():,.0f}",
+                  delta=f"Rs {fd['Aging Value (Rs)'].sum() - ffd['Aging Value (Rs)'].sum():,.0f}",
+                  delta_color="inverse")
+        c3.metric(f"Materials with aging ({lm})",
+                  f"{(fd['Aging Value (Rs)'] > 0).sum():,}")
+        c4.metric("Components with BOM consumption",
+                  f"{len(prod_cons):,}")
 
+        # ── Logic explainer ────────────────────────────────────
+        with st.expander("ℹ How the aging forecast is calculated"):
+            st.markdown(f"""
+**Snapshot date:** {bd}  — this is when your aging file was extracted from SAP.
+
+| Closing Month | Aging Pool (stock age on snapshot) | Less |
+|---|---|---|
+| **{fm}** (current) | 91-120 + 121-150 + 151-180 + 181-360 + Over361 day stock | — (baseline) |
+| **{mo[1] if len(mo)>1 else ''}** closing | 61-90 + 91+ day stock | Cumulative May BOM consumption |
+| **{mo[2] if len(mo)>2 else ''}** closing | 31-60 + 61-90 + 91+ day stock | Cumulative May+Jun consumption |
+| **{mo[3] if len(mo)>3 else ''}** closing | 16-30 + 31-60 + … day stock | Cumulative May+Jun+Jul consumption |
+| **{mo[4] if len(mo)>4 else ''}+** closing | All stock buckets | Cumulative consumption to date |
+
+**Value calculation:** Snapshot month uses actual SAP value columns. Forecast months use `Aging Qty × Moving Average Price`.  
+**Consumption:** Pure gross BOM explosion (BOM Header × Alt × Required Qty × FG Demand) — no stock netting applied.
+""")
+
+        # ── Monthly summary ────────────────────────────────────
         sec("Aging value by month-end")
-        msumm=(proj.groupby("Month",sort=False)
-               .agg(Aging_Val=("Aging Value (Rs)","sum"),
-                    Mat_Aging=("Material",lambda x:(proj.loc[x.index,"Aging Value (Rs)"]>0).sum()),
-                    Newly_Aging=("Newly Aging This Month","sum"),
-                    BOM_Cons=("Cumulative BOM Consumption","sum"),
-                    Turning_Next=("Turning Aging Next Month","sum"))
-               .reindex(mo).reset_index())
-        msumm.columns=["Month","Aging Value (Rs)","Materials with Aging Value","Newly Aging Qty This Month","Total BOM Consumption (Cumul)","Qty Turning Aging Next Month"]
+        msumm = (proj.groupby("Month", sort=False)
+                 .agg(
+                     Aging_Val    =("Aging Value (Rs)", "sum"),
+                     Mat_Aging    =("Material", lambda x: (proj.loc[x.index, "Aging Value (Rs)"] > 0).sum()),
+                     Newly_Aging  =("Newly Aging This Month", "sum"),
+                     Month_Cons   =("Month BOM Consumption", "sum"),
+                     Cum_Cons     =("Cumulative BOM Consumption", "sum"),
+                     Turning_Next =("Turning Aging Next Month", "sum"),
+                 )
+                 .reindex(mo).reset_index())
+        msumm.columns = ["Month", "Aging Value (Rs)", "Materials with Aging Value",
+                         "Newly Aging Qty", "Month BOM Consumption",
+                         "Cumulative BOM Consumption", "Qty Turning Aging Next Month"]
         def hv(row):
-            v=row["Aging Value (Rs)"]
-            if v>10_000_000: return ["background-color:#fff0f0"]*len(row)
-            if v>1_000_000: return ["background-color:#fffbeb"]*len(row)
-            if v>0: return ["background-color:#f0fdf4"]*len(row)
-            return [""]*len(row)
-        st.dataframe(msumm.style.apply(hv,axis=1).format({"Aging Value (Rs)":"Rs {:,.0f}","Newly Aging Qty This Month":"{:,.0f}","Total BOM Consumption (Cumul)":"{:,.0f}","Qty Turning Aging Next Month":"{:,.0f}"}),use_container_width=True,hide_index=True)
+            v = row["Aging Value (Rs)"]
+            if v > 10_000_000: return ["background-color:#fff0f0"] * len(row)
+            if v > 1_000_000:  return ["background-color:#fffbeb"] * len(row)
+            if v > 0:          return ["background-color:#f0fdf4"] * len(row)
+            return [""] * len(row)
+        st.dataframe(
+            msumm.style.apply(hv, axis=1).format({
+                "Aging Value (Rs)":           "Rs {:,.0f}",
+                "Newly Aging Qty":            "{:,.0f}",
+                "Month BOM Consumption":      "{:,.0f}",
+                "Cumulative BOM Consumption": "{:,.0f}",
+                "Qty Turning Aging Next Month": "{:,.0f}",
+            }),
+            use_container_width=True, hide_index=True)
 
+        # ── Material × month pivot ─────────────────────────────
         sec("Aging value — material × month")
-        piv=(proj.pivot_table(index=["Material","Description"],columns="Month",values="Aging Value (Rs)",aggfunc="sum")
-             .reindex(columns=mo,fill_value=0).reset_index())
-        arows=piv[piv[mo].max(axis=1)>0].sort_values(lm,ascending=False)
+        piv = (proj.pivot_table(index=["Material", "Description"], columns="Month",
+                                values="Aging Value (Rs)", aggfunc="sum")
+               .reindex(columns=mo, fill_value=0).reset_index())
+        arows = piv[piv[mo].max(axis=1) > 0].sort_values(lm, ascending=False)
         st.caption(f"{len(arows):,} materials with aging value")
-        st.dataframe(arows.style.format({m:"Rs {:,.0f}" for m in mo}).background_gradient(subset=mo,cmap="YlOrRd"),use_container_width=True,hide_index=True)
+        st.dataframe(
+            arows.style.format({m: "Rs {:,.0f}" for m in mo})
+                       .background_gradient(subset=mo, cmap="YlOrRd"),
+            use_container_width=True, hide_index=True)
 
+        # ── Material-level detail for selected month ───────────
         sec("Material detail — select month")
-        sm=st.selectbox("View as of:",mo,index=len(mo)-1,key="ag_sel")
-        mdf=proj[proj["Month"]==sm].query("`Aging Value (Rs)` > 0").sort_values("Aging Value (Rs)",ascending=False).copy()
+        sm = st.selectbox("View as of:", mo, index=len(mo) - 1, key="ag_sel")
+        mdf = (proj[proj["Month"] == sm]
+               .query("`Aging Value (Rs)` > 0")
+               .sort_values("Aging Value (Rs)", ascending=False).copy())
         st.caption(f"{len(mdf):,} materials · Total: Rs {mdf['Aging Value (Rs)'].sum():,.0f}")
-        shc=["Material","Description","Material Type","Aging Pool Qty","Newly Aging This Month","Cumulative BOM Consumption","Aging Qty (>=91d)","Aging Value (Rs)"]
+        shc = ["Material", "Description", "Material Type",
+               "Aging Pool Qty", "Newly Aging This Month",
+               "Month BOM Consumption", "Cumulative BOM Consumption",
+               "Aging Qty (>=91d)", "Aging Value (Rs)", "Turning Aging Next Month"]
+        shc = [c for c in shc if c in mdf.columns]
         def hr2(row):
-            v=row["Aging Value (Rs)"]
-            if v>500_000: return ["background-color:#fff0f0"]*len(row)
-            if v>100_000: return ["background-color:#fffbeb"]*len(row)
-            return [""]*len(row)
-        st.dataframe(mdf[shc].style.apply(hr2,axis=1).format({"Aging Pool Qty":"{:,.0f}","Newly Aging This Month":"{:,.0f}","Cumulative BOM Consumption":"{:,.0f}","Aging Qty (>=91d)":"{:,.0f}","Aging Value (Rs)":"Rs {:,.0f}"}),use_container_width=True,hide_index=True)
+            v = row["Aging Value (Rs)"]
+            if v > 500_000: return ["background-color:#fff0f0"] * len(row)
+            if v > 100_000: return ["background-color:#fffbeb"] * len(row)
+            return [""] * len(row)
+        fmt = {
+            "Aging Pool Qty":            "{:,.0f}",
+            "Newly Aging This Month":    "{:,.0f}",
+            "Month BOM Consumption":     "{:,.0f}",
+            "Cumulative BOM Consumption":"{:,.0f}",
+            "Aging Qty (>=91d)":         "{:,.0f}",
+            "Aging Value (Rs)":          "Rs {:,.0f}",
+            "Turning Aging Next Month":  "{:,.0f}",
+        }
+        st.dataframe(
+            mdf[shc].style.apply(hr2, axis=1).format({k: v for k, v in fmt.items() if k in shc}),
+            use_container_width=True, hide_index=True)
 
-        buf=io.BytesIO()
-        with pd.ExcelWriter(buf,engine="openpyxl") as w:
-            msumm.to_excel(w,sheet_name="Monthly Summary",index=False)
-            arows.to_excel(w,sheet_name="Aging Value Pivot",index=False)
-            proj.to_excel(w,sheet_name="Full Detail",index=False)
+        # ── Component consumption drill-down ───────────────────
+        sec("Component BOM consumption drill-down")
+        if prod_cons:
+            cons_rows = []
+            for mat, mdict in prod_cons.items():
+                row_d = {"Component": mat}
+                cum = 0.0
+                for m in mo:
+                    row_d[m] = float(mdict.get(m, 0))
+                    cum += row_d[m]
+                row_d["Total"] = cum
+                cons_rows.append(row_d)
+            cons_df = (pd.DataFrame(cons_rows)
+                       .sort_values("Total", ascending=False)
+                       .reset_index(drop=True))
+            # Only show components that also appear in the aging file
+            aging_mats = set(proj["Material"].unique())
+            cons_ag = cons_df[cons_df["Component"].isin(aging_mats)].copy()
+            st.caption(f"{len(cons_ag):,} components with both BOM consumption and aging data")
+            if not cons_ag.empty:
+                st.dataframe(
+                    cons_ag.style.format({m: "{:,.0f}" for m in mo + ["Total"]}),
+                    use_container_width=True, hide_index=True)
+        else:
+            st.info("No BOM consumption data — check BOM and Requirement files.")
+
+        # ── Download ───────────────────────────────────────────
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            msumm.to_excel(w, sheet_name="Monthly Summary",   index=False)
+            arows.to_excel(w, sheet_name="Aging Value Pivot",  index=False)
+            proj.to_excel( w, sheet_name="Full Detail",        index=False)
+            if prod_cons:
+                cons_df.to_excel(w, sheet_name="BOM Consumption", index=False)
         buf.seek(0)
-        st.download_button("⬇ Download Aging Projection (.xlsx)",data=buf,file_name="aging_projection.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,type="primary")
+        st.download_button(
+            "⬇ Download Aging Projection (.xlsx)", data=buf,
+            file_name="aging_projection.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, type="primary")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1401,6 +1730,7 @@ elif st.session_state["page"] == "settings":
     r3.metric("Aging results",  "Loaded" if st.session_state["aging_results"] else "Not run")
     st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
     if st.button("🗑 Clear all session data",key="clr"):
-        for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes","_bom","_req","_prod","_receipt"]:
+        for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes",
+                  "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req"]:
             st.session_state[k]=None
         st.success("Session cleared."); st.rerun()
