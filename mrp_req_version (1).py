@@ -1795,12 +1795,31 @@ elif st.session_state["page"] == "aging":
             piv[_mc] = pd.to_numeric(piv[_mc], errors="coerce").fillna(0)
         arows = piv[piv[mo].max(axis=1) > 0].sort_values(lm, ascending=False).reset_index(drop=True)
         st.caption(f"{len(arows):,} materials with aging value")
-        try:
-            styled = (arows.style
-                      .format({m: "Rs {:,.0f}" for m in mo})
-                      .background_gradient(subset=mo, cmap="YlOrRd"))
-        except Exception:
-            styled = arows.style.format({m: "Rs {:,.0f}" for m in mo})
+
+        # Manual heat-map colouring (no matplotlib needed)
+        def _heatmap_row(row):
+            styles = []
+            for col in row.index:
+                if col not in mo:
+                    styles.append("")
+                    continue
+                v = row[col]
+                if v <= 0:
+                    styles.append("")
+                else:
+                    # Red intensity scaled 0-100 within each row's max
+                    row_max = max(row[mo].max(), 1)
+                    pct = min(v / row_max, 1.0)
+                    # YlOrRd approximation: low=yellow, high=red
+                    r = int(255)
+                    g = int(255 * (1 - pct * 0.85))
+                    b = int(max(0, 180 * (1 - pct * 2)))
+                    styles.append(f"background-color:rgb({r},{g},{b});color:{'#111' if pct < 0.6 else '#fff'}")
+            return styles
+
+        styled = (arows.style
+                  .format({m: "Rs {:,.0f}" for m in mo})
+                  .apply(_heatmap_row, axis=1))
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
         # ── Material detail for selected opening month ─────────
