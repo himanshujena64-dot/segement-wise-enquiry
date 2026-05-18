@@ -295,7 +295,7 @@ for k, v in {
     "cfg_phantom": "50", "cfg_vl1": "0010748460",
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_prod": None, "_receipt": None,
-    "_aging": None, "_ag_bom": None, "_ag_req": None,
+    "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -973,41 +973,91 @@ def compute_bom_consumption(bom_bytes, req_bytes, phantom_code="50"):
     return cons, months
 
 
-def project_aging(aging_df, base_date, prod_cons, months_list):
+def load_receipts(f):
     """
-    Aging projection logic:
-    ─────────────────────────────────────────────────────────────────
-    Snapshot date = base_date (e.g. 1-May-26). Each bucket represents
-    how old that stock is ON the snapshot date.
+    Load month-wise receipt file.
+    Format: Component | May-26 | Jun-26 | Jul-26 | Aug-26 ...
+    Returns: dict {material: {month_label: receipt_qty}}
+    """
+    df = pd.read_excel(f)
+    df.columns = [str(c).strip() for c in df.columns]
 
-    Bucket index → age band on snapshot date:
+    # First column = Component/Material
+    mat_col = df.columns[0]
+    month_cols = df.columns[1:]
+
+    receipts = {}
+    for _, row in df.iterrows():
+        mat = str(row[mat_col]).strip()
+        if not mat or mat.lower() in ("nan", "none", ""): continue
+        for col in month_cols:
+            qty = pd.to_numeric(row[col], errors="coerce")
+            if pd.isna(qty) or qty <= 0: continue
+            # Normalise column label to Mon-YY
+            try:
+                ts = pd.Timestamp(col).replace(day=1)
+                lbl = ts.strftime("%b-%y")
+            except:
+                try:
+                    ts = pd.to_datetime(str(col), dayfirst=True).replace(day=1)
+                    lbl = ts.strftime("%b-%y")
+                except:
+                    lbl = str(col).strip()
+            if mat not in receipts: receipts[mat] = {}
+            receipts[mat][lbl] = receipts[mat].get(lbl, 0) + float(qty)
+    return receipts
+
+
+def project_aging(aging_df, base_date, prod_cons, months_list, receipts=None):
+    """
+    Aging Opening Inventory Projection
+    ────────────────────────────────────────────────────────────────
+    Snapshot date = base_date (e.g. May-01-2026).
+    Aging buckets represent stock age AS OF the snapshot date.
+
+    Bucket index in AGING_BUCKETS:
       0: 0-15 d   1: 16-30 d   2: 31-60 d   3: 61-90 d
       4: 91-120d  5: 121-150d  6: 151-180d  7: 181-360d  8: Over361d
 
-    Current 90-day aging (off=0):
-      Pool = buckets[4:]  i.e. 91-120 and above
+    Opening Aging on snapshot month (off=0):
+      Pool  = buckets[4:]   → already ≥ 90 days
+      Less  = nothing (baseline)
+      Plus  = nothing
 
-    May-31 closing / Jun-01 opening (off=1, ~1 month after snapshot):
-      Pool = buckets[3:]  i.e. 61-90 + 91+ (will all be ≥90 days)
-      Less : May gross BOM consumption (cumulative from month 1)
+    Jun-1 opening (off=1, snapshot=May-1):
+      Pool  = buckets[3:]   → 61-90 day stock will be 91-120 days by Jun-1
+      Less  = May consumption (months BEFORE Jun)
+      Plus  = May receipts not consumed
 
-    Jun-30 closing (off=2):
-      Pool = buckets[2:]  i.e. 31-60 + 61-90 + 91+
-      Less : cumulative May+Jun gross BOM consumption
+    Jul-1 opening (off=2):
+      Pool  = buckets[2:]   → 31-60 day stock will be 91+ by Jul-1
+      Less  = May + Jun cumulative consumption
+      Plus  = May + Jun cumulative receipts not consumed
 
-    Jul-31 closing (off=3):
-      Pool = buckets[1:]  i.e. 16-30 + …
-      Less : cumulative May+Jun+Jul consumption
+    Aug-1 opening (off=3):
+      Pool  = ALL buckets   → even 0-15 day stock will be 90+ by Aug-1
+      Less  = May + Jun + Jul cumulative consumption
+      Plus  = May + Jun + Jul cumulative receipts not consumed
 
-    Aug-31 closing and beyond (off≥4):
-      Pool = all buckets[0:]
-      Less : cumulative consumption up to that month
+    Sep-1+ opening (off≥3):
+      Pool  = ALL buckets   (same as Aug — all buckets exhausted)
+      Less  = all prior months cumulative consumption
+      Plus  = all prior months cumulative receipts not consumed
 
-    Aging Value:
-      • For current snapshot (off=0): sum of actual Value columns (91-120 Value + …)
-      • For forecast months       : Aging_Qty × MAP
-    ─────────────────────────────────────────────────────────────────
+    KEY RULES:
+    • Consumption deducted = all months BEFORE this opening (off months back)
+      i.e. for off=1 (Jun opening) deduct only May (1 month before)
+    • Receipts added = same prior months as consumption
+      Receipt qty valued at MAP. Only net-positive receipts (receipt > consumption
+      for that material) contribute to aging.
+    • Aging Value:
+        off=0 → actual SAP value columns (sum of 91-120 Value + …)
+        off>0 → Aging_Qty × MAP
+    ────────────────────────────────────────────────────────────────
     """
+    if receipts is None:
+        receipts = {}
+
     base_ts = pd.Timestamp(base_date)
 
     def _month_offset(label):
@@ -1019,8 +1069,12 @@ def project_aging(aging_df, base_date, prod_cons, months_list):
 
     offsets = [max(0, _month_offset(m)) for m in months_list]
 
-    # First bucket index whose stock will be ≥90 days old after `off` months
-    def _aging_start_idx(off): return max(0, 4 - off)
+    # Bucket index where aging pool starts for a given month-offset
+    # off=0 → idx 4 (91-120+)
+    # off=1 → idx 3 (61-90+)
+    # off=2 → idx 2 (31-60+)
+    # off≥3 → idx 0 (ALL — even 0-15 day stock will be 90+ days old)
+    def _aging_start_idx(off): return max(0, 4 - off) if off < 4 else 0
 
     records = []
     for _, row in aging_df.iterrows():
@@ -1029,61 +1083,70 @@ def project_aging(aging_df, base_date, prod_cons, months_list):
         mtype = str(row.get("Material Type", ""))
         mapx  = float(row.get("MAP", 0) or 0)
 
-        # Quantity buckets
         bkts_q = [float(row.get(b, 0) or 0) for b in AGING_BUCKETS]
-        # Value buckets (actual SAP values — used for snapshot month)
         bkts_v = [float(row.get(b, 0) or 0) for b in AGING_VAL_BKTS]
 
-        mcons = prod_cons.get(mat, {})
-        cum   = 0.0   # cumulative gross BOM consumption (no stock netting)
+        mcons  = prod_cons.get(mat, {})
+        mrec   = receipts.get(mat, {})
+
+        # Build cumulative consumption and receipts month by month
+        # We track cumulatives up to (but NOT including) the current opening month
+        # i.e. for off=1 (Jun opening) → deduct only months[0] (May)
+        cum_cons = 0.0
+        cum_rec  = 0.0
 
         for mi, ml in enumerate(months_list):
             off = offsets[mi]
             si  = _aging_start_idx(off)
 
-            # Accumulate gross BOM requirement for this month
-            month_cons = float(mcons.get(ml, 0))
-            cum += month_cons
+            # ── For off=0 (snapshot/current month): no prior months to deduct ──
+            # ── For off>0: deduct all months BEFORE this one (index 0..mi-1) ──
+            # We accumulate as we iterate, so cum_cons/cum_rec at start of this
+            # iteration already holds sum of months[0..mi-1]. Correct!
 
-            # Aging pool = qty that will be ≥90 days by this month-end
             aging_pool_qty = sum(bkts_q[si:])
-            aging_pool_val = sum(bkts_v[si:])   # actual SAP value (for snapshot)
+            aging_pool_val = sum(bkts_v[si:])
 
-            # Qty that just crossed the 90-day line this month
+            # Newly crossing 90-day threshold this opening
             newly_aging = bkts_q[si] if (off > 0 and si < len(bkts_q)) else 0.0
 
-            # Net aging qty after BOM consumption deduction
-            aging_qty = max(0.0, aging_pool_qty - cum)
+            # Net receipts (only receipts exceeding consumption matter for aging)
+            net_receipt = max(0.0, cum_rec - cum_cons)
 
-            # Aging value:
-            #   off=0 → use actual SAP value columns (then reduce proportionally)
-            #   off>0 → use MAP × aging_qty (forecast)
+            # Net aging qty
+            # = pool qty - cumulative consumption + net receipts (uncollected)
+            aging_qty = max(0.0, aging_pool_qty - cum_cons + net_receipt)
+
+            # Aging value
             if off == 0:
-                # Proportional reduction of actual value
-                if aging_pool_qty > 0:
-                    val_rate = aging_pool_val / aging_pool_qty
-                else:
-                    val_rate = mapx
+                val_rate = (aging_pool_val / aging_pool_qty) if aging_pool_qty > 0 else mapx
                 aging_val = round(aging_qty * val_rate, 2)
             else:
                 aging_val = round(aging_qty * mapx, 2) if mapx > 0 else 0.0
 
-            # Qty in the bucket just below threshold → will turn aging next month
             turning_next = bkts_q[si - 1] if si > 0 else 0.0
 
             records.append({
-                "Material":                    mat,
-                "Description":                 desc,
-                "Material Type":               mtype,
-                "Month":                       ml,
-                "Aging Pool Qty":              round(aging_pool_qty, 2),
-                "Newly Aging This Month":      round(newly_aging, 2),
-                "Month BOM Consumption":       round(month_cons, 2),
-                "Cumulative BOM Consumption":  round(cum, 2),
-                "Aging Qty (>=91d)":           round(aging_qty, 2),
-                "Aging Value (Rs)":            aging_val,
-                "Turning Aging Next Month":    round(turning_next, 2),
+                "Material":                   mat,
+                "Description":                desc,
+                "Material Type":              mtype,
+                "Opening Month":              ml,
+                "Aging Pool Qty":             round(aging_pool_qty, 2),
+                "Newly Aging This Month":     round(newly_aging, 2),
+                "Month BOM Consumption":      round(float(mcons.get(ml, 0)), 2),
+                "Cumulative BOM Consumption": round(cum_cons, 2),
+                "Month Receipt Qty":          round(float(mrec.get(ml, 0)), 2),
+                "Cumulative Receipt Qty":     round(cum_rec, 2),
+                "Net Receipt (unused)":       round(net_receipt, 2),
+                "Aging Qty (>=91d)":          round(aging_qty, 2),
+                "Aging Value (Rs)":           aging_val,
+                "Turning Aging Next Month":   round(turning_next, 2),
             })
+
+            # NOW accumulate this month's consumption and receipts
+            # so next iteration has correct prior-month totals
+            cum_cons += float(mcons.get(ml, 0))
+            cum_rec  += float(mrec.get(ml, 0))
 
     return pd.DataFrame(records)
 
@@ -1527,7 +1590,7 @@ elif st.session_state["page"] == "segment":
 # PAGE: AGING PROJECTION
 # ═══════════════════════════════════════════════════════════════
 elif st.session_state["page"] == "aging":
-    topbar("Aging Material Projection", "Forecast aging stock with cumulative production consumption offset")
+    topbar("Aging Opening Inventory Forecast", "Month-wise aging opening stock — BOM consumption + receipt adjusted")
 
     sec("Input Files")
     fc1, fc2 = st.columns(2)
@@ -1553,10 +1616,20 @@ elif st.session_state["page"] == "aging":
         if not st.session_state.get("_ag_req") and st.session_state.get("_req"):
             st.caption("✓ Will use Req & Stock already loaded in MRP session")
     with fc4:
+        rec_ag_f = st.file_uploader("Receipt File (.xlsx) — Optional",
+                                    type=["xlsx","xls"], key="ag_rec_f")
+        if rec_ag_f:
+            st.session_state["_ag_rec"] = rec_ag_f.read()
+            st.caption("✓ Receipt file loaded")
+
+    fc5, fc6 = st.columns(2)
+    with fc5:
         st.markdown("**Aging snapshot date**")
-        st.caption("Date the aging file was extracted from SAP")
+        st.caption("Date the aging file was extracted from SAP (e.g. May-01 if it is May opening)")
         abd = st.date_input("Snapshot date", value=pd.Timestamp("2026-05-01"),
                             key="ag_dt", label_visibility="collapsed")
+    with fc6:
+        st.markdown(" ")
 
     rb, _ = st.columns([1,4])
     with rb:
@@ -1567,6 +1640,7 @@ elif st.session_state["page"] == "aging":
         ag_bytes  = st.session_state.get("_aging")
         bom_bytes = st.session_state.get("_ag_bom") or st.session_state.get("_bom")
         req_bytes = st.session_state.get("_ag_req") or st.session_state.get("_req")
+        rec_bytes = st.session_state.get("_ag_rec")
 
         missing = []
         if not ag_bytes:  missing.append("Aging Material Details")
@@ -1578,6 +1652,7 @@ elif st.session_state["page"] == "aging":
             try:
                 status_ag = st.status("Running Aging Projection ...", expanded=True)
                 with status_ag:
+                    # Step 1 — consolidate aging
                     st.write("► Step 1 — Consolidating aging file (storage location → material) ...")
                     agdf = load_aging(io.BytesIO(ag_bytes))
                     n_mats    = len(agdf)
@@ -1585,6 +1660,7 @@ elif st.session_state["page"] == "aging":
                                            "181-360 Qty","Over361 Qty"]].sum(axis=1) > 0).sum())
                     st.write(f"   → {n_mats:,} unique materials · {n_aging90:,} with current 90+ day aging")
 
+                    # Step 2 — BOM explosion
                     st.write("► Step 2 — Exploding BOM (L1–L4) to get gross component consumption ...")
                     prod_cons, months_from_req = compute_bom_consumption(
                         bom_bytes, req_bytes,
@@ -1592,14 +1668,26 @@ elif st.session_state["page"] == "aging":
                     st.write(f"   → {len(prod_cons):,} components with BOM consumption · "
                              f"{len(months_from_req)} months: {', '.join(months_from_req)}")
 
-                    st.write("► Step 3 — Projecting aging month-by-month ...")
+                    # Step 3 — Receipts (optional)
+                    receipts = {}
+                    if rec_bytes:
+                        st.write("► Step 3 — Loading receipt file ...")
+                        receipts = load_receipts(io.BytesIO(rec_bytes))
+                        st.write(f"   → {len(receipts):,} components with receipt data")
+                    else:
+                        st.write("► Step 3 — No receipt file provided (skipping)")
+
+                    # Step 4 — Project aging
+                    st.write("► Step 4 — Projecting aging opening inventory month-by-month ...")
                     proj = project_aging(agdf, base_date=abd,
-                                         prod_cons=prod_cons, months_list=months_from_req)
+                                         prod_cons=prod_cons,
+                                         months_list=months_from_req,
+                                         receipts=receipts)
 
                     st.session_state["aging_results"] = {
                         "proj": proj, "months": months_from_req, "base_date": abd,
                         "n_mats": n_mats, "n_aging90": n_aging90,
-                        "prod_cons": prod_cons,
+                        "prod_cons": prod_cons, "receipts": receipts,
                     }
                 status_ag.update(label="Aging Projection complete ✅", state="complete", expanded=False)
             except Exception as e:
@@ -1610,82 +1698,96 @@ elif st.session_state["page"] == "aging":
         if not run_ag:
             st.markdown("""<div class="empty"><div class="empty-icon">📦</div>
             <div class="empty-ttl">No aging data yet</div>
-            <div class="empty-sub">Upload Aging file + BOM + Requirement, then click Run Aging Projection.</div></div>""",
+            <div class="empty-sub">Upload Aging file + BOM + Requirement (Receipt optional), then click Run Aging Projection.</div></div>""",
             unsafe_allow_html=True)
     else:
-        proj = ag["proj"]; ml = ag["months"]; bd = ag["base_date"]
-        prod_cons = ag.get("prod_cons", {})
-        mo = [m for m in ml if m in proj["Month"].unique()]
+        proj     = ag["proj"]; ml = ag["months"]; bd = ag["base_date"]
+        prod_cons = ag.get("prod_cons", {}); receipts = ag.get("receipts", {})
+        mo = [m for m in ml if m in proj["Opening Month"].unique()]
         lm = mo[-1] if mo else ""; fm = mo[0] if mo else ""
-        fd  = proj[proj["Month"] == lm]
-        ffd = proj[proj["Month"] == fm]
+        fd  = proj[proj["Opening Month"] == lm]
+        ffd = proj[proj["Opening Month"] == fm]
 
-        # ── Overview metrics ────────────────────────────────────
+        # ── Logic explainer ────────────────────────────────────
+        with st.expander("ℹ How the aging opening forecast is calculated"):
+            def _pool_desc(off):
+                if off == 0: return "91-120 + 121-150 + 151-180 + 181-360 + Over361 day stock"
+                if off == 1: return "61-90 + 91+ day stock"
+                if off == 2: return "31-60 + 61-90 + 91+ day stock"
+                return "ALL buckets (0-15 + 16-30 + 31-60 + 61-90 + 91+ day stock)"
+            def _cons_desc(idx, mo_list):
+                prior = mo_list[:idx]
+                if not prior: return "— (baseline, no prior months)"
+                return "Cumulative " + "+".join(prior) + " BOM consumption"
+            rows_md = ""
+            for i, m in enumerate(mo):
+                pool = _pool_desc(i)
+                cons = _cons_desc(i, mo)
+                rows_md += "| **" + m + "** opening | " + pool + " | " + cons + " |\n"
+            st.markdown(f"""
+**Snapshot date:** {bd} — date the aging file was extracted from SAP.
+
+| Opening Month | Aging Pool (stock age on snapshot) | Less |
+|---|---|---|
+{rows_md}
+**Value:** Snapshot month uses actual SAP value columns. Forecast months use `Aging Qty × MAP`.  
+**Receipts:** Receipt qty × MAP added for prior months (only net-positive = receipt > consumption).  
+**Consumption:** Pure gross BOM explosion — no stock netting.
+""")
+
+        # ── Overview metrics ───────────────────────────────────
         sec("Overview")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric(f"Current Aging Value ({fm})",
+        c1.metric(f"Opening Aging Value ({fm})",
                   f"Rs {ffd['Aging Value (Rs)'].sum():,.0f}",
-                  help="90+ day aging value at snapshot date (actual SAP values)")
-        c2.metric(f"Projected Aging Value ({lm})",
+                  help="Current 90+ day aging — actual SAP values")
+        c2.metric(f"Projected Opening Aging ({lm})",
                   f"Rs {fd['Aging Value (Rs)'].sum():,.0f}",
                   delta=f"Rs {fd['Aging Value (Rs)'].sum() - ffd['Aging Value (Rs)'].sum():,.0f}",
                   delta_color="inverse")
         c3.metric(f"Materials with aging ({lm})",
                   f"{(fd['Aging Value (Rs)'] > 0).sum():,}")
-        c4.metric("Components with BOM consumption",
-                  f"{len(prod_cons):,}")
+        c4.metric("With receipt adjustment",
+                  f"{len(receipts):,} components" if receipts else "No receipt file")
 
-        # ── Logic explainer ────────────────────────────────────
-        with st.expander("ℹ How the aging forecast is calculated"):
-            st.markdown(f"""
-**Snapshot date:** {bd}  — this is when your aging file was extracted from SAP.
-
-| Closing Month | Aging Pool (stock age on snapshot) | Less |
-|---|---|---|
-| **{fm}** (current) | 91-120 + 121-150 + 151-180 + 181-360 + Over361 day stock | — (baseline) |
-| **{mo[1] if len(mo)>1 else ''}** closing | 61-90 + 91+ day stock | Cumulative May BOM consumption |
-| **{mo[2] if len(mo)>2 else ''}** closing | 31-60 + 61-90 + 91+ day stock | Cumulative May+Jun consumption |
-| **{mo[3] if len(mo)>3 else ''}** closing | 16-30 + 31-60 + … day stock | Cumulative May+Jun+Jul consumption |
-| **{mo[4] if len(mo)>4 else ''}+** closing | All stock buckets | Cumulative consumption to date |
-
-**Value calculation:** Snapshot month uses actual SAP value columns. Forecast months use `Aging Qty × Moving Average Price`.  
-**Consumption:** Pure gross BOM explosion (BOM Header × Alt × Required Qty × FG Demand) — no stock netting applied.
-""")
-
-        # ── Monthly summary ────────────────────────────────────
-        sec("Aging value by month-end")
-        msumm = (proj.groupby("Month", sort=False)
+        # ── Monthly summary table ──────────────────────────────
+        sec("Opening aging by month")
+        msumm = (proj.groupby("Opening Month", sort=False)
                  .agg(
-                     Aging_Val    =("Aging Value (Rs)", "sum"),
-                     Mat_Aging    =("Material", lambda x: (proj.loc[x.index, "Aging Value (Rs)"] > 0).sum()),
-                     Newly_Aging  =("Newly Aging This Month", "sum"),
-                     Month_Cons   =("Month BOM Consumption", "sum"),
-                     Cum_Cons     =("Cumulative BOM Consumption", "sum"),
-                     Turning_Next =("Turning Aging Next Month", "sum"),
+                     Aging_Val   =("Aging Value (Rs)",          "sum"),
+                     Mat_Aging   =("Material", lambda x: (proj.loc[x.index,"Aging Value (Rs)"]>0).sum()),
+                     Newly_Aging =("Newly Aging This Month",    "sum"),
+                     Month_Cons  =("Month BOM Consumption",     "sum"),
+                     Cum_Cons    =("Cumulative BOM Consumption","sum"),
+                     Month_Rec   =("Month Receipt Qty",         "sum"),
+                     Cum_Rec     =("Cumulative Receipt Qty",    "sum"),
+                     Net_Rec     =("Net Receipt (unused)",      "sum"),
                  )
                  .reindex(mo).reset_index())
-        msumm.columns = ["Month", "Aging Value (Rs)", "Materials with Aging Value",
-                         "Newly Aging Qty", "Month BOM Consumption",
-                         "Cumulative BOM Consumption", "Qty Turning Aging Next Month"]
+        msumm.columns = ["Opening Month","Aging Value (Rs)","Materials with Aging",
+                         "Newly Aging Qty","Month BOM Consumption","Cumulative BOM Consumption",
+                         "Month Receipt Qty","Cumulative Receipt Qty","Net Unused Receipt Qty"]
         def hv(row):
             v = row["Aging Value (Rs)"]
             if v > 10_000_000: return ["background-color:#fff0f0"] * len(row)
             if v > 1_000_000:  return ["background-color:#fffbeb"] * len(row)
             if v > 0:          return ["background-color:#f0fdf4"] * len(row)
             return [""] * len(row)
-        st.dataframe(
-            msumm.style.apply(hv, axis=1).format({
-                "Aging Value (Rs)":           "Rs {:,.0f}",
-                "Newly Aging Qty":            "{:,.0f}",
-                "Month BOM Consumption":      "{:,.0f}",
-                "Cumulative BOM Consumption": "{:,.0f}",
-                "Qty Turning Aging Next Month": "{:,.0f}",
-            }),
-            use_container_width=True, hide_index=True)
+        fmt_s = {
+            "Aging Value (Rs)":           "Rs {:,.0f}",
+            "Newly Aging Qty":            "{:,.0f}",
+            "Month BOM Consumption":      "{:,.0f}",
+            "Cumulative BOM Consumption": "{:,.0f}",
+            "Month Receipt Qty":          "{:,.0f}",
+            "Cumulative Receipt Qty":     "{:,.0f}",
+            "Net Unused Receipt Qty":     "{:,.0f}",
+        }
+        st.dataframe(msumm.style.apply(hv, axis=1).format(fmt_s),
+                     use_container_width=True, hide_index=True)
 
-        # ── Material × month pivot ─────────────────────────────
-        sec("Aging value — material × month")
-        piv = (proj.pivot_table(index=["Material", "Description"], columns="Month",
+        # ── Material × month pivot (aging value) ───────────────
+        sec("Aging value — material × opening month")
+        piv = (proj.pivot_table(index=["Material","Description"], columns="Opening Month",
                                 values="Aging Value (Rs)", aggfunc="sum")
                .reindex(columns=mo, fill_value=0).reset_index())
         arows = piv[piv[mo].max(axis=1) > 0].sort_values(lm, ascending=False)
@@ -1695,70 +1797,66 @@ elif st.session_state["page"] == "aging":
                        .background_gradient(subset=mo, cmap="YlOrRd"),
             use_container_width=True, hide_index=True)
 
-        # ── Material-level detail for selected month ───────────
-        sec("Material detail — select month")
-        sm = st.selectbox("View as of:", mo, index=len(mo) - 1, key="ag_sel")
-        mdf = (proj[proj["Month"] == sm]
+        # ── Material detail for selected opening month ─────────
+        sec("Material detail — select opening month")
+        sm = st.selectbox("Opening as of:", mo, index=0, key="ag_sel")
+        mdf = (proj[proj["Opening Month"] == sm]
                .query("`Aging Value (Rs)` > 0")
                .sort_values("Aging Value (Rs)", ascending=False).copy())
         st.caption(f"{len(mdf):,} materials · Total: Rs {mdf['Aging Value (Rs)'].sum():,.0f}")
-        shc = ["Material", "Description", "Material Type",
-               "Aging Pool Qty", "Newly Aging This Month",
-               "Month BOM Consumption", "Cumulative BOM Consumption",
-               "Aging Qty (>=91d)", "Aging Value (Rs)", "Turning Aging Next Month"]
+        shc = ["Material","Description","Material Type",
+               "Aging Pool Qty","Newly Aging This Month",
+               "Cumulative BOM Consumption","Cumulative Receipt Qty","Net Receipt (unused)",
+               "Aging Qty (>=91d)","Aging Value (Rs)","Turning Aging Next Month"]
         shc = [c for c in shc if c in mdf.columns]
         def hr2(row):
             v = row["Aging Value (Rs)"]
             if v > 500_000: return ["background-color:#fff0f0"] * len(row)
             if v > 100_000: return ["background-color:#fffbeb"] * len(row)
             return [""] * len(row)
-        fmt = {
-            "Aging Pool Qty":            "{:,.0f}",
-            "Newly Aging This Month":    "{:,.0f}",
-            "Month BOM Consumption":     "{:,.0f}",
-            "Cumulative BOM Consumption":"{:,.0f}",
-            "Aging Qty (>=91d)":         "{:,.0f}",
-            "Aging Value (Rs)":          "Rs {:,.0f}",
-            "Turning Aging Next Month":  "{:,.0f}",
-        }
+        fmt2 = {c: "{:,.0f}" for c in shc if c != "Material" and c != "Description" and c != "Material Type"}
+        fmt2["Aging Value (Rs)"] = "Rs {:,.0f}"
         st.dataframe(
-            mdf[shc].style.apply(hr2, axis=1).format({k: v for k, v in fmt.items() if k in shc}),
+            mdf[shc].style.apply(hr2, axis=1).format({k:v for k,v in fmt2.items() if k in shc}),
             use_container_width=True, hide_index=True)
 
-        # ── Component consumption drill-down ───────────────────
-        sec("Component BOM consumption drill-down")
-        if prod_cons:
-            cons_rows = []
-            for mat, mdict in prod_cons.items():
+        # ── Receipts drill-down (if loaded) ───────────────────
+        if receipts:
+            sec("Receipt adjustment drill-down")
+            rec_rows = []
+            for mat, mdict in receipts.items():
                 row_d = {"Component": mat}
-                cum = 0.0
+                total = 0.0
                 for m in mo:
                     row_d[m] = float(mdict.get(m, 0))
-                    cum += row_d[m]
-                row_d["Total"] = cum
-                cons_rows.append(row_d)
-            cons_df = (pd.DataFrame(cons_rows)
-                       .sort_values("Total", ascending=False)
-                       .reset_index(drop=True))
-            # Only show components that also appear in the aging file
+                    total += row_d[m]
+                row_d["Total Receipt"] = total
+                rec_rows.append(row_d)
+            rec_df = (pd.DataFrame(rec_rows)
+                      .sort_values("Total Receipt", ascending=False)
+                      .reset_index(drop=True))
             aging_mats = set(proj["Material"].unique())
-            cons_ag = cons_df[cons_df["Component"].isin(aging_mats)].copy()
-            st.caption(f"{len(cons_ag):,} components with both BOM consumption and aging data")
-            if not cons_ag.empty:
-                st.dataframe(
-                    cons_ag.style.format({m: "{:,.0f}" for m in mo + ["Total"]}),
-                    use_container_width=True, hide_index=True)
-        else:
-            st.info("No BOM consumption data — check BOM and Requirement files.")
+            rec_ag = rec_df[rec_df["Component"].isin(aging_mats)].copy()
+            st.caption(f"{len(rec_ag):,} components with receipt data also present in aging file")
+            if not rec_ag.empty:
+                st.dataframe(rec_ag.style.format({m: "{:,.0f}" for m in mo + ["Total Receipt"]}),
+                             use_container_width=True, hide_index=True)
 
         # ── Download ───────────────────────────────────────────
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            msumm.to_excel(w, sheet_name="Monthly Summary",   index=False)
+            msumm.to_excel(w, sheet_name="Monthly Summary",    index=False)
             arows.to_excel(w, sheet_name="Aging Value Pivot",  index=False)
             proj.to_excel( w, sheet_name="Full Detail",        index=False)
             if prod_cons:
-                cons_df.to_excel(w, sheet_name="BOM Consumption", index=False)
+                cons_rows = []
+                for mat, mdict in prod_cons.items():
+                    row_d = {"Component": mat}
+                    for m in mo: row_d[m] = float(mdict.get(m, 0))
+                    cons_rows.append(row_d)
+                pd.DataFrame(cons_rows).to_excel(w, sheet_name="BOM Consumption", index=False)
+            if receipts:
+                rec_df.to_excel(w, sheet_name="Receipts", index=False)
         buf.seek(0)
         st.download_button(
             "⬇ Download Aging Projection (.xlsx)", data=buf,
@@ -1795,6 +1893,6 @@ elif st.session_state["page"] == "settings":
     st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
     if st.button("🗑 Clear all session data",key="clr"):
         for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes",
-                  "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req"]:
+                  "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_rec"]:
             st.session_state[k]=None
         st.success("Session cleared."); st.rerun()
