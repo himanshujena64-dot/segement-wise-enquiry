@@ -1790,12 +1790,18 @@ elif st.session_state["page"] == "aging":
         piv = (proj.pivot_table(index=["Material","Description"], columns="Opening Month",
                                 values="Aging Value (Rs)", aggfunc="sum")
                .reindex(columns=mo, fill_value=0).reset_index())
-        arows = piv[piv[mo].max(axis=1) > 0].sort_values(lm, ascending=False)
+        # Ensure month columns are numeric before styling
+        for _mc in mo:
+            piv[_mc] = pd.to_numeric(piv[_mc], errors="coerce").fillna(0)
+        arows = piv[piv[mo].max(axis=1) > 0].sort_values(lm, ascending=False).reset_index(drop=True)
         st.caption(f"{len(arows):,} materials with aging value")
-        st.dataframe(
-            arows.style.format({m: "Rs {:,.0f}" for m in mo})
-                       .background_gradient(subset=mo, cmap="YlOrRd"),
-            use_container_width=True, hide_index=True)
+        try:
+            styled = (arows.style
+                      .format({m: "Rs {:,.0f}" for m in mo})
+                      .background_gradient(subset=mo, cmap="YlOrRd"))
+        except Exception:
+            styled = arows.style.format({m: "Rs {:,.0f}" for m in mo})
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
         # ── Material detail for selected opening month ─────────
         sec("Material detail — select opening month")
