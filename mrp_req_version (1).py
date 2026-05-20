@@ -302,9 +302,71 @@ for k, v in {
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_prod": None, "_receipt": None,
     "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None, "plan_open": False,
+    "authenticated": False, "_login_error": "",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ═══════════════════════════════════════════════════════════════
+# LOGIN GATE
+# ═══════════════════════════════════════════════════════════════
+_VALID_USER = "admin"
+_VALID_PASS = "admin@2040"
+
+if not st.session_state["authenticated"]:
+    st.markdown("""
+    <style>
+    [data-testid="stSidebar"] { display: none !important; }
+    .login-wrap {
+        max-width: 420px; margin: 80px auto 0;
+        background: #ffffff; border: 1px solid #e5e7eb;
+        border-radius: 16px; padding: 40px 36px 36px;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.07);
+    }
+    .login-logo {
+        width: 48px; height: 48px; background: #1a6ef7;
+        border-radius: 12px; display: flex; align-items: center;
+        justify-content: center; font-size: 24px; margin: 0 auto 20px;
+    }
+    .login-title {
+        font-size: 22px; font-weight: 700; color: #111827;
+        text-align: center; margin-bottom: 4px;
+    }
+    .login-sub { font-size: 13px; color: #9ca3af; text-align: center; margin-bottom: 28px; }
+    .login-err {
+        background: #fff0f0; border: 1px solid #fecaca;
+        border-radius: 8px; padding: 10px 14px;
+        color: #dc2626; font-size: 13px; font-weight: 500;
+        margin-bottom: 14px; text-align: center;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    _col_l, _col_c, _col_r = st.columns([1, 2, 1])
+    with _col_c:
+        st.markdown("""
+        <div class="login-wrap">
+          <div class="login-logo">⚙</div>
+          <div class="login-title">SAP MRP Engine</div>
+          <div class="login-sub">Sign in to continue</div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.session_state["_login_error"]:
+            st.markdown(f'<div class="login-err">❌ {st.session_state["_login_error"]}</div>',
+                        unsafe_allow_html=True)
+        _uid = st.text_input("User ID", placeholder="Enter user ID", key="_li_uid")
+        _pwd = st.text_input("Password", placeholder="Enter password",
+                             type="password", key="_li_pwd")
+        _btn = st.button("Sign In", type="primary", use_container_width=True)
+        if _btn:
+            if _uid.strip() == _VALID_USER and _pwd == _VALID_PASS:
+                st.session_state["authenticated"] = True
+                st.session_state["_login_error"] = ""
+                st.rerun()
+            else:
+                st.session_state["_login_error"] = "Invalid user ID or password."
+                st.rerun()
+    st.stop()  # block the rest of the app until authenticated
 
 PHANTOM   = st.session_state["cfg_phantom"]
 VERIFY_L1 = st.session_state["cfg_vl1"]
@@ -1272,15 +1334,17 @@ with st.sidebar:
     for icon, label, pg, badge in tools_items:
         _nav_btn(icon, label, pg, badge)
 
-    # Footer
+    # Footer with logout
     st.markdown("""
-    <div style="position:fixed;bottom:0;left:0;width:230px;padding:14px 16px;
-                border-top:1px solid rgba(255,255,255,0.07);background:#0d1b2a;">
-      <div style="font-size:12px;color:rgba(255,255,255,0.3);font-family:'Plus Jakarta Sans',sans-serif;">
-        Need help?<br>
-        <span style="font-size:11px;color:rgba(255,255,255,0.18);">Contact support</span>
+    <div style="position:fixed;bottom:48px;left:0;width:230px;padding:10px 16px 4px;
+                background:#0d1b2a;">
+      <div style="font-size:11px;color:rgba(255,255,255,0.3);font-family:'Plus Jakarta Sans',sans-serif;">
+        Logged in as <span style="color:rgba(255,255,255,0.55);font-weight:600;">admin</span>
       </div>
     </div>""", unsafe_allow_html=True)
+    if st.button("🔒  Sign Out", key="nav_logout", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1344,6 +1408,31 @@ if st.session_state["page"] == "home":
 elif st.session_state["page"] == "upload":
     topbar("Upload Configuration & Data Files", "Upload all required files to run the MRP process")
 
+    def _file_status(key, label):
+        """Show green tick if file already in session, grey hint if not."""
+        if st.session_state.get(key):
+            st.markdown(
+                f'''<div style="display:flex;align-items:center;gap:6px;margin:4px 0 6px;
+                            padding:6px 10px;background:#f0fdf4;border-radius:6px;
+                            border:1px solid #bbf7d0;">
+                  <span style="color:#16a34a;font-size:14px;">✓</span>
+                  <span style="color:#15803d;font-size:12px;font-weight:600;">{label} loaded — retained in session.
+                  Re-upload to replace.</span>
+                </div>''', unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<p style="color:#9ca3af;font-size:11px;margin:2px 0 6px;">Accepted: .XLSX, .XLS</p>',
+                unsafe_allow_html=True)
+
+    # Show overall status badges in topbar area
+    _bom_ok = bool(st.session_state.get("_bom"))
+    _req_ok = bool(st.session_state.get("_req"))
+    status_html = ""
+    if _bom_ok: status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● BOM done</span>'
+    if _req_ok: status_html += '<span style="background:#dcfce7;color:#15803d;font-size:11px;font-weight:700;padding:3px 10px;border-radius:10px;margin-right:6px;">● Req done</span>'
+    if status_html:
+        st.markdown(f'<div style="margin-bottom:12px;">{status_html}</div>', unsafe_allow_html=True)
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
@@ -1351,8 +1440,8 @@ elif st.session_state["page"] == "upload":
         <p class="ucard-desc">Upload your BOM file (.XLSX, .XLS)</p></div></div>
         <span class="badge-req">Required</span></div></div>""", unsafe_allow_html=True)
         bf = st.file_uploader("BOM", type=["xlsx","xls"], key="bom_u", label_visibility="collapsed")
-        if bf: st.session_state["_bom"]=bf.read()
-        st.markdown('<p class="accepted">Accepted: .XLSX, .XLS</p>', unsafe_allow_html=True)
+        if bf: st.session_state["_bom"] = bf.read()
+        _file_status("_bom", "BOM file")
 
     with c2:
         st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
@@ -1360,8 +1449,8 @@ elif st.session_state["page"] == "upload":
         <p class="ucard-desc">Upload your requirement &amp; stock file</p></div></div>
         <span class="badge-req">Required</span></div></div>""", unsafe_allow_html=True)
         rf = st.file_uploader("Req", type=["xlsx","xls"], key="req_u", label_visibility="collapsed")
-        if rf: st.session_state["_req"]=rf.read()
-        st.markdown('<p class="accepted">Accepted: .XLSX, .XLS</p>', unsafe_allow_html=True)
+        if rf: st.session_state["_req"] = rf.read()
+        _file_status("_req", "Req & Stock file")
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
     c3, c4 = st.columns(2)
@@ -1371,8 +1460,8 @@ elif st.session_state["page"] == "upload":
         <p class="ucard-desc">Upload your production orders file</p></div></div>
         <span class="badge-opt">Optional</span></div></div>""", unsafe_allow_html=True)
         pf = st.file_uploader("Prod", type=["xlsx","xls"], key="prod_u", label_visibility="collapsed")
-        if pf: st.session_state["_prod"]=pf.read()
-        st.markdown('<p class="accepted">Accepted: .XLSX, .XLS</p>', unsafe_allow_html=True)
+        if pf: st.session_state["_prod"] = pf.read()
+        _file_status("_prod", "Production Orders file")
 
     with c4:
         st.markdown("""<div class="ucard"><div class="ucard-header"><div class="ucard-title-row">
@@ -1380,17 +1469,20 @@ elif st.session_state["page"] == "upload":
         <p class="ucard-desc">Upload your receipt quantities file</p></div></div>
         <span class="badge-opt">Optional</span></div></div>""", unsafe_allow_html=True)
         rrf = st.file_uploader("Receipt", type=["xlsx","xls"], key="receipt_u", label_visibility="collapsed")
-        if rrf: st.session_state["_receipt"]=rrf.read()
-        st.markdown('<p class="accepted">Accepted: .XLSX, .XLS</p>', unsafe_allow_html=True)
+        if rrf: st.session_state["_receipt"] = rrf.read()
+        _file_status("_receipt", "Receipt Quantities file")
 
-    st.markdown("""<div class="run-bar">
-      <div><div class="run-bar-text">Ready to process?</div>
-      <div class="run-bar-sub">All required files uploaded · Click Run MRP to proceed</div></div>
-    </div>""", unsafe_allow_html=True)
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    ready = _bom_ok and _req_ok
+    bar_sub = "All required files loaded · Click Run MRP to proceed" if ready else "Upload BOM and Req & Stock files to continue"
+    st.markdown(f'''<div class="run-bar">
+      <div><div class="run-bar-text">{"Ready to process! ✓" if ready else "Waiting for required files..."}</div>
+      <div class="run-bar-sub">{bar_sub}</div></div>
+    </div>''', unsafe_allow_html=True)
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     rb, _ = st.columns([1,4])
     with rb:
-        if st.button("Run MRP  ▶", type="primary", use_container_width=True): go("mrp")
+        if st.button("Run MRP  ▶", type="primary", use_container_width=True, disabled=not ready): go("mrp")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1419,14 +1511,6 @@ elif st.session_state["page"] == "mrp":
         with d:
             f=st.file_uploader("Receipt Quantities",type=["xlsx","xls"],key="rec_m")
             if f: receipt_b=f.read(); st.session_state["_receipt"]=receipt_b
-
-    sec("Engine Configuration")
-    g1,g2,g3,g4,g5=st.columns(5)
-    with g1: st.session_state["cfg_phantom"]=st.text_input("Phantom code",value=st.session_state["cfg_phantom"],key="ph"); PHANTOM=st.session_state["cfg_phantom"]
-    with g2: st.session_state["cfg_vl1"]=st.text_input("Verify L1",value=st.session_state["cfg_vl1"],key="vl1"); VERIFY_L1=st.session_state["cfg_vl1"]
-    with g3: st.session_state["cfg_vl2"]=st.text_input("Verify L2",value=st.session_state["cfg_vl2"],key="vl2"); VERIFY_L2=st.session_state["cfg_vl2"]
-    with g4: st.session_state["cfg_vl3"]=st.text_input("Verify L3",value=st.session_state["cfg_vl3"],key="vl3"); VERIFY_L3=st.session_state["cfg_vl3"]
-    with g5: st.session_state["cfg_vl4"]=st.text_input("Verify L4",value=st.session_state["cfg_vl4"],key="vl4"); VERIFY_L4=st.session_state["cfg_vl4"]
 
     rb,_=st.columns([1,4])
     with rb:
