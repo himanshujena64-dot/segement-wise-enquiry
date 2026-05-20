@@ -62,7 +62,7 @@ html, body, [class*="css"], .stApp {
     background: transparent !important;
     border: none !important;
     border-radius: 8px !important;
-    color: rgba(255,255,255,0.5) !important;
+    color: rgba(255,255,255,0.88) !important;
     font-family: 'Plus Jakarta Sans', sans-serif !important;
     font-size: 13px !important;
     font-weight: 500 !important;
@@ -73,10 +73,16 @@ html, body, [class*="css"], .stApp {
     transition: background 0.15s, color 0.15s !important;
     box-shadow: none !important;
 }
+[data-testid="stSidebar"] .stButton > button p {
+    color: rgba(255,255,255,0.88) !important;
+}
 [data-testid="stSidebar"] .stButton > button:hover {
-    background: rgba(255,255,255,0.07) !important;
-    color: rgba(255,255,255,0.9) !important;
+    background: rgba(255,255,255,0.10) !important;
+    color: #ffffff !important;
     box-shadow: none !important;
+}
+[data-testid="stSidebar"] .stButton > button:hover p {
+    color: #ffffff !important;
 }
 [data-testid="stSidebar"] .stButton > button:focus {
     box-shadow: none !important;
@@ -295,7 +301,7 @@ for k, v in {
     "cfg_phantom": "50", "cfg_vl1": "0010748460",
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_prod": None, "_receipt": None,
-    "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None,
+    "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None, "plan_open": False,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -1226,22 +1232,26 @@ with st.sidebar:
     seg_done  = st.session_state["seg_results"] is not None
     ag_done   = st.session_state["aging_results"] is not None
 
-    nav_items = [
+    # Main workflow nav items
+    workflow_items = [
         ("🏠", "Home",                    "home",    None),
         ("📂", "Upload Files",            "upload",  None),
         ("⚙️",  "Run MRP",               "mrp",     "✓" if mrp_done else None),
         ("🏭",  "Segment Wise Available", "segment", "✓" if seg_done else None),
         ("📦",  "Aging Projection",       "aging",   "✓" if ag_done else None),
-        ("⚙",  "Settings",               "settings",None),
+    ]
+    # Tools / views nav items
+    tools_items = [
+        ("📋",  "Production Plan",        "plan",    None),
+        ("⚙",   "Settings",              "settings",None),
     ]
 
-    for icon, label, pg, badge in nav_items:
+    def _nav_btn(icon, label, pg, badge):
         is_active = (page == pg)
-        # Use HTML for active styling since we can't use data attributes easily
         if is_active:
             st.markdown(f"""
             <div style="background:#1a6ef7;border-radius:8px;margin:1px 0;padding:9px 14px;
-                        display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        display:flex;align-items:center;gap:8px;">
               <span style="font-size:14px;">{icon}</span>
               <span style="font-size:13px;font-weight:600;color:#fff;font-family:'Plus Jakarta Sans',sans-serif;flex:1;">{label}</span>
               {"<span style='font-size:10px;background:rgba(255,255,255,0.2);color:#fff;padding:2px 6px;border-radius:8px;font-weight:600;'>"+badge+"</span>" if badge else ""}
@@ -1249,6 +1259,18 @@ with st.sidebar:
         else:
             if st.button(f"{icon}  {label}", key=f"nav_{pg}", use_container_width=True):
                 go(pg)
+
+    for icon, label, pg, badge in workflow_items:
+        _nav_btn(icon, label, pg, badge)
+
+    # Divider before tools
+    st.markdown("""<div style="border-top:1px solid rgba(255,255,255,0.08);margin:8px 8px 6px 8px;"></div>
+    <div style="font-size:10px;color:rgba(255,255,255,0.3);font-family:'Plus Jakarta Sans',sans-serif;
+                padding:0 14px 4px;letter-spacing:0.08em;text-transform:uppercase;">Views</div>""",
+    unsafe_allow_html=True)
+
+    for icon, label, pg, badge in tools_items:
+        _nav_btn(icon, label, pg, badge)
 
     # Footer
     st.markdown("""
@@ -1276,6 +1298,7 @@ if st.session_state["page"] == "home":
         ("⚙️","Run MRP",           "Execute L1–L4 BOM explosion & NET propagation", mrp_done, "mrp"),
         ("🏭","Segment Wise Available","LP-optimised import-part constrained capacity", seg_done, "segment"),
         ("📦","Aging Projection",  "Material aging forecast with consumption offset", ag_done,  "aging"),
+        ("📋","Production Plan",   "Month-wise model requirement plan with descriptions", True, "plan"),
     ]
 
     c1, c2 = st.columns(2)
@@ -1593,43 +1616,60 @@ elif st.session_state["page"] == "aging":
     topbar("Aging Opening Inventory Forecast", "Month-wise aging opening stock — BOM consumption + receipt adjusted")
 
     sec("Input Files")
+
+    # ── BOM and Req auto-carry from MRP session — no re-upload needed ──
+    _bom_ready = bool(st.session_state.get("_bom"))
+    _req_ready = bool(st.session_state.get("_req"))
+
     fc1, fc2 = st.columns(2)
     with fc1:
         af = st.file_uploader("Aging Material Details (.xlsx) *Required*",
                               type=["xlsx","xls"], key="ag_f")
         if af:
             st.session_state["_aging"] = af.read()
-    with fc2:
-        bom_ag_f = st.file_uploader("BOM File (.xlsx) — leave blank to use MRP session BOM",
-                                    type=["xlsx","xls"], key="ag_bom_f")
-        if bom_ag_f:
-            st.session_state["_ag_bom"] = bom_ag_f.read()
-        if not st.session_state.get("_ag_bom") and st.session_state.get("_bom"):
-            st.caption("✓ Will use BOM already loaded in MRP session")
 
-    fc3, fc4 = st.columns(2)
-    with fc3:
-        req_ag_f = st.file_uploader("Requirement File (.xlsx) — leave blank to use MRP session Req",
-                                    type=["xlsx","xls"], key="ag_req_f")
-        if req_ag_f:
-            st.session_state["_ag_req"] = req_ag_f.read()
-        if not st.session_state.get("_ag_req") and st.session_state.get("_req"):
-            st.caption("✓ Will use Req & Stock already loaded in MRP session")
-    with fc4:
+    with fc2:
         rec_ag_f = st.file_uploader("Receipt File (.xlsx) — Optional",
                                     type=["xlsx","xls"], key="ag_rec_f")
         if rec_ag_f:
             st.session_state["_ag_rec"] = rec_ag_f.read()
-            st.caption("✓ Receipt file loaded")
 
-    fc5, fc6 = st.columns(2)
+    # Show BOM / Req status — auto-used from MRP session, override only if needed
+    fc3, fc4 = st.columns(2)
+    with fc3:
+        if _bom_ready:
+            st.success("✓ BOM file — carried from MRP session (no re-upload needed)")
+            bom_override = st.file_uploader("Upload different BOM (optional override)",
+                                            type=["xlsx","xls"], key="ag_bom_f")
+            if bom_override:
+                st.session_state["_ag_bom"] = bom_override.read()
+                st.caption("Using overridden BOM for aging")
+        else:
+            bom_ag_f = st.file_uploader("BOM File (.xlsx) *Required*",
+                                        type=["xlsx","xls"], key="ag_bom_f")
+            if bom_ag_f:
+                st.session_state["_ag_bom"] = bom_ag_f.read()
+
+    with fc4:
+        if _req_ready:
+            st.success("✓ Requirement file — carried from MRP session (no re-upload needed)")
+            req_override = st.file_uploader("Upload different Requirement (optional override)",
+                                            type=["xlsx","xls"], key="ag_req_f")
+            if req_override:
+                st.session_state["_ag_req"] = req_override.read()
+                st.caption("Using overridden Requirement for aging")
+        else:
+            req_ag_f = st.file_uploader("Requirement File (.xlsx) *Required*",
+                                        type=["xlsx","xls"], key="ag_req_f")
+            if req_ag_f:
+                st.session_state["_ag_req"] = req_ag_f.read()
+
+    fc5, _ = st.columns([1, 3])
     with fc5:
         st.markdown("**Aging snapshot date**")
-        st.caption("Date the aging file was extracted from SAP (e.g. May-01 if it is May opening)")
+        st.caption("Date the aging file was extracted from SAP (e.g. May-01 for May opening)")
         abd = st.date_input("Snapshot date", value=pd.Timestamp("2026-05-01"),
                             key="ag_dt", label_visibility="collapsed")
-    with fc6:
-        st.markdown(" ")
 
     rb, _ = st.columns([1,4])
     with rb:
@@ -1892,6 +1932,154 @@ elif st.session_state["page"] == "aging":
 
 # ═══════════════════════════════════════════════════════════════
 # PAGE: SETTINGS
+# ═══════════════════════════════════════════════════════════════
+# PAGE: PRODUCTION PLAN
+# ═══════════════════════════════════════════════════════════════
+elif st.session_state["page"] == "plan":
+    topbar("Production Plan", "Model-wise month-by-month requirement plan")
+
+    req_bytes = st.session_state.get("_req")
+    bom_bytes = st.session_state.get("_bom")
+
+    if not req_bytes:
+        st.markdown("""<div class="empty"><div class="empty-icon">📋</div>
+        <div class="empty-ttl">No requirement data</div>
+        <div class="empty-sub">Upload the Requirement & Stock file on the Upload Files page first.</div></div>""",
+        unsafe_allow_html=True)
+    else:
+        # ── Load & parse requirement sheet ────────────────────
+        import io as _io
+        raw = pd.read_excel(_io.BytesIO(req_bytes), sheet_name="Requirement", header=None)
+        raw.columns = [str(c).strip() for c in raw.iloc[0].tolist()]
+        raw = raw.iloc[1:].reset_index(drop=True)
+
+        # Parse month columns
+        month_cols = []
+        month_labels = {}
+        for col in raw.columns:
+            try:
+                ts = pd.Timestamp(col)
+                if pd.notna(ts) and ts.year > 2000:
+                    lbl = ts.strftime("%b-%y")
+                    month_cols.append(col)
+                    month_labels[col] = lbl
+            except Exception:
+                pass
+
+        # Rename month columns to labels
+        raw = raw.rename(columns=month_labels)
+        months_lbl = list(month_labels.values())
+
+        # Clean up
+        raw["BOM Header"] = raw["BOM Header"].astype(str).str.strip()
+        alt_col = "Alt." if "Alt." in raw.columns else "Alt"
+        raw[alt_col] = raw[alt_col].astype(str).str.strip()
+        for m in months_lbl:
+            raw[m] = pd.to_numeric(raw[m], errors="coerce").fillna(0)
+
+        # ── Get model descriptions from BOM ───────────────────
+        if bom_bytes:
+            bom_df = pd.read_excel(_io.BytesIO(bom_bytes))
+            bom_df.columns = bom_df.columns.str.strip()
+            desc_col = next((c for c in bom_df.columns if "header desc" in c.lower()), None)
+            if desc_col:
+                model_desc = (bom_df[["BOM Header", desc_col]]
+                              .drop_duplicates("BOM Header")
+                              .rename(columns={desc_col: "Model Description"}))
+                model_desc["BOM Header"] = model_desc["BOM Header"].astype(str).str.strip()
+                raw = raw.merge(model_desc, on="BOM Header", how="left")
+            else:
+                raw["Model Description"] = ""
+        else:
+            raw["Model Description"] = ""
+
+        raw["Model Description"] = raw["Model Description"].fillna("")
+
+        # ── Filters ────────────────────────────────────────────
+        sec("Filters")
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            all_models = sorted(raw["BOM Header"].unique().tolist())
+            sel_models = st.multiselect("Filter by Model", all_models,
+                                        placeholder="All models", key="plan_models")
+        with fc2:
+            all_alts = sorted(raw[alt_col].unique().tolist())
+            sel_alts = st.multiselect("Filter by Alt BOM", all_alts,
+                                      placeholder="All alts", key="plan_alts")
+        with fc3:
+            search_desc = st.text_input("Search description", placeholder="e.g. HSI18", key="plan_search")
+
+        # Apply filters
+        plan_df = raw.copy()
+        if sel_models:
+            plan_df = plan_df[plan_df["BOM Header"].isin(sel_models)]
+        if sel_alts:
+            plan_df = plan_df[plan_df[alt_col].isin(sel_alts)]
+        if search_desc:
+            plan_df = plan_df[plan_df["Model Description"].str.contains(search_desc, case=False, na=False)]
+
+        # ── Summary metrics ────────────────────────────────────
+        sec("Plan Summary")
+        mc = st.columns(len(months_lbl) + 1)
+        mc[0].metric("Total Models", f"{len(plan_df):,}")
+        for i, m in enumerate(months_lbl):
+            mc[i+1].metric(m, f"{int(plan_df[m].sum()):,}")
+
+        # ── Main plan table ────────────────────────────────────
+        sec("Month-wise Requirement Plan")
+
+        disp_cols = ["BOM Header", "Model Description", alt_col] + months_lbl + ["Total"]
+        plan_df["Total"] = plan_df[months_lbl].sum(axis=1)
+        plan_df = plan_df.sort_values("Total", ascending=False).reset_index(drop=True)
+
+        # Show only rows with any demand
+        show_zero = st.checkbox("Include models with zero demand", value=False, key="plan_zero")
+        if not show_zero:
+            plan_df = plan_df[plan_df["Total"] > 0]
+
+        st.caption(f"{len(plan_df):,} models shown")
+
+        # Style: highlight high-demand rows
+        def _plan_row_style(row):
+            total = row.get("Total", 0)
+            if total > 5000:  return ["background-color:#fff0f0"] * len(row)
+            if total > 1000:  return ["background-color:#fffbeb"] * len(row)
+            if total > 0:     return ["background-color:#f0fdf4"] * len(row)
+            return [""] * len(row)
+
+        fmt = {m: "{:,.0f}" for m in months_lbl}
+        fmt["Total"] = "{:,.0f}"
+
+        avail_cols = [c for c in disp_cols if c in plan_df.columns]
+        st.dataframe(
+            plan_df[avail_cols].style
+                .apply(_plan_row_style, axis=1)
+                .format({k: v for k, v in fmt.items() if k in avail_cols}),
+            use_container_width=True, hide_index=True, height=520)
+
+        # ── Month-wise bar chart (total across all models) ─────
+        sec("Total Requirement by Month")
+        month_totals = {m: int(plan_df[m].sum()) for m in months_lbl}
+        chart_data = pd.DataFrame({
+            "Month": list(month_totals.keys()),
+            "Requirement": list(month_totals.values())
+        })
+        st.bar_chart(chart_data.set_index("Month"), use_container_width=True, height=280)
+
+        # ── Download ───────────────────────────────────────────
+        buf = _io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            plan_df[avail_cols].to_excel(w, sheet_name="Production Plan", index=False)
+            # Also a pivot: month as columns, model as rows
+            plan_df[avail_cols].to_excel(w, sheet_name="Plan (All Models)", index=False)
+        buf.seek(0)
+        st.download_button(
+            "⬇ Download Production Plan (.xlsx)", data=buf,
+            file_name="production_plan.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, type="primary")
+
+
 # ═══════════════════════════════════════════════════════════════
 elif st.session_state["page"] == "settings":
     topbar("Settings", "Engine configuration and session management")
