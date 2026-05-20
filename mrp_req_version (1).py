@@ -1,5 +1,5 @@
 """
-SAP MRP ENGINE — Professional Sidebar Navigation Layout (Fixed)
+Material Requirement Plan — Professional Sidebar Navigation Layout (Fixed)
 No black gaps — uses Streamlit's native sidebar styled as a custom nav panel.
 """
 
@@ -13,7 +13,7 @@ import streamlit as st
 from scipy.optimize import linprog
 
 st.set_page_config(
-    page_title="SAP MRP Engine",
+    page_title="Material Requirement Planning",
     page_icon="⚙️",
     layout="wide",
     initial_sidebar_state="expanded",
