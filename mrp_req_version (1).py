@@ -1,5 +1,5 @@
 """
-Material Requirement Plan — Professional Sidebar Navigation Layout (Fixed)
+SAP MRP ENGINE — Professional Sidebar Navigation Layout (Fixed)
 No black gaps — uses Streamlit's native sidebar styled as a custom nav panel.
 """
 
@@ -13,7 +13,7 @@ import streamlit as st
 from scipy.optimize import linprog
 
 st.set_page_config(
-    page_title="Material Requirement Planning",
+    page_title="SAP MRP Engine",
     page_icon="⚙️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1606,28 +1606,92 @@ elif st.session_state["page"] == "segment":
                 <div class="empty-sub">Upload the Segment & Import Part file and click Run Segment Capacity.</div></div>""",
                 unsafe_allow_html=True)
         else:
-            sec("Overview")
+            rm_map=r.get("rm_map",{}); all_rm=sorted(set(rm_map.values())) if rm_map else []; ag=r.get("active_rm_groups",[])
+
+            # ── RM Group Filter — shown FIRST so it drives the metrics below ──
+            if all_rm:
+                st.markdown("""
+                <style>
+                .rm-filter-card {
+                    background:#ffffff; border:1px solid #e5e7eb; border-radius:12px;
+                    padding:18px 22px 14px; margin-bottom:18px;
+                }
+                .rm-filter-title {
+                    font-size:11px; font-weight:700; color:#6b7280;
+                    letter-spacing:0.1em; text-transform:uppercase; margin-bottom:14px;
+                    display:flex; align-items:center; gap:8px;
+                }
+                .rm-filter-title::after {
+                    content:""; flex:1; height:1px; background:#e5e7eb;
+                }
+                .rm-hint {
+                    font-size:11px; color:#9ca3af; margin-top:10px;
+                }
+                /* Tighten checkbox rows inside the filter card */
+                .rm-filter-card [data-testid="stCheckbox"] {
+                    background:#f9fafb; border:1px solid #e5e7eb; border-radius:8px;
+                    padding:6px 10px; margin-bottom:4px;
+                }
+                .rm-filter-card [data-testid="stCheckbox"]:has(input:checked) {
+                    background:#eff6ff; border-color:#bfdbfe;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+
+                st.markdown('<div class="rm-filter-card">', unsafe_allow_html=True)
+                st.markdown('<div class="rm-filter-title">RM Group Filter</div>', unsafe_allow_html=True)
+
+                # Quick-action buttons: Select All / Clear All
+                qa1, qa2, qa_spacer = st.columns([1, 1, 6])
+                with qa1:
+                    select_all = st.button("✓ Select All", key="rm_all", use_container_width=True)
+                with qa2:
+                    clear_all  = st.button("✗ Clear All",  key="rm_none", use_container_width=True)
+
+                if select_all:
+                    for grp in all_rm: st.session_state[f"rm_{grp}"] = True
+                if clear_all:
+                    for grp in all_rm: st.session_state[f"rm_{grp}"] = False
+
+                # Checkboxes in a clean 4-column grid
+                sg = []
+                cols_per_row = 4
+                rm_rows = [all_rm[i:i+cols_per_row] for i in range(0, len(all_rm), cols_per_row)]
+                for rm_row in rm_rows:
+                    row_cols = st.columns(cols_per_row)
+                    for ci, grp in enumerate(rm_row):
+                        with row_cols[ci]:
+                            checked = st.checkbox(grp, value=st.session_state.get(f"rm_{grp}", grp in ag), key=f"rm_{grp}")
+                            if checked: sg.append(grp)
+                    # Fill empty cells in last row
+                    for ci in range(len(rm_row), cols_per_row):
+                        row_cols[ci].empty()
+
+                st.markdown('<div class="rm-hint">💡 Toggle groups to include / exclude their parts as constraints. Click <b>Apply Filter</b> to recalculate capacity.</div>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                # Apply button — triggers recalculation which refreshes the metrics below
+                ab, _ = st.columns([1.4, 5])
+                with ab:
+                    if st.button("↻  Apply Filter", key="arm", type="primary", use_container_width=True):
+                        sb = st.session_state.get("seg_imp_bytes")
+                        if sb:
+                            with st.spinner("Recalculating capacity …"):
+                                nr = run_segment(mrp_r["bom"], mrp_r["stock"], sb, active_rm=sg)
+                                if nr: st.session_state["seg_results"] = nr; st.rerun()
+
+            # ── Overview metrics — reflect the latest (possibly filtered) results ──
+            st.markdown("""
+            <div style="font-size:11px;font-weight:700;color:#6b7280;letter-spacing:0.1em;
+                        text-transform:uppercase;display:flex;align-items:center;gap:8px;margin:4px 0 10px;">
+              OVERVIEW
+              <span style="flex:1;height:1px;background:#e5e7eb;display:block;"></span>
+            </div>""", unsafe_allow_html=True)
             m1,m2,m3,m4=st.columns(4)
             m1.metric("Total FG sets",f"{r['total_sets']:,}")
             m2.metric("FGs producing",f"{sum(1 for f in r['fg_results'] if f['Max_Sets']>0)} / {len(r['fg_results'])}")
             m3.metric("Active segments",f"{(r['alloc_int']>0).sum()} / {len(r['segs'])}")
             m4.metric("Constrained parts",f"{len(r['constrained_parts'])}")
-
-            rm_map=r.get("rm_map",{}); all_rm=sorted(set(rm_map.values())) if rm_map else []; ag=r.get("active_rm_groups",[])
-            if all_rm:
-                sec("RM Group Filter")
-                rmc=st.columns(min(len(all_rm),6)); sg=[]
-                for i,grp in enumerate(all_rm):
-                    with rmc[i%len(rmc)]:
-                        if st.checkbox(grp,value=(grp in ag),key=f"rm_{grp}"): sg.append(grp)
-                ab,_=st.columns([1,4])
-                with ab:
-                    if st.button("↻ Apply filter",key="arm",type="primary"):
-                        sb=st.session_state.get("seg_imp_bytes")
-                        if sb:
-                            with st.spinner("Recalculating ..."):
-                                nr=run_segment(mrp_r["bom"],mrp_r["stock"],sb,active_rm=sg)
-                                if nr: st.session_state["seg_results"]=nr; st.rerun()
 
             if r.get("skipped_segs"):
                 with st.expander(f"⚠ {len(r['skipped_segs'])} FGs skipped"):
