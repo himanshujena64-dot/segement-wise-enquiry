@@ -1166,7 +1166,7 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
     parts=sorted({p for f in fg_res for p in f["combined_req"]})
     A=np.array([[f["combined_req"].get(p,0) for f in fg_res] for p in parts],dtype=float)
     ub=[sum(fg_req[fg].values()) if basis=="req" else None for fg in fgs]
-    arr=import_arrivals_by_week(po_df,mcols)
+    arr=import_arrivals_by_week(align_part_codes(po_df,_mrp_known_codes(mrp_r)),mcols)
 
     def solve(b,lb):
         if not parts: return np.array(lb,dtype=float)
@@ -1847,9 +1847,12 @@ def load_import_po(po_bytes, transit_days=30):
     xl=pd.ExcelFile(io.BytesIO(po_bytes))
     sh=next((s for s in xl.sheet_names if "po" in s.lower() or "import" in s.lower()),xl.sheet_names[0])
     df=pd.read_excel(io.BytesIO(po_bytes),sheet_name=sh); df.columns=[str(c).strip() for c in df.columns]
+    txt=pd.read_excel(io.BytesIO(po_bytes),sheet_name=sh,dtype=str)  # same sheet as text, keeps leading zeros
     df=df.dropna(how="all")
     df,missing=map_import_po_columns(df)
     if missing: return None,f"Could not find column(s): {', '.join(missing)}. Found: {', '.join(map(str,df.columns))}"
+    for c in ["Part","PO_No"]:
+        if c in df.columns: df[c]=txt.iloc[:,list(df.columns).index(c)].loc[df.index]
     for c,d in [("Description",""),("PO_No",""),("Supplier",""),("ETD",pd.NaT),("ETA",pd.NaT)]:
         if c not in df.columns: df[c]=d
     df["Part"]=df["Part"].astype(str).str.strip()
@@ -1864,18 +1867,78 @@ def load_import_po(po_bytes, transit_days=30):
     return df.reset_index(drop=True),None
 
 def create_import_po_template():
-    df=pd.DataFrame({
-        "Import Part":["COMP-A","COMP-A","COMP-B","COMP-C"],
-        "Description":["Compressor","Compressor","PCB Assy","Fan Motor"],
-        "PO No":["4500001234","4500001301","4500001250","4500001277"],
-        "Supplier":["Supplier X","Supplier X","Supplier Y","Supplier Z"],
-        "PO Qty":[500,800,1200,300],
-        "ETD":["05-May-26","10-Jun-26","15-May-26","01-Jun-26"],
-        "ETA":["05-Jun-26","12-Jul-26","20-Jun-26","02-Jul-26"],
-    })
-    buf=io.BytesIO()
-    with pd.ExcelWriter(buf,engine="openpyxl") as w: df.to_excel(w,sheet_name="Import PO",index=False)
-    buf.seek(0); return buf
+    """Import PO template: one row per PO line; red headers required; grey columns show the ETA month / week."""
+    from datetime import date
+    from openpyxl import Workbook
+    from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.workbook.properties import CalcProperties
+    def F(size=10,**k): return Font(name="Arial",size=size,**k)
+    wb=Workbook(); ws=wb.active; ws.title="Import PO"
+    hdr=["Import Part","Description","PO No","Supplier","PO Qty","ETD","ETA","Arrival Month (auto)","Arrival Week (auto)"]
+    ws.append(hdr)
+    rows=[("0010748458","Compressor Rotary 1.5T","4500012345","Supplier A",1200,date(2026,9,1),date(2026,10,6)),
+          ("0010748458","Compressor Rotary 1.5T","4500012399","Supplier A",800,date(2026,10,1),date(2026,11,18)),
+          ("0010300601","Inverter PCB Assy","4500012410","Supplier B",1500,date(2026,9,12),date(2026,10,24)),
+          ("0010748814","BLDC Fan Motor","4500012433","Supplier C",600,date(2026,10,3),None)]
+    thin=Side(style="thin",color="BFBFBF"); bd=Border(thin,thin,thin,thin)
+    grey=PatternFill("solid",fgColor="F2F2F2"); N=200
+    for r in range(2,N+2):
+        vals=rows[r-2] if r-2<len(rows) else (None,)*7
+        for c,v in enumerate(vals,1):
+            cell=ws.cell(r,c,v); cell.font=F(color="0000FF"); cell.border=bd
+            if c in (1,3): cell.number_format="@"
+            if c in (6,7): cell.number_format="dd-mmm-yy"
+            if c==5: cell.number_format="#,##0"
+        ws.cell(r,8,f'=IF(G{r}="","",TEXT(G{r},"mmm-yy"))')
+        ws.cell(r,9,f'=IF(G{r}="","","WK0"&MIN(4,INT((DAY(G{r})-1)/7)+1))')
+        for c in (8,9):
+            cell=ws.cell(r,c); cell.font=F(); cell.fill=grey; cell.border=bd; cell.alignment=Alignment(horizontal="center")
+    for c in range(1,len(hdr)+1):
+        cell=ws.cell(1,c); cell.font=F(bold=True,color="FFFFFF"); cell.border=bd
+        cell.fill=PatternFill("solid",fgColor="C00000" if c in (1,5,6,7) else "1F4E78")  # red = required
+        cell.alignment=Alignment(horizontal="center",vertical="center",wrap_text=True)
+    for col,w in zip("ABCDEFGHI",[16,28,14,16,10,12,12,14,14]): ws.column_dimensions[col].width=w
+    ws.row_dimensions[1].height=30; ws.freeze_panes="A2"
+    dv=DataValidation(type="date",operator="greaterThan",formula1="DATE(2020,1,1)",allow_blank=True,
+                      error="Enter a date, e.g. 06-Oct-26",errorTitle="Date needed")
+    ws.add_data_validation(dv); dv.add(f"F2:G{N+1}")
+    dq=DataValidation(type="decimal",operator="greaterThanOrEqual",formula1="0",allow_blank=True,error="PO Qty must be a number >= 0")
+    ws.add_data_validation(dq); dq.add(f"E2:E{N+1}")
+    ins=wb.create_sheet("Instructions")
+    lines=[("How to fill the Import PO template",True),("",False),
+     ("One row per PO line (the same part can have many rows / POs).",False),
+     ("Red headers are required: Import Part, PO Qty, and ETA (or ETD if ETA not known yet).",False),
+     ("Blue text = your inputs. Replace the 4 example rows with your data.",False),
+     ("Grey columns (Arrival Month / Week) are formulas for your reference only - the app works them out itself.",False),
+     ("",False),("Columns",True),
+     ("Import Part - material code as in BOM / Stock (column is text, so leading zeros are kept).",False),
+     ("Description / PO No / Supplier - optional, shown in reports.",False),
+     ("PO Qty - open quantity still to arrive (do not include already-received qty).",False),
+     ("ETD - dispatch date from supplier.",False),
+     ("ETA - arrival date at plant. If blank, the app uses ETD + Transit days (default 30).",False),
+     ("",False),("Arrival Week rule (week of the ETA month)",True),
+     ("Day 1-7 = WK01 | Day 8-14 = WK02 | Day 15-21 = WK03 | Day 22-31 = WK04",False),
+     ("ETA before the first MRP month = counted in first month WK01. ETA after the last MRP month = ignored.",False),
+     ("",False),("Where to upload",True),
+     ("Import Shortage page, or Segment Wise page > 'Import PO file for Arrival Weeks'. Same file works for both.",False)]
+    for i,(t,b_) in enumerate(lines,1): ins.cell(i,1,t).font=F(size=12 if i==1 else 10,bold=b_)
+    ins.column_dimensions["A"].width=110
+    wb.calculation=CalcProperties(fullCalcOnLoad=True)
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+def align_part_codes(po_df, known_codes):
+    """Match PO part codes to MRP/BOM codes even if one side lost leading zeros (e.g. 0010748458 vs 10748458)."""
+    if po_df is None or po_df.empty: return po_df
+    known=[str(k).strip() for k in known_codes]; ks=set(known)
+    by_stripped={}
+    for k in known: by_stripped.setdefault(k.lstrip("0") or "0",k)
+    po_df=po_df.copy()
+    po_df["Part"]=[p if p in ks else by_stripped.get(p.lstrip("0") or "0",p) for p in po_df["Part"].astype(str)]
+    return po_df
+
+def _mrp_known_codes(mrp_r):
+    return set(mrp_r["bom"]["Component"].astype(str))|set(mrp_r["bom"]["BOM Header"].astype(str))|set(map(str,mrp_r["stock"].index))
 
 def run_import_coverage(mrp_r, po_df):
     """Month-wise projection per import part: Stock + PO arrivals (by ETA bucket) − MRP gross requirement."""
@@ -1901,7 +1964,7 @@ def run_import_coverage(mrp_r, po_df):
     stock=mrp_r["stock"]
 
     # Bucket each PO into an MRP month by ETA
-    po=po_df.copy()
+    po=align_part_codes(po_df,_mrp_known_codes(mrp_r))
     def bucket(eta):
         if pd.isna(eta): return "Unscheduled"
         if eta>horizon_end: return "Beyond horizon"
@@ -2507,6 +2570,9 @@ elif st.session_state["page"] == "segment":
                                          type=["xlsx","xls"],key="seg_po_u")
                     if pof: st.session_state["_imp_po"]=pof.read()
                     if st.session_state.get("_imp_po") and not pof: st.caption("✓ Using Import PO file already in session.")
+                    st.download_button("📥 Import PO template (week-wise ETA / ETD)",data=create_import_po_template().getvalue(),
+                                       file_name="import_po_weekly_template.xlsx",key="dl_seg_po",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 po_df=None
                 if st.session_state.get("_imp_po"):
                     po_df,po_err=load_import_po(st.session_state["_imp_po"],st.session_state.get("imp_transit",30))
