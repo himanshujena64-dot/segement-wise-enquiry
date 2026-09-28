@@ -592,8 +592,15 @@ def auto_map_columns(df, required_cols):
     mapping = {}
     matched = set()
     
+    # Pass 0: columns that already have the exact standard name always keep it
+    for col in df.columns:
+        if col in required_cols and col not in matched:
+            mapping[col] = col
+            matched.add(col)
+    
     # First pass: exact matches
     for col in df.columns:
+        if col in mapping: continue
         normalized = normalize_column_name(col)
         if normalized in required_cols and normalized not in matched:
             mapping[col] = normalized
@@ -648,6 +655,7 @@ def verify_bom_columns(df):
     for standard_name, variants in optional_mappings.items():
         if standard_name not in df.columns:
             for col in df.columns:
+                if col in required: continue
                 norm = normalize_column_name(col)
                 if norm == standard_name and col != standard_name:
                     df = df.rename(columns={col: standard_name})
