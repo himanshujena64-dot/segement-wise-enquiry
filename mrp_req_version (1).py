@@ -996,15 +996,44 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
 # ═══════════════════════════════════════════════════════════════
 # SEGMENT CAPACITY ENGINE
 # ═══════════════════════════════════════════════════════════════
+def _interchange_col(cols):
+    """Column naming interchangeable-part groups (same hardware, only EPROM / firmware differs)."""
+    return next((c for c in cols if "interchang" in str(c).lower() or "common group" in str(c).lower()),None)
+
+def _interchange_map(df,part_col,ig_col):
+    """{part code: group name} for rows with a group; blank group = part stands alone."""
+    if not ig_col: return {}
+    g=df[[part_col,ig_col]].copy(); g[ig_col]=g[ig_col].fillna("").astype(str).str.strip()
+    g=g[(g[ig_col]!="")&(g[ig_col].str.lower()!="nan")]
+    return {str(p).strip():"⇄ "+v for p,v in zip(g[part_col],g[ig_col])}
+
+def load_interchange_map(seg_bytes):
+    """Interchange groups from the Segment & Import Part file's import-part sheet (empty if none)."""
+    if not seg_bytes: return {}
+    try: return load_seg_imp(io.BytesIO(seg_bytes))[3]
+    except Exception: return {}
+
+def pool_interchange(stock, ig_map, parts=None):
+    """Pooled stock per group (sum of member codes) + {group: [members]}. Non-grouped parts keep their own stock."""
+    members=defaultdict(list)
+    for p,g in ig_map.items():
+        if parts is None or p in parts: members[g].append(p)
+    pooled=stock.copy().astype(float)
+    for g,mem in members.items(): pooled[g]=float(sum(float(stock.get(m,0)) for m in mem))
+    return pooled,{g:sorted(m) for g,m in members.items()}
+
 def load_seg_imp(f):
     xl=pd.ExcelFile(f); sheets=xl.sheet_names
     imp_sh=next((s for s in sheets if "import" in s.lower()),sheets[0])
-    imp=pd.read_excel(f,sheet_name=imp_sh,header=0); imp.columns=[str(c).strip() for c in imp.columns]
-    cc=imp.columns[0]; imp[cc]=imp[cc].astype(str).str.strip()
-    rm_col=next((c for c in imp.columns if "rm" in c.lower() or "group" in c.lower()),None)
+    imp=pd.read_excel(f,sheet_name=imp_sh,header=0,dtype=str); imp.columns=[str(c).strip() for c in imp.columns]
+    cc=imp.columns[0]; imp=imp[imp[cc].notna()].copy(); imp[cc]=imp[cc].astype(str).str.strip()
+    imp=imp[(imp[cc]!="")&(imp[cc].str.lower()!="nan")]
+    ig_col=_interchange_col(imp.columns)
+    rm_col=next((c for c in imp.columns if c!=ig_col and ("rm" in c.lower() or "group" in c.lower() or "category" in c.lower())),None)
     rm_map={}
-    if rm_col: imp[rm_col]=imp[rm_col].astype(str).str.strip(); rm_map=dict(zip(imp[cc],imp[rm_col]))
-    import_parts=sorted(imp[cc].dropna().unique())
+    if rm_col: imp[rm_col]=imp[rm_col].fillna("").astype(str).str.strip(); rm_map=dict(zip(imp[cc],imp[rm_col]))
+    ig_map=_interchange_map(imp,cc,ig_col)
+    import_parts=sorted(imp[cc].unique())
     seg_sh=next((s for s in sheets if "seg" in s.lower()),sheets[min(1,len(sheets)-1)])
     seg=pd.read_excel(f,sheet_name=seg_sh,header=0); seg.columns=[str(c).strip() for c in seg.columns]
     cm={seg.columns[0]:"Segment",seg.columns[1]:"FG_Code",seg.columns[2]:"IDU"}
@@ -1015,7 +1044,7 @@ def load_seg_imp(f):
     seg=seg[seg["Segment"].notna()&(seg["Segment"]!="")&(seg["Segment"]!="nan")&
             seg["FG_Code"].notna()&(seg["FG_Code"]!="")&(seg["FG_Code"]!="nan")&
             seg["IDU"].notna()&(seg["IDU"]!="")&(seg["IDU"]!="nan")].copy().reset_index(drop=True)
-    return import_parts,seg,rm_map
+    return import_parts,seg,rm_map,ig_map
 
 def explode_seg(hdr,bom,tset):
     alts=sorted(bom[bom["BOM Header"]==hdr]["Alt"].unique())
@@ -1037,7 +1066,11 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
     f=io.BytesIO(seg_bytes)
     status=st.status("Running Segment Capacity ...",expanded=True)
     with status: st.write("► Loading data ...")
-    import_parts,seg_df,rm_map=load_seg_imp(f)
+    import_parts,seg_df,rm_map,ig_map=load_seg_imp(f)
+    kn=set(bom["Component"].astype(str))
+    _al=align_part_codes(pd.DataFrame({"Part":import_parts}),kn)["Part"].tolist()
+    ren=dict(zip(import_parts,_al)); import_parts=sorted(set(_al))
+    rm_map={ren.get(p,p):v for p,v in rm_map.items()}; ig_map={ren.get(p,p):v for p,v in ig_map.items()}
     all_rm=sorted(set(rm_map.values())) if rm_map else []
     if active_rm is None: active_rm=all_rm
     if rm_map and active_rm: import_parts=[p for p in import_parts if rm_map.get(p,"Unknown") in active_rm]
@@ -1064,6 +1097,16 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
         ap=set(ir)|set(or_); comb={p:ir.get(p,0)+or_.get(p,0) for p in ap if ir.get(p,0)+or_.get(p,0)>0}
         fg_list.append(fg); fgseg[fg]=seg; fgidu[fg]=idu; fgodu[fg]=odu; fgcomb[fg]=comb
     if not fg_list: st.error("No valid FG codes."); return None
+    # Interchangeable parts: pool member codes into one group row (qty per set and stock both summed)
+    ig_act={p:g for p,g in ig_map.items() if p in tset}
+    stock,group_members=pool_interchange(stock,ig_act,tset)
+    if ig_act:
+        for fg in fg_list:
+            pc=defaultdict(float)
+            for p,q in fgcomb[fg].items(): pc[ig_act.get(p,p)]+=q
+            fgcomb[fg]=dict(pc)
+        for g,mem in group_members.items(): rm_map[g]=rm_map.get(mem[0],"—")
+        import_parts=sorted({ig_act.get(p,p) for p in import_parts})
     n=len(fg_list); cp=[]; AR=[]; br=[]
     for p in import_parts:
         rv=[fgcomb[fg].get(p,0) for fg in fg_list]
@@ -1099,7 +1142,8 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
     status.update(label="Segment Capacity ✅",state="complete",expanded=False)
     return dict(segs=segs,alloc_int=sai,total_sets=total,segments_data=sdata,fg_results=fg_res,
                 import_parts=import_parts,constrained_parts=cp,part_usage=pu,stock=stock,
-                skipped_segs=skipped,rm_map=rm_map,active_rm_groups=active_rm)
+                skipped_segs=skipped,rm_map=rm_map,active_rm_groups=active_rm,
+                group_members=group_members,part_group=ig_act)
 
 
 WEEKS=["WK01","WK02","WK03","WK04"]
@@ -1166,12 +1210,26 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
     parts=sorted({p for f in fg_res for p in f["combined_req"]})
     A=np.array([[f["combined_req"].get(p,0) for f in fg_res] for p in parts],dtype=float)
     ub=[sum(fg_req[fg].values()) if basis=="req" else None for fg in fgs]
-    arr=import_arrivals_by_week(align_part_codes(po_df,_mrp_known_codes(mrp_r)),mcols)
+    po_al=align_part_codes(po_df,_mrp_known_codes(mrp_r))
+    if po_al is not None and seg_r.get("part_group"):
+        po_al=po_al.copy(); po_al["Part"]=po_al["Part"].map(lambda p:seg_r["part_group"].get(p,p))
+    arr=import_arrivals_by_week(po_al,mcols)
 
+    nf,nm=len(fgs),len(mcols)
     def solve(b,lb):
         if not parts: return np.array(lb,dtype=float)
-        res=linprog(-np.ones(len(fgs)),A_ub=A,b_ub=b,bounds=list(zip(lb,ub)),method="highs")
-        return res.x if res.status in (0,1) else np.array(lb,dtype=float)
+        if basis!="req":
+            res=linprog(-np.ones(nf),A_ub=A,b_ub=b,bounds=list(zip(lb,ub)),method="highs")
+            return res.x if res.status in (0,1) else np.array(lb,dtype=float)
+        # Aligned: one variable per (FG, month) capped at that month's requirement; earlier months weigh more,
+        # so material covers every model's near-term demand before anyone's later months.
+        Ax=np.repeat(A,nm,axis=1)                              # column f*nm+k uses FG f's qty per set
+        L=np.zeros((nf,nf*nm))
+        for f in range(nf): L[f,f*nm:(f+1)*nm]=-1.0           # keep sets already counted: Σ_k x[f,k] ≥ lb[f]
+        w=np.tile([1.0+0.01*(nm-k) for k in range(nm)],nf)
+        bnd=[(0,fg_req[fgs[f]][mcols[k]]) for f in range(nf) for k in range(nm)]
+        res=linprog(-w,A_ub=np.vstack([Ax,L]),b_ub=np.concatenate([b,-np.asarray(lb,dtype=float)]),bounds=bnd,method="highs")
+        return res.x.reshape(nf,nm).sum(axis=1) if res.status in (0,1) else np.array(lb,dtype=float)
 
     # Capacity timeline: stock only, then stock + cumulative arrivals after each week
     supply=np.array([float(stock.get(p,0)) for p in parts],dtype=float)
@@ -1815,6 +1873,7 @@ IMP_PO_ALIASES = {
     "PO_Qty":      ["po qty","po quantity","open po qty","open qty","pending qty","balance qty","qty","quantity"],
     "ETD":         ["etd","etd date","dispatch date","ship date","shipment date"],
     "ETA":         ["eta","eta date","arrival date","expected arrival","expected arrival date"],
+    "IGroup":      ["interchange group","interchangeable group","interchange","common group"],
 }
 
 def _imp_norm(c): return re.sub(r"[^a-z0-9]+"," ",str(c).lower()).strip()
@@ -1853,11 +1912,11 @@ def load_import_po(po_bytes, transit_days=30):
     if missing: return None,f"Could not find column(s): {', '.join(missing)}. Found: {', '.join(map(str,df.columns))}"
     for c in ["Part","PO_No"]:
         if c in df.columns: df[c]=txt.iloc[:,list(df.columns).index(c)].loc[df.index]
-    for c,d in [("Description",""),("PO_No",""),("Supplier",""),("ETD",pd.NaT),("ETA",pd.NaT)]:
+    for c,d in [("Description",""),("PO_No",""),("Supplier",""),("ETD",pd.NaT),("ETA",pd.NaT),("IGroup","")]:
         if c not in df.columns: df[c]=d
     df["Part"]=df["Part"].astype(str).str.strip()
     df=df[(df["Part"]!="")&(df["Part"].str.lower()!="nan")].copy()
-    for c in ["Description","PO_No","Supplier"]:
+    for c in ["Description","PO_No","Supplier","IGroup"]:
         df[c]=df[c].fillna("").astype(str).str.strip().replace("nan","")
     df["PO_Qty"]=pd.to_numeric(df["PO_Qty"].astype(str).str.replace(",","",regex=False).str.strip(),errors="coerce").fillna(0)
     for c in ["ETD","ETA"]: df[c]=pd.to_datetime(df[c],errors="coerce",dayfirst=True,format="mixed")
@@ -1865,6 +1924,66 @@ def load_import_po(po_bytes, transit_days=30):
     df["ETA_Estimated"]=df["ETA"].isna()&df["ETD"].notna()
     df.loc[df["ETA_Estimated"],"ETA"]=df.loc[df["ETA_Estimated"],"ETD"]+pd.Timedelta(days=int(transit_days))
     return df.reset_index(drop=True),None
+
+def create_seg_imp_template():
+    """Segment & Import Part template. 'Interchange Group': same name = same hardware (only EPROM / firmware differs),
+    stock is pooled across those codes; blank = code stands alone. 'Category' drives the RM Group filter."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
+    def F(size=10,**k): return Font(name="Arial",size=size,**k)
+    groups=[  # (group, fill colour, category, [(code, desc)])
+     ("DISP-G1","92D050","PCB-Display",[("0011801045ANP","Display pcb"),("0011801045NP","display panel")]),
+     ("","FCE4D6","PCB-IDU",[("0011800613Z","IDU PCB-70R")]),
+     ("IDU-G1","A6A6A6","PCB-IDU",[("0011800613X","INDOOR PCB"),("0011800613WD","INDOOR PCB-18K/19K"),("0011800613Y","INDOOR PCB"),
+        ("0011800613XA","INDOOR PCB"),("0011800613WE","IDU PCB- Hot & Cool"),("0011800613XNP","Indoor PCB"),("0011800613YNP","Indoor PCB"),
+        ("0011800613WA","INDOOR PCB"),("0011800613WM","IDU PCB"),("0011800613ZM","IDU PCB")]),
+     ("","FFFFFF","PCB-IDU",[("0011800323AZDEL","PCB"),("0011800491CDEL","IDU computer board")]),
+     ("ODU-G1","1F6B2A","PCB-ODU",[("0011801843WFNP","ODU Comoputer Board"),("0011801843WFNPA","Outdoor PCB"),("0011801843WFNPB","ODU PCB"),
+        ("0011801843BFNPB","Outdoor PCB"),("0011801843BFNP","ODU Computer Board"),("0011801843BFNPA","ODU Computer Board")]),
+     ("ODU-G2","F2CEEF","PCB-ODU",[("0011801843JNP","Outdoor PCB"),("0011801843JNPA","Outdoor PCB")]),
+     ("ODU-G3","17405F","PCB-ODU",[("0011801490MANPB","ODU PCB"),("0011801490MANPG","Outdoor PCB"),("0011801490QNP","ODU PCB"),
+        ("0011801490MANPH","Outdoor PCB"),("0011801490QNPB","Outdoor PCB"),("0011801490QNPA","ODU Computer Board")]),
+     ("","FFFFFF","PCB-ODU",[("0011801118CSB","Outdoor PCB")]),
+     ("ODU-G4","FFFF00","PCB-ODU",[("0011801843WNPE","Outdoor PCB"),("0011801843BNPA","ODU Computer Board"),("0011801843WNPA","Outdoor PCB"),
+        ("0011801843WNPD","Outdoor PCB"),("0011801843WNP","ODU PCB"),("0011801843BNPB","ODU Computer Board"),("0011801843BNPC","ODU Computer Board"),
+        ("0011801843WNPG","Outdoor PCB"),("0011801843WNPC","Outdoor PCB"),("0011801843WNPH","ODU PCB"),("0011801843WNPB","ODU PCB"),
+        ("0011801843WNPCA","ODU PCB"),("0011801843WNPEA","ODU PCB"),("0011801843WNPJ","ODU PCB"),("0011801843WNPK","ODU PCB")]),
+     ("","FFFFFF","PCB-TOWER",[("0011800698BGNP","INDOOR PCB")]),
+    ]
+    thin=Side(style="thin",color="BFBFBF"); bd=Border(thin,thin,thin,thin)
+    wb=Workbook(); ws=wb.active; ws.title="Import Part"
+    hdr=["Part Code","Desc.","Category","Interchange Group"]; ws.append(hdr)
+    for g,colr,cat,items in groups:
+        dark=colr in ("1F6B2A","17405F")
+        for code,desc in items:
+            ws.append([code,desc,cat,g]); r=ws.max_row
+            for c in range(1,5):
+                cell=ws.cell(r,c); cell.border=bd; cell.font=F(color="FFFFFF" if dark and c<=2 else "0000FF" if c==4 else "000000")
+                cell.number_format="@"
+                if c<=2 and colr!="FFFFFF": cell.fill=PatternFill("solid",fgColor=colr)
+                if c==4: cell.fill=PatternFill("solid",fgColor="FFF2CC")
+    for c in range(1,5):
+        cell=ws.cell(1,c); cell.font=F(bold=True,color="FFFFFF"); cell.fill=PatternFill("solid",fgColor="1F4E78")
+        cell.border=bd; cell.alignment=Alignment(horizontal="center")
+    for col,w in zip("ABCD",[20,26,14,18]): ws.column_dimensions[col].width=w
+    ws.freeze_panes="A2"
+    sg=wb.create_sheet("Segment"); sg.append(["Segment","FG Code","IDU","ODU"])
+    for row in [("1 ton 3 Star","FG-1T3S-01","IDU-CODE-1","ODU-CODE-1"),("1.5 ton 5 Star","FG-15T5S-01","IDU-CODE-2","ODU-CODE-2")]:
+        sg.append(list(row))
+    for c in range(1,5):
+        cell=sg.cell(1,c); cell.font=F(bold=True,color="FFFFFF"); cell.fill=PatternFill("solid",fgColor="1F4E78")
+        sg.column_dimensions["ABCD"[c-1]].width=18
+    ins=wb.create_sheet("Instructions")
+    for i,(t,b_) in enumerate([("Segment & Import Part file",True),("",False),("Sheet 'Import Part'",True),
+        ("Part Code - import part code as in BOM / Stock (text, leading zeros kept).",False),
+        ("Category - used as the RM Group filter on the Segment page (e.g. PCB-IDU, PCB-ODU, PCB-Display).",False),
+        ("Interchange Group - codes with the SAME group name are the same hardware (only EPROM / firmware differs):",False),
+        ("   their stock and PO arrivals are pooled when calculating sets and shortage. Leave blank if the code cannot be swapped.",False),
+        ("Colours are only for reading - the app uses the group name, not the colour.",False),("",False),("Sheet 'Segment'",True),
+        ("Segment name, FG (set) code, IDU BOM header, ODU BOM header - replace the 2 example rows.",False)],1):
+        ins.cell(i,1,t).font=F(size=12 if i==1 else 10,bold=b_)
+    ins.column_dimensions["A"].width=115
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 def create_import_po_template():
     """Import PO template: one row per PO line; red headers required; grey columns show the ETA month / week."""
@@ -1944,8 +2063,9 @@ def align_part_codes(po_df, known_codes):
 def _mrp_known_codes(mrp_r):
     return set(mrp_r["bom"]["Component"].astype(str))|set(mrp_r["bom"]["BOM Header"].astype(str))|set(map(str,mrp_r["stock"].index))
 
-def run_import_coverage(mrp_r, po_df):
-    """Month-wise projection per import part: Stock + PO arrivals (by ETA bucket) − MRP gross requirement."""
+def run_import_coverage(mrp_r, po_df, group_map=None):
+    """Month-wise projection per import part: Stock + PO arrivals (by ETA bucket) − MRP gross requirement.
+    group_map {part: group}: interchangeable codes are pooled — requirement, stock and POs summed per group."""
     months=list(mrp_r["months"])
     parsed=[parse_col_to_date(m)[0] for m in months]
     yr=infer_year([{"ts":t} for t in parsed])
@@ -1968,7 +2088,19 @@ def run_import_coverage(mrp_r, po_df):
     stock=mrp_r["stock"]
 
     # Bucket each PO into an MRP month by ETA
-    po=align_part_codes(po_df,_mrp_known_codes(mrp_r))
+    known=_mrp_known_codes(mrp_r)
+    po=align_part_codes(po_df,known)
+    members={}
+    if group_map:
+        gk=list(group_map); gk_al=align_part_codes(pd.DataFrame({"Part":gk}),known)["Part"].tolist()
+        gmap={a:group_map[k] for k,a in zip(gk,gk_al)}
+        stock,members=pool_interchange(stock,gmap)
+        req_map2=defaultdict(float)
+        for (c,m),v in req_map.items(): req_map2[(gmap.get(c,c),m)]+=v
+        req_map=dict(req_map2)
+        for g,mem in members.items():
+            desc_map[g]=f"Interchangeable ({len(mem)} codes)"
+        po=po.copy(); po["Part"]=po["Part"].map(lambda p:gmap.get(p,p))
     def bucket(eta):
         if pd.isna(eta): return "Unscheduled"
         if eta>horizon_end: return "Beyond horizon"
@@ -1983,7 +2115,7 @@ def run_import_coverage(mrp_r, po_df):
     summary=[]; proj=[]; po_status=[]
     for p in parts:
         pp=po[po["Part"]==p]
-        desc=next((d for d in pp["Description"] if d),"") or desc_map.get(p,"")
+        desc=(desc_map.get(p,"") if p in members else "") or next((d for d in pp["Description"] if d),"") or desc_map.get(p,"")
         stk=float(stock.get(p,0))
         arr={m:float(pp.loc[pp["Arrival_Month"]==m,"PO_Qty"].sum()) for m in months}
         beyond=float(pp.loc[pp["Arrival_Month"]=="Beyond horizon","PO_Qty"].sum())
@@ -2011,7 +2143,7 @@ def run_import_coverage(mrp_r, po_df):
         elif stk+tot_po>=tot_req: status="🟠 Short – PO beyond horizon"
         else: status="🔴 Short – new PO needed"
         nxt=pp[pp["ETA"].notna()&(pp["ETA"]>=pd.Timestamp.today().normalize())]["ETA"].min()
-        summary.append({"Import Part":p,"Description":desc,"Stock":stk,"Total Requirement":tot_req,
+        summary.append({"Import Part":p,"Description":desc,"Interchangeable codes":", ".join(members.get(p,[])),"Stock":stk,"Total Requirement":tot_req,
                         "Open PO Qty":tot_po,"PO in horizon":in_h,"Closing Balance":bal,
                         "Max Shortage":max_short,"Additional PO Needed":max(0.0,-bal),
                         "First Shortage Month":first_short or "—",
@@ -2429,7 +2561,10 @@ elif st.session_state["page"] == "segment":
         sc,_=st.columns([2,3])
         with sc:
             sf=st.file_uploader("Segment & Import Part (.xlsx)",type=["xlsx","xls"],key="seg_f",
-                                 help="Sheet 1: Import Part List | Sheet 2: Segment (IDU/ODU codes)")
+                                 help="Sheet 1: Import Part List (Part Code, Desc., Category, Interchange Group) | Sheet 2: Segment (IDU/ODU codes)")
+            st.download_button("📥 Segment & Import Part template (with Interchange Group)",data=create_seg_imp_template().getvalue(),
+                               file_name="segment_import_part_template.xlsx",key="dl_seg_imp",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         rb,_=st.columns([1,4])
         with rb:
             run_seg=st.button("▶ Run Segment Capacity",type="primary",use_container_width=True,key="run_seg")
@@ -2537,6 +2672,10 @@ elif st.session_state["page"] == "segment":
             m3.metric("Active segments",f"{(r['alloc_int']>0).sum()} / {len(r['segs'])}")
             m4.metric("Constrained parts",f"{len(r['constrained_parts'])}")
 
+            if r.get("group_members"):
+                with st.expander(f"⇄ {len(r['group_members'])} interchangeable part group(s) pooled — same hardware, stock shared across codes"):
+                    st.dataframe(pd.DataFrame([{"Group":g,"Codes":len(m),"Pooled stock":int(r["stock"].get(g,0)),"Member codes":", ".join(m)}
+                                               for g,m in r["group_members"].items()]),use_container_width=True,hide_index=True)
             if r.get("skipped_segs"):
                 with st.expander(f"⚠ {len(r['skipped_segs'])} FGs skipped"):
                     for s in r["skipped_segs"]: st.text(f"  · {s}")
@@ -2636,8 +2775,9 @@ elif st.session_state["page"] == "segment":
                 irows=[]
                 for p,req in sorted(fgr["combined_req"].items(),key=lambda x:-x[1]):
                     avail=float(r["stock"].get(p,0)); ms=int(avail/req) if req>0 else 0
-                    irows.append({"Import Part":p,"RM Group":rm_map.get(p,"—"),"Qty per set":round(req,4),"Stock available":int(avail),"Max sets (alone)":ms,"Binding?":"🔴 YES" if ms==sets and sets>0 else ""})
+                    irows.append({"Import Part":p,"Interchangeable codes":", ".join(r.get("group_members",{}).get(p,[])),"RM Group":rm_map.get(p,"—"),"Qty per set":round(req,4),"Stock available":int(avail),"Max sets (alone)":ms,"Binding?":"🔴 YES" if ms==sets and sets>0 else ""})
                 idf=pd.DataFrame(irows)
+                if not idf.empty and not idf["Interchangeable codes"].astype(bool).any(): idf=idf.drop(columns="Interchangeable codes")
                 def hi(row): return ["background-color:#fff0f0"]*len(row) if row["Binding?"]=="🔴 YES" else [""]*len(row)
                 st.dataframe(idf.style.apply(hi,axis=1).format({"Qty per set":"{:.4f}","Stock available":"{:,}","Max sets (alone)":"{:,}"}),use_container_width=True,hide_index=True)
 
@@ -2645,8 +2785,9 @@ elif st.session_state["page"] == "segment":
             purows=[]
             for p in r["import_parts"]:
                 pu=r["part_usage"].get(p,{})
-                purows.append({"Import Part":p,"RM Group":rm_map.get(p,"—"),"Stock":int(r["stock"].get(p,0)),"Used":int(pu.get("used",0)),"Remaining":int(pu.get("remain",r["stock"].get(p,0))),"Utilisation%":pu.get("pct",0)})
+                purows.append({"Import Part":p,"Interchangeable codes":", ".join(r.get("group_members",{}).get(p,[])),"RM Group":rm_map.get(p,"—"),"Stock":int(r["stock"].get(p,0)),"Used":int(pu.get("used",0)),"Remaining":int(pu.get("remain",r["stock"].get(p,0))),"Utilisation%":pu.get("pct",0)})
             pudf=pd.DataFrame(purows).sort_values("Utilisation%",ascending=False)
+            if not pudf.empty and not pudf["Interchangeable codes"].astype(bool).any(): pudf=pudf.drop(columns="Interchangeable codes")
             def hu(row):
                 p=row["Utilisation%"]
                 if p>=90: return ["background-color:#fff0f0"]*len(row)
@@ -3173,6 +3314,9 @@ elif st.session_state["page"] == "import":
                                file_name="import_po_template.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                use_container_width=True,key="dl_imp_po")
+        use_ig=st.checkbox("⇄ Pool interchangeable parts (same hardware, only EPROM / firmware differs)",value=True,key="imp_use_ig",
+                           help="Groups come from the 'Interchange Group' column of the Segment & Import Part file (Segment page) "
+                                "and/or an 'Interchange Group' column in this PO file. Stock, POs and requirement are summed per group.")
         rb,_=st.columns([1,4])
         with rb:
             run_imp=st.button("▶ Calculate Coverage",type="primary",use_container_width=True,key="run_imp")
@@ -3183,7 +3327,10 @@ elif st.session_state["page"] == "import":
                     po_df,err=load_import_po(st.session_state["_imp_po"],transit)
                     if err: st.error(err)
                     else:
-                        res,err=run_import_coverage(mrp_r,po_df)
+                        gmap=load_interchange_map(st.session_state.get("seg_imp_bytes")) if use_ig else {}
+                        if use_ig:
+                            gmap.update({p:"⇄ "+g for p,g in zip(po_df["Part"],po_df["IGroup"]) if g})
+                        res,err=run_import_coverage(mrp_r,po_df,gmap or None)
                         if err: st.error(err)
                         else: st.session_state["imp_results"]=res; st.success("Import coverage calculated.")
                 except Exception as e: st.exception(e)
@@ -3219,8 +3366,9 @@ elif st.session_state["page"] == "import":
             with t1:
                 if short.empty: st.success("No import part goes short within the MRP horizon. 🎉")
                 else:
-                    cols=["Import Part","Description","Stock","Total Requirement","Open PO Qty","First Shortage Month",
+                    cols=["Import Part","Description","Interchangeable codes","Stock","Total Requirement","Open PO Qty","First Shortage Month",
                           "Max Shortage","Additional PO Needed","Next ETA","Status"]
+                    cols=[c for c in cols if c!="Interchangeable codes" or short[c].astype(bool).any()]
                     sdf=short.sort_values(["First Shortage Month","Max Shortage"],
                                           key=lambda s:s.map({m:i for i,m in enumerate(months)}) if s.name=="First Shortage Month" else -s)[cols]
                     st.dataframe(sdf.style.apply(_status_style,axis=1).format({k:v for k,v in num_fmt.items() if k in cols}),
@@ -3231,8 +3379,9 @@ elif st.session_state["page"] == "import":
                 cdf=summ.copy()
                 if sf_opt: cdf=cdf[cdf["Status"].isin(sf_opt)]
                 if q: cdf=cdf[cdf["Import Part"].str.lower().str.contains(q,regex=False)|cdf["Description"].str.lower().str.contains(q,regex=False)]
-                cols=["Import Part","Description","Stock","Total Requirement","Open PO Qty","PO in horizon","Closing Balance",
+                cols=["Import Part","Description","Interchangeable codes","Stock","Total Requirement","Open PO Qty","PO in horizon","Closing Balance",
                       "Coverage w/o PO (months)","Coverage (months)","Covered till","First Shortage Month","Next ETA","Status"]
+                cols=[c for c in cols if c!="Interchangeable codes" or cdf[c].astype(bool).any()]
                 st.dataframe(cdf[cols].style.apply(_status_style,axis=1).format({k:v for k,v in num_fmt.items() if k in cols}),
                              use_container_width=True,hide_index=True)
                 st.caption(f"Coverage (months) counts consecutive MRP months from {months[0]} with no shortage, using stock + PO arrivals by ETA.")
