@@ -1144,6 +1144,23 @@ def segment_monthwise(seg_r, mrp_r, basis="max"):
             avail=bal
     return pd.DataFrame(rows),mcols
 
+def monthwise_by_segment(long_df,mcols,metrics):
+    """Months as rows; for each segment (sorted by total req) + TOTAL, one column per chosen metric: 'Segment | Metric'."""
+    names={"Sets Available":"Available","Requirement":"Req","Balance c/f":"Balance","Net Shortfall":"Shortfall"}
+    g=long_df.groupby(["Segment","Month"])[list(names)].sum()
+    segs=long_df.groupby("Segment")["Requirement"].sum().sort_values(ascending=False).index.tolist()
+    tot=long_df.groupby("Month")[list(names)].sum()
+    out=pd.DataFrame({"Month":mcols})
+    for sgm in segs+["TOTAL"]:
+        for k in metrics:
+            src=tot[k] if sgm=="TOTAL" else g[k].xs(sgm,level="Segment")
+            out[f"{sgm} | {names[k]}"]=[float(src.get(m,0)) for m in mcols]
+    tr={"Month":"TOTAL"}
+    for c in out.columns[1:]:
+        # Available/Balance are stock positions → total row shows opening / closing; Req/Shortfall are flows → summed
+        tr[c]=out[c].iloc[0] if c.endswith("| Available") else out[c].iloc[-1] if c.endswith("| Balance") else out[c].sum()
+    return pd.concat([out,pd.DataFrame([tr])],ignore_index=True)
+
 def monthwise_wide(long_df,keys,mcols):
     """Wide table: per month → Available | Req | Balance | Shortfall columns, plus totals."""
     g=long_df.groupby(keys+["Month"],as_index=False)[["Sets Available","Requirement","Balance c/f","Net Shortfall"]].sum()
@@ -2377,15 +2394,19 @@ elif st.session_state["page"] == "segment":
                                 sty[c]=["color:#dc2626;font-weight:600;background-color:#fef2f2" if v>0 else "color:#15803d" for v in df[c]]
                             elif c.endswith("| Balance"): sty[c]="background-color:#f0fdf4"
                         return sty
-                    seg_w=monthwise_wide(mw,["Segment"],mw_months).sort_values("Total Req",ascending=False)
-                    tot={"Segment":"TOTAL",**{c:seg_w[c].sum() for c in seg_w.columns if c!="Segment"}}
-                    seg_w=pd.concat([seg_w,pd.DataFrame([tot])],ignore_index=True)
+                    seg_w=monthwise_by_segment(mw,mw_months,["Sets Available","Requirement","Balance c/f","Net Shortfall"])
                     fg_w=monthwise_wide(mw,["Segment","FG Code","FG Description","Req matched on"],mw_months) \
                            .sort_values(["Segment","Total Shortfall"],ascending=[True,False])
                     numc=lambda d:{c:"{:,.0f}" for c in d.columns if "|" in c or c.startswith("Total")}
                     sw1,sw2,sw3=st.tabs(["Segment-wise","FG-wise","Single FG / segment view"])
                     with sw1:
-                        st.dataframe(seg_w.style.apply(_mw_style,axis=None).format(numc(seg_w)),use_container_width=True,hide_index=True)
+                        met_opts={"Available":"Sets Available","Req":"Requirement","Balance":"Balance c/f","Shortfall":"Net Shortfall"}
+                        sel_m=st.multiselect("Columns per segment",list(met_opts),default=list(met_opts),key="seg_mw_mets")
+                        if not sel_m: st.info("Pick at least one column.")
+                        else:
+                            sv=monthwise_by_segment(mw,mw_months,[met_opts[k] for k in sel_m])
+                            st.dataframe(sv.style.apply(_mw_style,axis=None).format(numc(sv)),use_container_width=True,hide_index=True)
+                            st.caption("Rows = months · columns = segment | metric · TOTAL row: Available = opening, Balance = closing, Req/Shortfall = sum")
                     with sw2:
                         only_sf=st.checkbox("Show only FGs with shortfall",key="seg_mw_sf")
                         fv=fg_w[fg_w["Total Shortfall"]>0] if only_sf else fg_w
