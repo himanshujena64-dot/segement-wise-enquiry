@@ -314,6 +314,7 @@ for k, v in {
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_prod": None, "_receipt": None,
     "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None, "plan_open": False,
+    "_imp_po": None, "imp_results": None,
     "authenticated": False, "_login_error": "",
 }.items():
     if k not in st.session_state:
@@ -407,6 +408,7 @@ def topbar(title, sub=""):
     if mrp_done:  chips += '<span class="chip done"><span class="chip-dot"></span>MRP done</span>'
     if seg_done:  chips += '<span class="chip done"><span class="chip-dot"></span>Segment done</span>'
     if ag_done:   chips += '<span class="chip done"><span class="chip-dot"></span>Aging done</span>'
+    if st.session_state["imp_results"] is not None: chips += '<span class="chip done"><span class="chip-dot"></span>Import done</span>'
     if not mrp_done: chips += '<span class="chip idle"><span class="chip-dot"></span>Awaiting run</span>'
     st.markdown(f"""
     <div class="topbar">
@@ -1598,6 +1600,187 @@ def show_search(bom,req_df,months,stock,prod_summary):
 
 
 # ═══════════════════════════════════════════════════════════════
+# IMPORT MATERIAL SHORTAGE & COVERAGE ENGINE
+# ═══════════════════════════════════════════════════════════════
+IMP_PO_ALIASES = {
+    "Part":        ["import part","part","part no","part number","material","material code","material no",
+                    "component","component code","item","item code"],
+    "Description": ["description","material description","part description","component description","desc"],
+    "PO_No":       ["po","po no","po number","purchase order","purchase order no","po num"],
+    "Supplier":    ["supplier","vendor","vendor name","supplier name"],
+    "PO_Qty":      ["po qty","po quantity","open po qty","open qty","pending qty","balance qty","qty","quantity"],
+    "ETD":         ["etd","etd date","dispatch date","ship date","shipment date"],
+    "ETA":         ["eta","eta date","arrival date","expected arrival","expected arrival date"],
+}
+
+def _imp_norm(c): return re.sub(r"[^a-z0-9]+"," ",str(c).lower()).strip()
+
+def map_import_po_columns(df):
+    """Map user's PO-file headers onto Part / Description / PO_No / Supplier / PO_Qty / ETD / ETA."""
+    cols={c:_imp_norm(c) for c in df.columns}; mapping={}; used=set()
+    # Pass 1: exact alias match
+    for tgt,aliases in IMP_PO_ALIASES.items():
+        c=next((c for c,n in cols.items() if c not in used and n in aliases),None)
+        if c is not None: mapping[c]=tgt; used.add(c)
+    # Pass 2: keyword containment for anything still missing
+    kw={"ETA":lambda n:"eta" in n.split() or "arrival" in n,
+        "ETD":lambda n:"etd" in n.split() or "dispatch" in n,
+        "PO_Qty":lambda n:("qty" in n or "quantity" in n),
+        "Description":lambda n:"desc" in n,
+        "Part":lambda n:("part" in n or "material" in n or "component" in n) and "desc" not in n,
+        "PO_No":lambda n:n.startswith("po") and "qty" not in n and "date" not in n,
+        "Supplier":lambda n:"vendor" in n or "supplier" in n}
+    for tgt,fn in kw.items():
+        if tgt in mapping.values(): continue
+        c=next((c for c,n in cols.items() if c not in used and fn(n)),None)
+        if c is not None: mapping[c]=tgt; used.add(c)
+    df=df.rename(columns=mapping)
+    missing=[c for c in ["Part","PO_Qty"] if c not in df.columns]
+    if "ETA" not in df.columns and "ETD" not in df.columns: missing.append("ETA or ETD")
+    return df,missing
+
+def load_import_po(po_bytes, transit_days=30):
+    xl=pd.ExcelFile(io.BytesIO(po_bytes))
+    sh=next((s for s in xl.sheet_names if "po" in s.lower() or "import" in s.lower()),xl.sheet_names[0])
+    df=pd.read_excel(io.BytesIO(po_bytes),sheet_name=sh); df.columns=[str(c).strip() for c in df.columns]
+    df=df.dropna(how="all")
+    df,missing=map_import_po_columns(df)
+    if missing: return None,f"Could not find column(s): {', '.join(missing)}. Found: {', '.join(map(str,df.columns))}"
+    for c,d in [("Description",""),("PO_No",""),("Supplier",""),("ETD",pd.NaT),("ETA",pd.NaT)]:
+        if c not in df.columns: df[c]=d
+    df["Part"]=df["Part"].astype(str).str.strip()
+    df=df[(df["Part"]!="")&(df["Part"].str.lower()!="nan")].copy()
+    for c in ["Description","PO_No","Supplier"]:
+        df[c]=df[c].fillna("").astype(str).str.strip().replace("nan","")
+    df["PO_Qty"]=pd.to_numeric(df["PO_Qty"].astype(str).str.replace(",","",regex=False).str.strip(),errors="coerce").fillna(0)
+    for c in ["ETD","ETA"]: df[c]=pd.to_datetime(df[c],errors="coerce",dayfirst=True,format="mixed")
+    # Missing ETA → ETD + transit days
+    df["ETA_Estimated"]=df["ETA"].isna()&df["ETD"].notna()
+    df.loc[df["ETA_Estimated"],"ETA"]=df.loc[df["ETA_Estimated"],"ETD"]+pd.Timedelta(days=int(transit_days))
+    return df.reset_index(drop=True),None
+
+def create_import_po_template():
+    df=pd.DataFrame({
+        "Import Part":["COMP-A","COMP-A","COMP-B","COMP-C"],
+        "Description":["Compressor","Compressor","PCB Assy","Fan Motor"],
+        "PO No":["4500001234","4500001301","4500001250","4500001277"],
+        "Supplier":["Supplier X","Supplier X","Supplier Y","Supplier Z"],
+        "PO Qty":[500,800,1200,300],
+        "ETD":["05-May-26","10-Jun-26","15-May-26","01-Jun-26"],
+        "ETA":["05-Jun-26","12-Jul-26","20-Jun-26","02-Jul-26"],
+    })
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as w: df.to_excel(w,sheet_name="Import PO",index=False)
+    buf.seek(0); return buf
+
+def run_import_coverage(mrp_r, po_df):
+    """Month-wise projection per import part: Stock + PO arrivals (by ETA bucket) − MRP gross requirement."""
+    months=list(mrp_r["months"])
+    parsed=[parse_col_to_date(m)[0] for m in months]
+    yr=infer_year([{"ts":t} for t in parsed])
+    mts=[]
+    for m in months:
+        t,_=parse_col_to_date(m,default_year=yr); mts.append(pd.Timestamp(t).normalize() if t is not None else pd.NaT)
+    if not months or any(pd.isna(t) for t in mts): return None,"Could not read MRP month columns as dates."
+    horizon_end=mts[-1]+pd.offsets.MonthEnd(0)
+
+    # Requirement per component per month (all BOM levels, as in the MRP pivot)
+    req=pd.concat([mrp_r[k][["Component","Month","Gross_Requirement"]] for k in
+                   ["result_l1","result_l2","result_l3","result_l4"] if not mrp_r[k].empty],ignore_index=True) \
+          if any(not mrp_r[k].empty for k in ["result_l1","result_l2","result_l3","result_l4"]) \
+          else pd.DataFrame(columns=["Component","Month","Gross_Requirement"])
+    req_map=req.groupby(["Component","Month"])["Gross_Requirement"].sum().to_dict()
+    desc_map={}
+    for k in ["result_l1","result_l2","result_l3","result_l4"]:
+        d=mrp_r[k]
+        if not d.empty: desc_map.update(dict(zip(d["Component"],d["Description"])))
+    stock=mrp_r["stock"]
+
+    # Bucket each PO into an MRP month by ETA
+    po=po_df.copy()
+    def bucket(eta):
+        if pd.isna(eta): return "Unscheduled"
+        if eta>horizon_end: return "Beyond horizon"
+        idx=0
+        for i,t in enumerate(mts):
+            if eta>=t: idx=i
+        return months[idx]
+    po["Arrival_Month"]=po["ETA"].apply(bucket)
+    po["ETA_Past_Due"]=po["ETA"].notna()&(po["ETA"]<mts[0])
+
+    parts=list(dict.fromkeys(po["Part"].tolist()))
+    summary=[]; proj=[]; po_status=[]
+    for p in parts:
+        pp=po[po["Part"]==p]
+        desc=next((d for d in pp["Description"] if d),"") or desc_map.get(p,"")
+        stk=float(stock.get(p,0))
+        arr={m:float(pp.loc[pp["Arrival_Month"]==m,"PO_Qty"].sum()) for m in months}
+        beyond=float(pp.loc[pp["Arrival_Month"]=="Beyond horizon","PO_Qty"].sum())
+        unsched=float(pp.loc[pp["Arrival_Month"]=="Unscheduled","PO_Qty"].sum())
+        bal=stk; bal_noPO=stk; first_short=None; first_short_noPO=None; max_short=0.0; tot_req=0.0
+        cov_m=0; cov_noPO=0; still_cov=True; still_cov_noPO=True
+        for m in months:
+            rq=float(req_map.get((p,m),0)); tot_req+=rq
+            opening=bal; bal=bal+arr[m]-rq; bal_noPO=bal_noPO-rq
+            short=max(0.0,-bal)
+            if bal<0 and first_short is None: first_short=m
+            if bal_noPO<0 and first_short_noPO is None: first_short_noPO=m
+            if bal<0: still_cov=False
+            if bal_noPO<0: still_cov_noPO=False
+            if still_cov: cov_m+=1
+            if still_cov_noPO: cov_noPO+=1
+            max_short=max(max_short,short)
+            proj.append({"Import Part":p,"Description":desc,"Month":m,"Opening":opening,"PO Arrival":arr[m],
+                         "Requirement":rq,"Closing":bal,"Shortage":short})
+        tot_po=float(pp["PO_Qty"].sum())
+        in_h=tot_po-beyond-unsched
+        if tot_req==0: status="⚪ No demand"
+        elif first_short is None: status="🟢 Covered"
+        elif stk+in_h>=tot_req: status="🟠 Short – expedite PO"
+        elif stk+tot_po>=tot_req: status="🟠 Short – PO beyond horizon"
+        else: status="🔴 Short – new PO needed"
+        nxt=pp[pp["ETA"].notna()&(pp["ETA"]>=pd.Timestamp.today().normalize())]["ETA"].min()
+        summary.append({"Import Part":p,"Description":desc,"Stock":stk,"Total Requirement":tot_req,
+                        "Open PO Qty":tot_po,"PO in horizon":in_h,"Closing Balance":bal,
+                        "Max Shortage":max_short,"Additional PO Needed":max(0.0,-bal),
+                        "First Shortage Month":first_short or "—",
+                        "Covered till":(months[cov_m-1] if cov_m>0 else "Not covered") if first_short else "Full horizon",
+                        "Coverage (months)":cov_m,"Coverage w/o PO (months)":cov_noPO,
+                        "Stock-only shortage from":first_short_noPO or "—",
+                        "Next ETA":nxt.strftime("%d-%b-%y") if pd.notna(nxt) else "—",
+                        "Status":status})
+
+        # PO-level need-by check (FIFO by ETA): when is each PO needed vs when does it land
+        running={m:0.0 for m in months}; mi={m:i for i,m in enumerate(months)}
+        for idx,row in pp.sort_values("ETA",na_position="last").iterrows():
+            b=stk; need=None
+            for m in months:
+                b=b+running[m]-float(req_map.get((p,m),0))
+                if b<0: need=m; break
+            am=row["Arrival_Month"]
+            if need is None: st_="✅ Not needed in horizon" if tot_req>0 else "⚪ No demand"
+            elif am in mi and mi[am]<=mi[need]: st_="✅ On time"
+            else: st_="⏰ Late – expedite"
+            if am in running: running[am]+=float(row["PO_Qty"])
+            po_status.append({"Import Part":p,"Description":desc,"PO No":row["PO_No"],"Supplier":row["Supplier"],
+                              "PO Qty":float(row["PO_Qty"]),
+                              "ETD":row["ETD"].strftime("%d-%b-%y") if pd.notna(row["ETD"]) else "—",
+                              "ETA":(row["ETA"].strftime("%d-%b-%y")+(" (est.)" if row["ETA_Estimated"] else "")) if pd.notna(row["ETA"]) else "—",
+                              "Arrival Month":am,"Needed by":need or "—","PO Status":st_})
+
+    summ=pd.DataFrame(summary)
+    proj_df=pd.DataFrame(proj)
+    closing=proj_df.pivot_table(index=["Import Part","Description"],columns="Month",values="Closing",aggfunc="sum").reset_index() \
+            if not proj_df.empty else pd.DataFrame()
+    if not closing.empty: closing=closing[["Import Part","Description"]+[m for m in months if m in closing.columns]]
+    not_in_mrp=[p for p in parts if not any(req_map.get((p,m),0) for m in months) and p not in stock.index]
+    return dict(summary=summ,projection=proj_df,closing=closing,po_status=pd.DataFrame(po_status),
+                months=months,not_in_mrp=not_in_mrp,
+                unscheduled=int((po["Arrival_Month"]=="Unscheduled").sum()),
+                past_due=int(po["ETA_Past_Due"].sum())),None
+
+
+# ═══════════════════════════════════════════════════════════════
 # SIDEBAR NAV
 # ═══════════════════════════════════════════════════════════════
 with st.sidebar:
@@ -1627,6 +1810,7 @@ with st.sidebar:
         ("⚙️",  "Run MRP",               "mrp",     "✓" if mrp_done else None),
         ("🏭",  "Segment Wise Available", "segment", "✓" if seg_done else None),
         ("📦",  "Aging Projection",       "aging",   "✓" if ag_done else None),
+        ("🚢",  "Import Shortage",        "import",  "✓" if st.session_state["imp_results"] is not None else None),
     ]
     # Tools / views nav items
     tools_items = [
@@ -1688,6 +1872,7 @@ if st.session_state["page"] == "home":
         ("⚙️","Run MRP",           "Execute L1–L4 BOM explosion & NET propagation", mrp_done, "mrp"),
         ("🏭","Segment Wise Available","LP-optimised import-part constrained capacity", seg_done, "segment"),
         ("📦","Aging Projection",  "Material aging forecast with consumption offset", ag_done,  "aging"),
+        ("🚢","Import Shortage",   "Import part shortage & coverage from PO Qty, ETD, ETA", st.session_state["imp_results"] is not None, "import"),
         ("📋","Production Plan",   "Month-wise model requirement plan with descriptions", True, "plan"),
     ]
 
@@ -2617,6 +2802,138 @@ elif st.session_state["page"] == "plan":
 
 
 # ═══════════════════════════════════════════════════════════════
+# PAGE: IMPORT SHORTAGE & COVERAGE
+# ═══════════════════════════════════════════════════════════════
+elif st.session_state["page"] == "import":
+    topbar("Import Material Shortage & Coverage", "Stock + open import POs (by ETA) vs MRP requirement, month-wise")
+
+    mrp_r=st.session_state.get("mrp_results")
+    if mrp_r is None:
+        st.markdown("""<div class="empty"><div class="empty-icon">🚢</div>
+        <div class="empty-ttl">Run MRP first</div>
+        <div class="empty-sub">Import coverage uses the month-wise requirement and stock from the MRP run.</div></div>""",
+        unsafe_allow_html=True)
+    else:
+        sec("Import PO File")
+        u1,u2,u3=st.columns([2,1,1])
+        with u1:
+            pf=st.file_uploader("Import parts with PO Qty, ETD, ETA (.xlsx)",type=["xlsx","xls"],key="imp_po_u",
+                                help="One row per PO line. Columns: Import Part, Description (opt), PO No (opt), Supplier (opt), PO Qty, ETD, ETA")
+            if pf: st.session_state["_imp_po"]=pf.read()
+            if st.session_state.get("_imp_po") and not pf:
+                st.caption("✓ Import PO file retained in session. Re-upload to replace.")
+        with u2:
+            transit=st.number_input("Transit days (if ETA blank)",min_value=0,max_value=180,value=30,step=1,key="imp_transit",
+                                    help="When ETA is empty, ETA = ETD + these days")
+        with u3:
+            st.markdown("<p style='font-size:12px;color:#6b7280;margin-bottom:8px;'><strong>Import PO Template</strong></p>",unsafe_allow_html=True)
+            st.download_button("📥 Download Template",data=create_import_po_template().getvalue(),
+                               file_name="import_po_template.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True,key="dl_imp_po")
+        rb,_=st.columns([1,4])
+        with rb:
+            run_imp=st.button("▶ Calculate Coverage",type="primary",use_container_width=True,key="run_imp")
+        if run_imp:
+            if not st.session_state.get("_imp_po"): st.warning("Upload the Import PO file first.")
+            else:
+                try:
+                    po_df,err=load_import_po(st.session_state["_imp_po"],transit)
+                    if err: st.error(err)
+                    else:
+                        res,err=run_import_coverage(mrp_r,po_df)
+                        if err: st.error(err)
+                        else: st.session_state["imp_results"]=res; st.success("Import coverage calculated.")
+                except Exception as e: st.exception(e)
+
+        r=st.session_state.get("imp_results")
+        if r is None:
+            st.markdown("""<div class="empty"><div class="empty-icon">🚢</div>
+            <div class="empty-ttl">No coverage calculated yet</div>
+            <div class="empty-sub">Upload the import part / PO file (PO Qty, ETD, ETA) and click Calculate Coverage.</div></div>""",
+            unsafe_allow_html=True)
+        else:
+            summ=r["summary"]; months=r["months"]
+            short=summ[summ["Max Shortage"]>0]
+            sec("Summary")
+            k1,k2,k3,k4,k5=st.columns(5)
+            k1.metric("Import parts",f"{len(summ):,}")
+            k2.metric("Parts short",f"{len(short):,}")
+            k3.metric("Need new PO",f"{(summ['Status'].str.contains('new PO')).sum():,}")
+            k4.metric("Need expedite",f"{(summ['Status'].str.contains('expedite|beyond')).sum():,}")
+            k5.metric("Fully covered",f"{(summ['Status'].str.contains('Covered')).sum():,}")
+            if r["past_due"]: st.warning(f"{r['past_due']} PO line(s) have ETA before the first MRP month — counted as arriving in {months[0]}.")
+            if r["unscheduled"]: st.warning(f"{r['unscheduled']} PO line(s) have no ETA/ETD — excluded from the projection.")
+            if r["not_in_mrp"]: st.info(f"{len(r['not_in_mrp'])} part(s) not found in MRP requirement or stock: {', '.join(r['not_in_mrp'][:20])}{' …' if len(r['not_in_mrp'])>20 else ''}")
+
+            def _status_style(row):
+                s=str(row.get("Status",row.get("PO Status","")))
+                bg="#fef2f2" if "🔴" in s else "#fff7ed" if ("🟠" in s or "⏰" in s) else "#f0fdf4" if ("🟢" in s or "✅" in s) else ""
+                return [f"background-color:{bg}" if bg else ""]*len(row)
+            num_fmt={c:"{:,.0f}" for c in ["Stock","Total Requirement","Open PO Qty","PO in horizon","Closing Balance",
+                                          "Max Shortage","Additional PO Needed","PO Qty"]}
+
+            t1,t2,t3,t4=st.tabs(["🔴 Shortage list","📋 Coverage list","📅 Month-wise balance","🚢 PO status"])
+            with t1:
+                if short.empty: st.success("No import part goes short within the MRP horizon. 🎉")
+                else:
+                    cols=["Import Part","Description","Stock","Total Requirement","Open PO Qty","First Shortage Month",
+                          "Max Shortage","Additional PO Needed","Next ETA","Status"]
+                    sdf=short.sort_values(["First Shortage Month","Max Shortage"],
+                                          key=lambda s:s.map({m:i for i,m in enumerate(months)}) if s.name=="First Shortage Month" else -s)[cols]
+                    st.dataframe(sdf.style.apply(_status_style,axis=1).format({k:v for k,v in num_fmt.items() if k in cols}),
+                                 use_container_width=True,hide_index=True)
+            with t2:
+                sf_opt=st.multiselect("Filter status",sorted(summ["Status"].unique()),key="imp_st_f")
+                q=st.text_input("Search part",key="imp_q",placeholder="Part code or description").strip().lower()
+                cdf=summ.copy()
+                if sf_opt: cdf=cdf[cdf["Status"].isin(sf_opt)]
+                if q: cdf=cdf[cdf["Import Part"].str.lower().str.contains(q,regex=False)|cdf["Description"].str.lower().str.contains(q,regex=False)]
+                cols=["Import Part","Description","Stock","Total Requirement","Open PO Qty","PO in horizon","Closing Balance",
+                      "Coverage w/o PO (months)","Coverage (months)","Covered till","First Shortage Month","Next ETA","Status"]
+                st.dataframe(cdf[cols].style.apply(_status_style,axis=1).format({k:v for k,v in num_fmt.items() if k in cols}),
+                             use_container_width=True,hide_index=True)
+                st.caption(f"Coverage (months) counts consecutive MRP months from {months[0]} with no shortage, using stock + PO arrivals by ETA.")
+            with t3:
+                cl=r["closing"]
+                if not cl.empty:
+                    def _neg_red(v):
+                        return "color:#dc2626;font-weight:600;background-color:#fef2f2" if isinstance(v,(int,float)) and v<0 else ""
+                    mc=[m for m in months if m in cl.columns]
+                    st.dataframe(cl.style.apply(lambda c:[_neg_red(v) for v in c],subset=mc).format({m:"{:,.0f}" for m in mc}),
+                                 use_container_width=True,hide_index=True)
+                    st.caption("Closing balance per month = Stock + cumulative PO arrivals − cumulative requirement · negative = shortage")
+                sec("Part drill-down")
+                sel=st.selectbox("Import part",summ["Import Part"].tolist(),key="imp_sel")
+                if sel:
+                    pj=r["projection"]; pj=pj[pj["Import Part"]==sel][["Month","Opening","PO Arrival","Requirement","Closing","Shortage"]]
+                    st.dataframe(pj.style.apply(lambda c:[_neg_red(v) for v in c],subset=["Closing"]).format({c:"{:,.0f}" for c in ["Opening","PO Arrival","Requirement","Closing","Shortage"]}),
+                                 use_container_width=True,hide_index=True)
+                    st.bar_chart(pj.set_index("Month")[["Closing"]],use_container_width=True,height=240)
+                    pos=r["po_status"]; pos=pos[pos["Import Part"]==sel]
+                    if not pos.empty: st.dataframe(pos.drop(columns=["Import Part","Description"]),use_container_width=True,hide_index=True)
+            with t4:
+                pos=r["po_status"]
+                only_late=st.checkbox("Show only late POs",key="imp_late")
+                if only_late: pos=pos[pos["PO Status"].str.contains("Late")]
+                st.dataframe(pos.rename(columns={"PO Status":"Status"}).style.apply(_status_style,axis=1)
+                             .format({"PO Qty":"{:,.0f}"}),use_container_width=True,hide_index=True)
+                st.caption("Needed by = first month the part goes short using stock + earlier-ETA POs only. Late = PO lands after that month.")
+
+            buf=io.BytesIO()
+            with pd.ExcelWriter(buf,engine="openpyxl") as w:
+                summ[summ["Max Shortage"]>0].to_excel(w,sheet_name="Shortage List",index=False)
+                summ.to_excel(w,sheet_name="Coverage List",index=False)
+                r["closing"].to_excel(w,sheet_name="Month-wise Balance",index=False)
+                r["projection"].to_excel(w,sheet_name="Projection Detail",index=False)
+                r["po_status"].to_excel(w,sheet_name="PO Status",index=False)
+            buf.seek(0)
+            st.download_button("⬇ Download import_coverage.xlsx",data=buf,file_name="import_coverage.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True,type="primary")
+
+
+# ═══════════════════════════════════════════════════════════════
 elif st.session_state["page"] == "settings":
     topbar("Settings", "Engine configuration and session management")
 
@@ -2642,6 +2959,7 @@ elif st.session_state["page"] == "settings":
     st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
     if st.button("🗑 Clear all session data",key="clr"):
         for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes",
-                  "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_rec"]:
+                  "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_rec",
+                  "_imp_po","imp_results"]:
             st.session_state[k]=None
         st.success("Session cleared."); st.rerun()
