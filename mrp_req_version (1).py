@@ -1877,10 +1877,14 @@ def create_import_po_template():
     wb=Workbook(); ws=wb.active; ws.title="Import PO"
     hdr=["Import Part","Description","PO No","Supplier","PO Qty","ETD","ETA","Arrival Month (auto)","Arrival Week (auto)"]
     ws.append(hdr)
-    rows=[("0010748458","Compressor Rotary 1.5T","4500012345","Supplier A",1200,date(2026,9,1),date(2026,10,6)),
-          ("0010748458","Compressor Rotary 1.5T","4500012399","Supplier A",800,date(2026,10,1),date(2026,11,18)),
-          ("0010300601","Inverter PCB Assy","4500012410","Supplier B",1500,date(2026,9,12),date(2026,10,24)),
-          ("0010748814","BLDC Fan Motor","4500012433","Supplier C",600,date(2026,10,3),None)]
+    # Example rows: Oct–Dec, every arrival week used (Part, Desc, PO No, Supplier, Qty, ETD, ETA)
+    C=("0010748458","Compressor Rotary 1.5T","Supplier A"); P=("0010300601","Inverter PCB Assy","Supplier B")
+    M=("0010748814","BLDC Fan Motor","Supplier C")
+    ex=[(C,"4500012345",1200,(9,1),(10,6)), (P,"4500012410",1500,(9,5),(10,10)), (M,"4500012433",600,(9,14),(10,17)),
+        (C,"4500012399",800,(9,20),(10,24)), (P,"4500012455",1000,(10,2),(11,4)), (M,"4500012470",700,(10,8),(11,12)),
+        (C,"4500012488",1500,(10,15),(11,19)), (P,"4500012502",900,(10,22),(11,27)), (M,"4500012519",500,(11,1),(12,3)),
+        (C,"4500012530",1000,(11,6),(12,9)), (P,"4500012547",1200,(11,13),(12,16)), (M,"4500012560",400,(11,24),None)]
+    rows=[(i[0],i[1],po,i[2],q,date(2026,*etd),date(2026,*eta) if eta else None) for i,po,q,etd,eta in ex]
     thin=Side(style="thin",color="BFBFBF"); bd=Border(thin,thin,thin,thin)
     grey=PatternFill("solid",fgColor="F2F2F2"); N=200
     for r in range(2,N+2):
@@ -1909,14 +1913,14 @@ def create_import_po_template():
     lines=[("How to fill the Import PO template",True),("",False),
      ("One row per PO line (the same part can have many rows / POs).",False),
      ("Red headers are required: Import Part, PO Qty, and ETA (or ETD if ETA not known yet).",False),
-     ("Blue text = your inputs. Replace the 4 example rows with your data.",False),
+     ("Blue text = your inputs. Replace the example rows (Oct-Dec, all 4 weeks) with your data.",False),
      ("Grey columns (Arrival Month / Week) are formulas for your reference only - the app works them out itself.",False),
      ("",False),("Columns",True),
      ("Import Part - material code as in BOM / Stock (column is text, so leading zeros are kept).",False),
      ("Description / PO No / Supplier - optional, shown in reports.",False),
      ("PO Qty - open quantity still to arrive (do not include already-received qty).",False),
      ("ETD - dispatch date from supplier.",False),
-     ("ETA - arrival date at plant. If blank, the app uses ETD + Transit days (default 30).",False),
+     ("ETA - arrival date at plant. If blank, the app uses ETD + Transit days (default 30) - see last example row.",False),
      ("",False),("Arrival Week rule (week of the ETA month)",True),
      ("Day 1-7 = WK01 | Day 8-14 = WK02 | Day 15-21 = WK03 | Day 22-31 = WK04",False),
      ("ETA before the first MRP month = counted in first month WK01. ETA after the last MRP month = ignored.",False),
