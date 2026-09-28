@@ -1102,6 +1102,62 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
                 skipped_segs=skipped,rm_map=rm_map,active_rm_groups=active_rm)
 
 
+def segment_monthwise(seg_r, mrp_r, basis="max"):
+    """Month-wise set rollover per FG: Available(m) = Balance(m-1); Balance = max(0, Available − Req); Shortfall = max(0, Req − Available).
+    basis="max": opening sets = LP Max Sets shown above.
+    basis="req": re-run LP with each FG capped at its total horizon requirement so material goes to demanded FGs first."""
+    months=list(mrp_r["months"]); req=mrp_r["req"].copy()
+    req["BOM Header"]=req["BOM Header"].astype(str).str.strip()
+    mcols=[m for m in months if m in req.columns]
+    req_by_hdr=req.groupby("BOM Header")[mcols].sum() if mcols else pd.DataFrame()
+    hdrs=set(req_by_hdr.index)
+    fg_res=seg_r["fg_results"]
+
+    # Requirement per FG: match on FG code, else IDU code (ODU is shared across sets, so not used)
+    fg_req={}; fg_src={}
+    for f in fg_res:
+        for lbl,code in [("FG",f["FG_Code"]),("IDU",f["IDU"])]:
+            if code in hdrs:
+                fg_req[f["FG_Code"]]={m:float(req_by_hdr.at[code,m]) for m in mcols}; fg_src[f["FG_Code"]]=lbl; break
+        else:
+            fg_req[f["FG_Code"]]={m:0.0 for m in mcols}; fg_src[f["FG_Code"]]="Not in Req"
+
+    opening={f["FG_Code"]:int(f["Max_Sets"]) for f in fg_res}
+    if basis=="req" and fg_res:
+        fgs=[f["FG_Code"] for f in fg_res]; stock=seg_r["stock"]
+        parts=sorted({p for f in fg_res for p in f["combined_req"]})
+        A=np.array([[f["combined_req"].get(p,0) for f in fg_res] for p in parts],dtype=float)
+        b=np.array([float(stock.get(p,0)) for p in parts],dtype=float)
+        ub=[sum(fg_req[fg].values()) for fg in fgs]
+        res=linprog(-np.ones(len(fgs)),A_ub=A if len(parts) else None,b_ub=b if len(parts) else None,
+                    bounds=[(0,u) for u in ub],method="highs")
+        if res.status in (0,1): opening=dict(zip(fgs,np.floor(res.x+1e-9).astype(int).tolist()))
+
+    rows=[]
+    for f in fg_res:
+        fg=f["FG_Code"]; avail=float(opening[fg])
+        for m in mcols:
+            rq=fg_req[fg][m]; bal=max(0.0,avail-rq); sf=max(0.0,rq-avail)
+            rows.append({"Segment":f["Segment"],"FG Code":fg,"FG Description":f.get("FG_Desc",""),
+                         "Req matched on":fg_src[fg],"Month":m,"Sets Available":avail,"Requirement":rq,
+                         "Balance c/f":bal,"Net Shortfall":sf})
+            avail=bal
+    return pd.DataFrame(rows),mcols
+
+def monthwise_wide(long_df,keys,mcols):
+    """Wide table: per month → Available | Req | Balance | Shortfall columns, plus totals."""
+    g=long_df.groupby(keys+["Month"],as_index=False)[["Sets Available","Requirement","Balance c/f","Net Shortfall"]].sum()
+    out=g[keys].drop_duplicates().reset_index(drop=True)
+    for m in mcols:
+        gm=g[g["Month"]==m].drop(columns="Month").rename(columns={
+            "Sets Available":f"{m} | Available","Requirement":f"{m} | Req",
+            "Balance c/f":f"{m} | Balance","Net Shortfall":f"{m} | Shortfall"})
+        out=out.merge(gm,on=keys,how="left")
+    out["Total Req"]=out[[f"{m} | Req" for m in mcols]].sum(axis=1)
+    out["Total Shortfall"]=out[[f"{m} | Shortfall" for m in mcols]].sum(axis=1)
+    return out.fillna(0)
+
+
 # ═══════════════════════════════════════════════════════════════
 # AGING ENGINE
 # ═══════════════════════════════════════════════════════════════
@@ -2290,6 +2346,63 @@ elif st.session_state["page"] == "segment":
             def hs(row): return ["background-color:#f0fdf4"]*len(row) if row["Total Sets"]>0 else ["background-color:#f9fafb"]*len(row)
             st.dataframe(sdf.style.apply(hs,axis=1).format({"Total Sets":"{:,}"}),use_container_width=True,hide_index=True)
 
+            sec("Month-wise sets vs requirement")
+            if fg_res:
+                st.session_state["_seg_mw_export"]=None
+                bcol,_=st.columns([2,3])
+                with bcol:
+                    basis=st.radio("Opening sets basis",["Max Sets (as above)","Aligned to requirement"],horizontal=True,key="seg_mw_basis",
+                                   help="Max Sets: LP maximum total sets (may give sets to FGs with no demand). "
+                                        "Aligned: LP re-run with each FG capped at its total requirement, so material goes to FGs that have demand.")
+                mw,mw_months=segment_monthwise(r,mrp_r,"req" if basis.startswith("Aligned") else "max")
+                if mw.empty or not mw_months:
+                    st.info("No month-wise requirement found in the MRP Requirement sheet.")
+                else:
+                    t_req=mw["Requirement"].sum(); t_sf=mw["Net Shortfall"].sum()
+                    t_open=mw[mw["Month"]==mw_months[0]]["Sets Available"].sum()
+                    q1,q2,q3,q4=st.columns(4)
+                    q1.metric(f"Sets available ({mw_months[0]})",f"{t_open:,.0f}")
+                    q2.metric("Total requirement",f"{t_req:,.0f}")
+                    q3.metric("Total net shortfall",f"{t_sf:,.0f}")
+                    q4.metric("FGs with shortfall",f"{mw[mw['Net Shortfall']>0]['FG Code'].nunique()} / {mw['FG Code'].nunique()}")
+                    nm=mw.drop_duplicates("FG Code")
+                    nmc=(nm["Req matched on"]=="Not in Req").sum()
+                    if nmc: st.caption(f"⚠ {nmc} FG code(s) not found in the Requirement sheet (by FG or IDU code) — treated as zero requirement.")
+                    st.caption("Available (month) = Balance carried from previous month · Balance = Available − Req (min 0) · Shortfall = Req − Available (min 0)")
+
+                    def _mw_style(df):
+                        sty=pd.DataFrame("",index=df.index,columns=df.columns)
+                        for c in df.columns:
+                            if c.endswith("| Shortfall") or c=="Total Shortfall":
+                                sty[c]=["color:#dc2626;font-weight:600;background-color:#fef2f2" if v>0 else "color:#15803d" for v in df[c]]
+                            elif c.endswith("| Balance"): sty[c]="background-color:#f0fdf4"
+                        return sty
+                    seg_w=monthwise_wide(mw,["Segment"],mw_months).sort_values("Total Req",ascending=False)
+                    tot={"Segment":"TOTAL",**{c:seg_w[c].sum() for c in seg_w.columns if c!="Segment"}}
+                    seg_w=pd.concat([seg_w,pd.DataFrame([tot])],ignore_index=True)
+                    fg_w=monthwise_wide(mw,["Segment","FG Code","FG Description","Req matched on"],mw_months) \
+                           .sort_values(["Segment","Total Shortfall"],ascending=[True,False])
+                    numc=lambda d:{c:"{:,.0f}" for c in d.columns if "|" in c or c.startswith("Total")}
+                    sw1,sw2,sw3=st.tabs(["Segment-wise","FG-wise","Single FG / segment view"])
+                    with sw1:
+                        st.dataframe(seg_w.style.apply(_mw_style,axis=None).format(numc(seg_w)),use_container_width=True,hide_index=True)
+                    with sw2:
+                        only_sf=st.checkbox("Show only FGs with shortfall",key="seg_mw_sf")
+                        fv=fg_w[fg_w["Total Shortfall"]>0] if only_sf else fg_w
+                        st.dataframe(fv.style.apply(_mw_style,axis=None).format(numc(fv)),use_container_width=True,hide_index=True)
+                    with sw3:
+                        v1,v2=st.columns(2)
+                        with v1: vseg=st.selectbox("Segment",["All"]+sorted(mw["Segment"].unique()),key="seg_mw_seg")
+                        sub=mw if vseg=="All" else mw[mw["Segment"]==vseg]
+                        with v2: vfg=st.selectbox("FG code",["All"]+sorted(sub["FG Code"].unique()),key="seg_mw_fg")
+                        if vfg!="All": sub=sub[sub["FG Code"]==vfg]
+                        one=sub.groupby("Month",as_index=False,sort=False)[["Sets Available","Requirement","Balance c/f","Net Shortfall"]].sum()
+                        st.dataframe(one.style.apply(lambda c:["color:#dc2626;font-weight:600" if v>0 else "" for v in c],subset=["Net Shortfall"])
+                                     .format({c:"{:,.0f}" for c in ["Sets Available","Requirement","Balance c/f","Net Shortfall"]}),
+                                     use_container_width=True,hide_index=True)
+                        st.line_chart(one.set_index("Month")[["Sets Available","Requirement"]],use_container_width=True,height=240)
+                    st.session_state["_seg_mw_export"]=(seg_w,fg_w,mw)
+
             sec("FG detail — import part breakdown")
             opts=sorted([f["FG_Code"] for f in fg_res],key=lambda fg:-next(f["Max_Sets"] for f in fg_res if f["FG_Code"]==fg))
             sfg=st.selectbox("Select FG code",options=opts,key="sfg")
@@ -2325,6 +2438,11 @@ elif st.session_state["page"] == "segment":
                 if fg_res: fgdf.to_excel(w,sheet_name="FG Sets",index=False)
                 sdf.to_excel(w,sheet_name="Segment Rollup",index=False)
                 pudf.to_excel(w,sheet_name="Import Part Utilisation",index=False)
+                _mwx=st.session_state.get("_seg_mw_export")
+                if fg_res and _mwx:
+                    _mwx[0].to_excel(w,sheet_name="Monthwise Segment",index=False)
+                    _mwx[1].to_excel(w,sheet_name="Monthwise FG",index=False)
+                    _mwx[2].to_excel(w,sheet_name="Monthwise Detail",index=False)
             buf.seek(0)
             st.download_button("⬇ Download Segment Capacity (.xlsx)",data=buf,file_name="segment_capacity.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,type="primary")
