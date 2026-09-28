@@ -471,7 +471,27 @@ def standardize_req_header(v):
     s=str(v).strip()
     return {"alt.":"Alt","alternative":"Alt","bom header":"BOM Header"}.get(s.lower(),s)
 
+def resolve_sheet(src, wanted):
+    """Return the real sheet name in `src` matching `wanted` ignoring case/extra spaces.
+    Falls back to `wanted` unchanged (so behaviour is identical when names already match)."""
+    try:
+        if isinstance(src, (bytes, bytearray)): bio = io.BytesIO(src)
+        else:
+            pos = src.tell() if hasattr(src, "tell") else None
+            bio = src
+        names = pd.ExcelFile(bio).sheet_names
+        if not isinstance(src, (bytes, bytearray)) and pos is not None: src.seek(pos)
+        key = str(wanted).strip().lower()
+        for n in names:
+            if str(n).strip().lower() == key: return n
+    except Exception:
+        try:
+            if not isinstance(src, (bytes, bytearray)) and pos is not None: src.seek(pos)
+        except Exception: pass
+    return wanted
+
 def detect_req_header_row(file_obj,sheet_name="Requirement",scan_rows=20):
+    sheet_name=resolve_sheet(file_obj,sheet_name)
     raw=pd.read_excel(file_obj,sheet_name=sheet_name,header=None,nrows=scan_rows)
     best_row,best_score=0,-1
     for i in range(len(raw)):
@@ -500,6 +520,182 @@ def load_receipt_qty(f):
         df[qc]=pd.to_numeric(df[qc].astype(str).str.replace(",","",regex=False).str.strip(),errors="coerce").fillna(0)
         return df.groupby(mc)[qc].sum()
     except: return pd.Series(dtype=float)
+
+
+# ═══════════════════════════════════════════════════════════════
+# FLEXIBLE COLUMN NAME DETECTION (NEW - HANDLES VARIATIONS)
+# ═══════════════════════════════════════════════════════════════
+
+def normalize_column_name(col_name):
+    """Convert any column name to standard format"""
+    s = str(col_name).strip().lower()
+    
+    # BOM Header variations
+    if any(x in s for x in ["bom", "model", "header", "product"]):
+        if any(x in s for x in ["header", "desc", "description", "name"]):
+            return "BOM Header Desc"
+        return "BOM Header"
+    
+    # Alternative variations
+    if any(x in s for x in ["alt", "variant", "version"]):
+        return "Alt"
+    
+    # Level variations
+    if "level" in s or "lvl" in s:
+        return "Level"
+    
+    # Parent variations
+    if "parent" in s or "assembly" in s:
+        return "Parent"
+    
+    # Component variations
+    if "component" in s or "part" in s or "material" in s or "mat" in s or "part number" in s or "partnum" in s:
+        if any(x in s for x in ["desc", "description", "name"]):
+            return "Component descriptio"
+        return "Component"
+    
+    # Quantity variations
+    if any(x in s for x in ["qty", "quantity", "required", "req"]):
+        if "base" in s or "unit" in s:
+            return "Base unit"
+        return "Required Qty"
+    
+    # Procurement variations
+    if any(x in s for x in ["procurement", "special", "sp code", "type"]):
+        if "special" in s or "sp" in s:
+            return "Special procurement"
+        return "Procurement type"
+    
+    # Stock variations
+    if any(x in s for x in ["stock", "inventory", "qty on hand", "opening"]):
+        return "Stock"
+    
+    # Path variations
+    if "path" in s:
+        return "Path"
+    
+    # Return original if no match
+    return col_name
+
+def auto_map_columns(df, required_cols):
+    """
+    Automatically map user's column names to standard names
+    
+    Parameters:
+    df: DataFrame with user's columns
+    required_cols: List of required standard column names
+    
+    Returns:
+    df with renamed columns, mapping dict
+    """
+    # Create mapping from current columns to standard names
+    mapping = {}
+    matched = set()
+    
+    # First pass: exact matches
+    for col in df.columns:
+        normalized = normalize_column_name(col)
+        if normalized in required_cols and normalized not in matched:
+            mapping[col] = normalized
+            matched.add(normalized)
+    
+    # Second pass: fuzzy matching for unmapped required columns
+    for req_col in required_cols:
+        if req_col not in matched:
+            # Try to find best match by similar keywords
+            for col in df.columns:
+                if col not in mapping:
+                    norm = normalize_column_name(col)
+                    # If normalized name contains same keywords as required
+                    if req_col.lower() in norm.lower() or norm.lower() in req_col.lower():
+                        mapping[col] = req_col
+                        matched.add(req_col)
+                        break
+    
+    # Apply mapping
+    df_mapped = df.rename(columns=mapping)
+    
+    return df_mapped, mapping
+
+def verify_bom_columns(df):
+    """
+    Verify and auto-fix BOM DataFrame
+    Handles flexible column names
+    """
+    required = ["BOM Header", "Level", "Component", "Required Qty"]
+    
+    # Auto-map columns
+    df, mapping = auto_map_columns(df, required)
+    
+    # Check for missing required columns
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return None, f"Missing columns: {', '.join(missing)}"
+    
+    # Auto-rename/create optional columns that might be named differently
+    optional_mappings = {
+        "BOM Header Desc": ["BOM Header Desc", "BOM Header Description", "Model Description", "Description"],
+        "Alt": ["Alt", "Alt.", "Alternative", "Variant", "Version"],
+        "Component descriptio": ["Component descriptio", "Component Description", "Component Desc", "Part Description"],
+        "Special procurement": ["Special procurement", "SP Code", "Procurement Type", "Type"],
+        "Base unit": ["Base unit", "Unit", "UOM"],
+        "Parent": ["Parent", "Parent Component", "Assembly"],
+        "Path": ["Path", "Component Path"],
+        "Procurement type": ["Procurement type", "Procurement Type"]
+    }
+    
+    # Try to map optional columns
+    for standard_name, variants in optional_mappings.items():
+        if standard_name not in df.columns:
+            for col in df.columns:
+                norm = normalize_column_name(col)
+                if norm == standard_name and col != standard_name:
+                    df = df.rename(columns={col: standard_name})
+                    break
+    
+    return df, None
+
+def verify_requirement_columns(df):
+    """
+    Verify and auto-fix Requirement DataFrame
+    Handles flexible column names
+    """
+    required = ["BOM Header"]
+    
+    # Auto-map columns
+    df, mapping = auto_map_columns(df, required)
+    
+    if "BOM Header" not in df.columns:
+        return None, "BOM Header column not found"
+    
+    # Try to find Alt column
+    if "Alt" not in df.columns:
+        for col in df.columns:
+            if normalize_column_name(col) == "Alt":
+                df = df.rename(columns={col: "Alt"})
+                break
+    
+    # Ensure Alt exists
+    if "Alt" not in df.columns:
+        df.insert(1, "Alt", "A")  # Default to "A"
+    
+    return df, None
+
+def verify_stock_columns(df):
+    """
+    Verify and auto-fix Stock DataFrame
+    Handles flexible column names
+    """
+    required = ["Component", "Stock"]
+    
+    # Auto-map columns
+    df, mapping = auto_map_columns(df, required)
+    
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return None, f"Missing columns: {', '.join(missing)}"
+    
+    return df, None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -608,6 +804,13 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
 
     with status: st.write("► Building BOM ...")
     bom=pd.read_excel(io.BytesIO(bom_bytes)); bom.columns=bom.columns.str.strip()
+    
+    # NEW: Use flexible column detection
+    bom, bom_error = verify_bom_columns(bom)
+    if bom_error:
+        st.error(f"BOM Error: {bom_error}"); 
+        return None
+    
     if "Alt." in bom.columns: bom=bom.rename(columns={"Alt.":"Alt"})
     bom["Level"]=pd.to_numeric(bom["Level"],errors="coerce").fillna(0).astype(int)
     bom=bom.reset_index(drop=True)
@@ -621,8 +824,6 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     for old,new in [("Component description","Component descriptio"),("BOM header description","BOM header descripti")]:
         if old in bom.columns: bom=bom.rename(columns={old:new})
     keep=["BOM Header","BOM header descripti","Alt","Level","Path","Parent","Component","Component descriptio","Required Qty","Base unit","Procurement type","Special procurement"]
-    missing=[c for c in ["BOM Header","Level","Component","Required Qty"] if c not in bom.columns]
-    if missing: st.error(f"Missing BOM columns: {missing}"); return None
     bom=bom[[c for c in keep if c in bom.columns]].copy()
     for col,default in [("Alt","0"),("Special procurement",""),("Procurement type",""),("Component descriptio","")]:
         if col not in bom.columns: bom[col]=default
@@ -637,12 +838,19 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     with status: st.write("► Loading Req & Stock ...")
     req_f=io.BytesIO(req_bytes)
     hrrow=detect_req_header_row(req_f,sheet_name="Requirement"); req_f.seek(0)
-    req=pd.read_excel(req_f,sheet_name="Requirement",header=None)
+    req_f.seek(0); _req_sh=resolve_sheet(req_f,"Requirement"); req_f.seek(0)
+    req=pd.read_excel(req_f,sheet_name=_req_sh,header=None)
     req.columns=[standardize_req_header(x) for x in req.iloc[hrrow].tolist()]
     req=req.iloc[hrrow+1:].reset_index(drop=True)
     req=req.loc[:,[str(c).strip()!="" for c in req.columns]]
     req=req.loc[:,~pd.Index(req.columns).duplicated(keep="first")]
-    if "BOM Header" not in req.columns: st.error("BOM Header column missing in Req file."); return None
+    
+    # NEW: Use flexible column detection for requirement
+    req, req_error = verify_requirement_columns(req)
+    if req_error:
+        st.error(f"Requirement Error: {req_error}"); 
+        return None
+    
     req["BOM Header"]=req["BOM Header"].astype(str).str.strip()
     req["Alt"]=pd.to_numeric(req.get("Alt",pd.Series(["0"]*len(req))),errors="coerce").fillna(0).astype(int).astype(str)
     parsed=parse_all_month_cols(req.columns.tolist(),{"BOM Header","Alt"})
@@ -653,8 +861,8 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     for m in months:
         col_data=safe_series(req,m)
         req[m]=pd.to_numeric(col_data.astype(str).str.replace(",","",regex=False).str.strip(),errors="coerce").fillna(0)
-    req_f.seek(0)
-    stock_raw=pd.read_excel(req_f,sheet_name="Stock",usecols=[0,1],header=0,names=["Component","Stock_Qty"])
+    req_f.seek(0); _stk_sh=resolve_sheet(req_f,"Stock"); req_f.seek(0)
+    stock_raw=pd.read_excel(req_f,sheet_name=_stk_sh,usecols=[0,1],header=0,names=["Component","Stock_Qty"])
     stock_raw=stock_raw.dropna(subset=["Component"]).copy()
     stock_raw["Component"]=stock_raw["Component"].astype(str).str.strip()
     stock_raw["Stock_Qty"]=pd.to_numeric(stock_raw["Stock_Qty"].astype(str).str.replace(",","",regex=False).str.strip(),errors="coerce").fillna(0)
@@ -969,6 +1177,7 @@ def compute_bom_consumption(bom_bytes, req_bytes, phantom_code="50"):
         return {"alt.": "Alt", "alternative": "Alt", "bom header": "BOM Header"}.get(s.lower(), s)
 
     def _detect_hrow(f_bytes, sheet="Requirement", scan=20):
+        sheet = resolve_sheet(f_bytes, sheet)
         raw = pd.read_excel(io.BytesIO(f_bytes), sheet_name=sheet, header=None, nrows=scan)
         best_r, best_s = 0, -1
         for i in range(len(raw)):
@@ -1003,7 +1212,7 @@ def compute_bom_consumption(bom_bytes, req_bytes, phantom_code="50"):
 
     # ── Requirement ───────────────────────────────────────────────
     hrrow = _detect_hrow(req_bytes)
-    req   = pd.read_excel(io.BytesIO(req_bytes), sheet_name="Requirement", header=None)
+    req   = pd.read_excel(io.BytesIO(req_bytes), sheet_name=resolve_sheet(req_bytes, "Requirement"), header=None)
     req.columns = [_std(x) for x in req.iloc[hrrow].tolist()]
     req   = req.iloc[hrrow + 1:].reset_index(drop=True)
     req   = req.loc[:, [str(c).strip() != "" for c in req.columns]]
@@ -2268,7 +2477,7 @@ elif st.session_state["page"] == "plan":
     else:
         # ── Load & parse requirement sheet ────────────────────
         import io as _io
-        raw = pd.read_excel(_io.BytesIO(req_bytes), sheet_name="Requirement", header=None)
+        raw = pd.read_excel(_io.BytesIO(req_bytes), sheet_name=resolve_sheet(req_bytes, "Requirement"), header=None)
         raw.columns = [str(c).strip() for c in raw.iloc[0].tolist()]
         raw = raw.iloc[1:].reset_index(drop=True)
 
