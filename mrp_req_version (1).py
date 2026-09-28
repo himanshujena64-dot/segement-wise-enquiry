@@ -1145,13 +1145,22 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
     if not fg_res or not mcols: return pd.DataFrame(),mcols
 
     # Requirement per FG: match on FG code, else IDU code (ODU is shared across sets, so not used)
-    fg_req={}; fg_src={}
+    fg_req={}; fg_src={}; fg_alt={}
+    req["_tot"]=req[mcols].sum(axis=1)
+    bom=mrp_r["bom"]
+    def _alts(code):
+        a=req[(req["BOM Header"]==code)&(req["_tot"]>0)]["Alt"].astype(str).unique().tolist() or \
+          req[req["BOM Header"]==code]["Alt"].astype(str).unique().tolist()
+        return ", ".join(sorted(a,key=lambda x:(len(x),x)))
     for f in fg_res:
         for lbl,code in [("FG",f["FG_Code"]),("IDU",f["IDU"])]:
             if code in hdrs:
-                fg_req[f["FG_Code"]]={m:float(req_by_hdr.at[code,m]) for m in mcols}; fg_src[f["FG_Code"]]=lbl; break
+                fg_req[f["FG_Code"]]={m:float(req_by_hdr.at[code,m]) for m in mcols}; fg_src[f["FG_Code"]]=lbl
+                fg_alt[f["FG_Code"]]=_alts(code); break
         else:
             fg_req[f["FG_Code"]]={m:0.0 for m in mcols}; fg_src[f["FG_Code"]]="Not in Req"
+            ba=sorted(bom[bom["BOM Header"]==f["IDU"]]["Alt"].astype(str).unique().tolist())
+            fg_alt[f["FG_Code"]]=ba[0] if ba else ""  # alt used by the segment BOM explosion
 
     fgs=[f["FG_Code"] for f in fg_res]; stock=seg_r["stock"]
     parts=sorted({p for f in fg_res for p in f["combined_req"]})
@@ -1185,7 +1194,7 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
             rq=fg_req[fg][m]; have=avail+tot_arr
             bal=max(0.0,have-rq); sf=max(0.0,rq-have)
             rows.append({"Segment":f["Segment"],"FG Code":fg,"FG Description":f.get("FG_Desc",""),
-                         "Req matched on":fg_src[fg],"Month":m,"Sets Available":avail,"Requirement":rq,
+                         "Alt BOM":fg_alt[fg],"Req matched on":fg_src[fg],"Month":m,"Sets Available":avail,"Requirement":rq,
                          **{w:wk[w] for w in WEEKS},"Arrival Sets":tot_arr,
                          "Balance c/f":bal,"Net Shortfall":sf})
             avail=bal
@@ -2521,9 +2530,9 @@ elif st.session_state["page"] == "segment":
                                "Balance = Available + Arrivals − Req (min 0) · Shortfall = Req − Available − Arrivals (min 0)")
 
                     seg_keys={"Segment":"Segment"}
-                    fg_keys={"Segment":"Segment","FG Description":"Model","FG Code":"Material code"}
+                    fg_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"Material code"}
                     seg_g=monthwise_grouped(mw,["Segment"],mw_months)
-                    fg_g=monthwise_grouped(mw,["Segment","FG Description","FG Code"],mw_months)
+                    fg_g=monthwise_grouped(mw,["Segment","Alt BOM","FG Description","FG Code"],mw_months)
                     fg_g=pd.concat([fg_g.iloc[:-1].sort_values(("","Segment"),kind="stable"),fg_g.iloc[-1:]],ignore_index=True)
                     sw1,sw2,sw3=st.tabs(["Segment-wise","Model-wise","Single FG / segment view"])
                     with sw1:
