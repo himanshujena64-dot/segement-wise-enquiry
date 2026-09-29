@@ -2946,7 +2946,7 @@ elif st.session_state["page"] == "segment":
                                    "(or its ⇄ interchange group) are shared by all FGs using it, in table order.")
                         o1,o2=st.columns(2)
                         with o1: only_fg=st.checkbox("Only FGs with a set shortfall",key="seg_mw_sf")
-                        with o2: comp_mode=st.radio("Component rows",["Short only","All"],horizontal=True,key="seg_mw_comp")
+                        with o2: comp_mode=st.radio("Component rows",["All","Short only"],horizontal=True,key="seg_mw_comp")
                         fv=fg_g
                         sfc=[c for c in fg_g.columns if c[1]=="Shortfall"]
                         keep=pd.Series(comp_mode=="All",index=fv.index) | (fv[sfc].sum(axis=1)>0)
