@@ -1344,40 +1344,37 @@ def component_monthwise(seg_r, mw, mcols):
         if sides[0][2] is None: sides=[("IDU+ODU",f"{f['IDU']} + {f['Compatible_ODU']}",f["combined_req"])]
         for side,hdr,rq in sides:
             for p,q in sorted((rq or {}).items()):
-                if q>0: lines.append((f["FG_Code"],f"{side}: {hdr}",p,pg.get(p,p),q,hdr_alt.get(hdr,"")))
+                if q>0: lines.append((f["FG_Code"],side,hdr,p,pg.get(p,p),q,hdr_alt.get(hdr,"")))
     lines.sort(key=lambda x:order.index(x[0]) if x[0] in order else 1e9)
     left={}; firsts=defaultdict(set); rows=[]
-    for k in {l[3] for l in lines}: left[k]=float(stock.get(k,0))
+    for k in {l[4] for l in lines}: left[k]=float(stock.get(k,0))
     for m in mcols:
         seen=set()
-        for fg,hdr,p,key,q,alt in lines:
+        for fg,side,hdr,p,key,q,alt in lines:
             av=left[key]
             wk={w:(float(arr.get(f"{key}|{m}|{w}",0.0)) if key not in seen else 0.0) for w in WEEKS}; seen.add(key)
             rq=float(fg_req.get(fg,{}).get(m,0.0))*q; tot=sum(wk.values())
             bal=max(0.0,av+tot-rq); sf=max(0.0,rq-av-tot); left[key]=bal
             mt=meta.loc[fg]
             rows.append({"Segment":mt["Segment"],"Alt BOM":alt,"FG Description":mt["FG Description"],"FG Code":fg,
-                         "IDU / ODU":hdr,"Component":p+(f"  ({key})" if key!=p else ""),"Key":key,"Qty / set":q,"Month":m,
+                         "Category":side,"IDU / ODU":hdr,"Component":p,"Key":key,"Qty / set":q,"Month":m,
                          "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf})
     return pd.DataFrame(rows)
 
-MODEL_KEYS={"Segment":"Segment","FG Description":"Model","FG Code":"FG Code","IDU / ODU":"IDU / ODU",
+MODEL_KEYS={"Segment":"Segment","FG Code":"FG Code","Category":"Category","IDU / ODU":"IDU / ODU",
             "Alt BOM":"Alt BOM","Component":"Component","Qty / set":"Qty / set","Unit":"Unit"}
 
 def model_with_components(mw, cmw):
-    """Long table for the Model-wise view: per FG one 'Sets' row (what can be built) followed by its import
-    component rows in pieces (which part is short, per BOM header)."""
+    """Long table for the Model + components view: per FG its import component rows in pieces
+    (which part is short, per BOM header). FG set totals are in the Model-wise (sets) tab."""
     num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall"]
     parts=[]
     comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["Month"]+num)
     if not comp.empty:
         comp["Qty / set"]=comp["Qty / set"].map(lambda v:f"{v:g}"); comp["Unit"]="Pcs"
     for fg in mw["FG Code"].drop_duplicates():
-        f=mw[mw["FG Code"]==fg].copy()
-        f["IDU / ODU"]="▶ Complete set"; f["Alt BOM"]=""; f["Component"]=""; f["Qty / set"]=""; f["Unit"]="Sets"
-        parts.append(f); parts.append(comp[comp["FG Code"]==fg])
+        parts.append(comp[comp["FG Code"]==fg])
     out=pd.concat(parts,ignore_index=True)
-    out["FG Description"]=out["FG Description"].fillna("")
     return out[list(MODEL_KEYS)+["Month"]+num]
 
 def component_shortage(cmw, mcols, arr, seg_r):
@@ -1389,7 +1386,7 @@ def component_shortage(cmw, mcols, arr, seg_r):
     pm=pretty_months(mcols)
     for key,g in cmw.groupby("Key",sort=False):
         codes=", ".join(members.get(key,[])) or key
-        hdrs=", ".join(sorted(g["IDU / ODU"].str.split(": ",n=1).str[-1].unique()))
+        hdrs=", ".join(sorted(g["IDU / ODU"].astype(str).unique()))
         fgs=", ".join(sorted(g["FG Code"].unique()))
         for m in mcols:
             gm=g[g["Month"]==m]
@@ -2944,21 +2941,20 @@ elif st.session_state["page"] == "segment":
                             body=fgo_g.iloc[:-1]; fgv=pd.concat([body[body[sfc].sum(axis=1)>0],fgo_g.iloc[-1:]],ignore_index=True)
                         st.markdown(grouped_table_html(fgv,fgo_keys),unsafe_allow_html=True)
                     with sw2:
-                        st.caption("Blue row = complete sets of the FG you can make (all components together). Rows under it = each import "
-                                   "component per BOM header (IDU / ODU) in pieces: Req = FG req × Qty/set; stock and PO arrivals of a component "
+                        st.caption("Each import component per BOM header (IDU / ODU) in pieces (complete sets per FG are in the Model-wise (sets) tab): "
+                                   "Req = FG req × Qty/set; stock and PO arrivals of a component "
                                    "(or its ⇄ interchange group) are shared by all FGs using it, in table order.")
                         o1,o2=st.columns(2)
                         with o1: only_fg=st.checkbox("Only FGs with a set shortfall",key="seg_mw_sf")
-                        with o2: comp_mode=st.radio("Component rows",["Short only","All","Hide"],horizontal=True,key="seg_mw_comp")
+                        with o2: comp_mode=st.radio("Component rows",["Short only","All"],horizontal=True,key="seg_mw_comp")
                         fv=fg_g
                         sfc=[c for c in fg_g.columns if c[1]=="Shortfall"]
-                        is_set=fv[("","Unit")]=="Sets"
-                        keep=is_set | (comp_mode=="All")
-                        if comp_mode=="Short only": keep=keep | (fv[sfc].sum(axis=1)>0)
+                        keep=pd.Series(comp_mode=="All",index=fv.index) | (fv[sfc].sum(axis=1)>0)
                         if only_fg:
-                            short_fg=set(fv[is_set & (fv[sfc].sum(axis=1)>0)][("","FG Code")])
+                            short_fg=set(mw[mw["Net Shortfall"]>0]["FG Code"])
                             keep=keep & fv[("","FG Code")].isin(short_fg)
-                        st.markdown(grouped_table_html(fv[keep],fg_keys),unsafe_allow_html=True)
+                        if not keep.any(): st.success("No component rows to show with these filters.")
+                        else: st.markdown(grouped_table_html(fv[keep],fg_keys),unsafe_allow_html=True)
                     with sw4:
                         if cs_g.empty: st.info("No import components found for these FGs.")
                         else:
