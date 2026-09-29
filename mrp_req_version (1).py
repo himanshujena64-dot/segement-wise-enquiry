@@ -1510,6 +1510,17 @@ def grouped_table_html(df,key_labels,freeze=()):
             '<table style="border-collapse:collapse;font-size:12px;font-family:\'Plus Jakarta Sans\',sans-serif;background:#fff;">'
             f"<thead>{h0}{h1}{h2}</thead><tbody>{body}</tbody></table></div>")
 
+def show_grouped_table(df,key_labels,freeze=()):
+    """Render the grouped table inside its own frame so every Streamlit version shows it exactly as built
+    (merged month headers, colours, pinned columns, sideways scroll) — st.markdown may strip the styling."""
+    import streamlit.components.v1 as components
+    html=grouped_table_html(df,key_labels,freeze=freeze)
+    h=min(600,3*30+len(df)*29+30)
+    components.html('<html><head><style>body{margin:0;font-family:"Plus Jakarta Sans","Segoe UI",Arial,sans-serif;}'
+                    'div::-webkit-scrollbar{height:10px;width:10px}div::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:5px}'
+                    '</style></head><body>'+html.replace("max-height:560px","max-height:590px")+'</body></html>',
+                    height=h,scrolling=False)
+
 def grouped_to_excel(w,df,sheet,key_labels):
     """Write the grouped table with merged month / 'Arrival Week' headers."""
     from openpyxl.styles import Alignment,Font,PatternFill,Border,Side
@@ -2948,14 +2959,14 @@ elif st.session_state["page"] == "segment":
                     sw1,sw5,sw2,sw4,sw3=st.tabs(["Segment-wise (sets)","Model-wise (sets)","Model + components (drill-down)",
                                                  "Component shortage & arrivals","Single FG / segment view"])
                     with sw1:
-                        st.markdown(grouped_table_html(seg_g,seg_keys,freeze=("Segment",)),unsafe_allow_html=True)
+                        show_grouped_table(seg_g,seg_keys,freeze=("Segment",))
                     with sw5:
                         only_fgo=st.checkbox("Show only models with shortfall",key="seg_fgo_sf")
                         fgv=fgo_g
                         if only_fgo:
                             sfc=[c for c in fgo_g.columns if c[1]=="Shortfall"]
                             body=fgo_g.iloc[:-1]; fgv=pd.concat([body[body[sfc].sum(axis=1)>0],fgo_g.iloc[-1:]],ignore_index=True)
-                        st.markdown(grouped_table_html(fgv,fgo_keys,freeze=("FG Code",)),unsafe_allow_html=True)
+                        show_grouped_table(fgv,fgo_keys,freeze=("FG Code",))
                     with sw2:
                         st.caption("Each import component per BOM header (IDU / ODU) in pieces (complete sets per FG are in the Model-wise (sets) tab): "
                                    "Req = FG req × Qty/set; stock and PO arrivals of a component "
@@ -2970,7 +2981,7 @@ elif st.session_state["page"] == "segment":
                             short_fg=set(mw[mw["Net Shortfall"]>0]["FG Code"])
                             keep=keep & fv[("","FG Code")].isin(short_fg)
                         if not keep.any(): st.success("No component rows to show with these filters.")
-                        else: st.markdown(grouped_table_html(fv[keep],fg_keys,freeze=("FG Code","Component")),unsafe_allow_html=True)
+                        else: show_grouped_table(fv[keep],fg_keys,freeze=("FG Code","Component"))
                     with sw4:
                         if cs_g.empty: st.info("No import components found for these FGs.")
                         else:
@@ -2982,7 +2993,7 @@ elif st.session_state["page"] == "segment":
                             if only_cs:
                                 sfc2=[c for c in cs_g.columns if c[1]=="Shortfall"]; cv=cs_g[cs_g[sfc2].sum(axis=1)>0]
                             if cv.empty: st.success("No import component is short in the horizon.")
-                            else: st.markdown(grouped_table_html(cv,cs_keys,freeze=("Component",)),unsafe_allow_html=True)
+                            else: show_grouped_table(cv,cs_keys,freeze=("Component",))
                     with sw3:
                         v1,v2=st.columns(2)
                         with v1: vseg=st.selectbox("Segment",["All"]+sorted(mw["Segment"].unique()),key="seg_mw_seg")
