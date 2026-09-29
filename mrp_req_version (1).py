@@ -2911,6 +2911,9 @@ elif st.session_state["page"] == "segment":
                     fg_keys=MODEL_KEYS
                     cs_keys={"Component":"Component","Codes":"Codes","Used in BOM headers":"Used in BOM headers","FG codes":"FG codes"}
                     seg_g=monthwise_grouped(mw,["Segment"],mw_months)
+                    fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code"}
+                    fgo_g=monthwise_grouped(mw,list(fgo_keys),mw_months)
+                    fgo_g=pd.concat([fgo_g.iloc[:-1].sort_values(("","Segment"),kind="stable"),fgo_g.iloc[-1:]],ignore_index=True)
                     cmw=component_monthwise(r,mw,mw_months)
                     mdl=model_with_components(mw,cmw)
                     fg_g=monthwise_grouped(mdl,list(fg_keys),mw_months,keep_order=True,total=False)
@@ -2920,7 +2923,8 @@ elif st.session_state["page"] == "segment":
                     with pd.ExcelWriter(_xb,engine="openpyxl") as _w:
                         pd.DataFrame({"Month-wise sets vs requirement":[f"Basis: {basis}",f"Months: {', '.join(pretty_months(mw_months).values())}"]}).to_excel(_w,sheet_name="Info",index=False)
                         grouped_to_excel(_w,seg_g,"Segment-wise",seg_keys)
-                        if not fg_g.empty: grouped_to_excel(_w,fg_g,"Model-wise",fg_keys)
+                        grouped_to_excel(_w,fgo_g,"Model-wise (sets)",fgo_keys)
+                        if not fg_g.empty: grouped_to_excel(_w,fg_g,"Model + components",fg_keys)
                         if not cs_g.empty:
                             cs_info.to_excel(_w,sheet_name="Component Shortage",index=False)
                             grouped_to_excel(_w,cs_g,"Component Monthwise",cs_keys)
@@ -2928,9 +2932,17 @@ elif st.session_state["page"] == "segment":
                     st.download_button("⬇ Download month-wise tables (.xlsx)",data=_xb,file_name="segment_monthwise.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                        type="primary",key="dl_seg_mw")
-                    sw1,sw2,sw4,sw3=st.tabs(["Segment-wise (sets)","Model-wise (sets + components)","Component shortage & arrivals","Single FG / segment view"])
+                    sw1,sw5,sw2,sw4,sw3=st.tabs(["Segment-wise (sets)","Model-wise (sets)","Model + components (drill-down)",
+                                                 "Component shortage & arrivals","Single FG / segment view"])
                     with sw1:
                         st.markdown(grouped_table_html(seg_g,seg_keys),unsafe_allow_html=True)
+                    with sw5:
+                        only_fgo=st.checkbox("Show only models with shortfall",key="seg_fgo_sf")
+                        fgv=fgo_g
+                        if only_fgo:
+                            sfc=[c for c in fgo_g.columns if c[1]=="Shortfall"]
+                            body=fgo_g.iloc[:-1]; fgv=pd.concat([body[body[sfc].sum(axis=1)>0],fgo_g.iloc[-1:]],ignore_index=True)
+                        st.markdown(grouped_table_html(fgv,fgo_keys),unsafe_allow_html=True)
                     with sw2:
                         st.caption("Blue row = complete sets of the FG you can make (all components together). Rows under it = each import "
                                    "component per BOM header (IDU / ODU) in pieces: Req = FG req × Qty/set; stock and PO arrivals of a component "
@@ -2970,7 +2982,7 @@ elif st.session_state["page"] == "segment":
                         st.dataframe(one.style.apply(lambda c:["color:#dc2626;font-weight:600" if v>0 else "" for v in c],subset=["Net Shortfall"])
                                      .format({c:"{:,.0f}" for c in cc}),use_container_width=True,hide_index=True)
                         st.line_chart(one.set_index("Month")[["Sets Available","Requirement"]],use_container_width=True,height=240)
-                    st.session_state["_seg_mw_export"]=(seg_g,fg_g,mw,seg_keys,fg_keys,cs_g,cs_keys,cs_info)
+                    st.session_state["_seg_mw_export"]=(seg_g,fg_g,mw,seg_keys,fg_keys,cs_g,cs_keys,cs_info,fgo_g,fgo_keys)
 
             sec("FG detail — import part breakdown")
             opts=sorted([f["FG_Code"] for f in fg_res],key=lambda fg:-next(f["Max_Sets"] for f in fg_res if f["FG_Code"]==fg))
@@ -3012,7 +3024,8 @@ elif st.session_state["page"] == "segment":
                 _mwx=st.session_state.get("_seg_mw_export")
                 if fg_res and _mwx:
                     grouped_to_excel(w,_mwx[0],"Monthwise Segment",_mwx[3])
-                    if not _mwx[1].empty: grouped_to_excel(w,_mwx[1],"Monthwise Model",_mwx[4])
+                    grouped_to_excel(w,_mwx[8],"Monthwise Model (sets)",_mwx[9])
+                    if not _mwx[1].empty: grouped_to_excel(w,_mwx[1],"Monthwise Model+Comp",_mwx[4])
                     if not _mwx[5].empty:
                         _mwx[7].to_excel(w,sheet_name="Component Shortage",index=False)
                         grouped_to_excel(w,_mwx[5],"Component Monthwise",_mwx[6])
