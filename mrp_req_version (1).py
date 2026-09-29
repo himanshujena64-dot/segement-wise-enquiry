@@ -321,6 +321,58 @@ for k, v in {
         st.session_state[k] = v
 
 # ═══════════════════════════════════════════════════════════════
+# SAVED UPLOADS — keep uploaded files on disk so they survive app restarts / redeploys during trials
+# ═══════════════════════════════════════════════════════════════
+import os, hashlib, datetime as _dt
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".saved_uploads")
+PERSIST_KEYS = {"_bom":"BOM", "_req":"Req & Stock", "_prod":"Production Orders", "_receipt":"Receipts",
+                "seg_imp_bytes":"Segment & Import Part", "_imp_po":"Import PO",
+                "_aging":"Aging", "_ag_bom":"Aging BOM", "_ag_req":"Aging Req", "_ag_rec":"Aging Receipts"}
+
+def _saved_path(k): return os.path.join(UPLOAD_DIR, k.strip("_") + ".bin")
+
+def restore_saved_uploads():
+    """Once per browser session: load any saved file the session doesn't already have."""
+    if st.session_state.get("_uploads_restored"): return
+    st.session_state["_uploads_restored"] = True; got = []
+    for k, lbl in PERSIST_KEYS.items():
+        p = _saved_path(k)
+        if st.session_state.get(k) is None and os.path.exists(p):
+            try:
+                with open(p, "rb") as fh: st.session_state[k] = fh.read()
+                got.append(lbl)
+            except OSError: pass
+    st.session_state["_restored_list"] = got
+
+def sync_saved_uploads():
+    """Write new / changed uploads to disk; delete the saved copy when a file is cleared."""
+    try: os.makedirs(UPLOAD_DIR, exist_ok=True)
+    except OSError: return
+    hashes = st.session_state.setdefault("_saved_hashes", {})
+    for k in PERSIST_KEYS:
+        v = st.session_state.get(k); p = _saved_path(k)
+        try:
+            if isinstance(v, (bytes, bytearray)) and v:
+                h = hashlib.md5(v).hexdigest()
+                if hashes.get(k) != h:
+                    with open(p, "wb") as fh: fh.write(v)
+                    hashes[k] = h
+            elif v is None and os.path.exists(p):
+                os.remove(p); hashes.pop(k, None)
+        except OSError: pass
+
+def saved_uploads_info():
+    out = []
+    for k, lbl in PERSIST_KEYS.items():
+        p = _saved_path(k)
+        if os.path.exists(p):
+            out.append({"File": lbl, "Size (KB)": round(os.path.getsize(p)/1024, 1),
+                        "Saved at": _dt.datetime.fromtimestamp(os.path.getmtime(p)).strftime("%d-%b-%y %H:%M")})
+    return out
+
+restore_saved_uploads()
+
+# ═══════════════════════════════════════════════════════════════
 # LOGIN GATE
 # ═══════════════════════════════════════════════════════════════
 _VALID_USER = "admin"
@@ -393,6 +445,7 @@ VERIFY_L4 = st.session_state["cfg_vl4"]
 # ═══════════════════════════════════════════════════════════════
 def go(page):
     st.session_state["page"] = page
+    sync_saved_uploads()
     st.rerun()
 
 def sec(text):
@@ -400,7 +453,12 @@ def sec(text):
                 f'<div class="sec-div-text">{text}</div>'
                 f'<div class="sec-div-line"></div></div>', unsafe_allow_html=True)
 
+def _restored_banner():
+    got=st.session_state.pop("_restored_list",None)
+    if got: st.toast(f"Restored saved uploads: {', '.join(got)}. Run MRP again to refresh results.", icon="📂")
+
 def topbar(title, sub=""):
+    _restored_banner()
     mrp_done  = st.session_state["mrp_results"]  is not None
     seg_done  = st.session_state["seg_results"]  is not None
     ag_done   = st.session_state["aging_results"] is not None
@@ -2677,11 +2735,13 @@ elif st.session_state["page"] == "segment":
         rb,_=st.columns([1,4])
         with rb:
             run_seg=st.button("▶ Run Segment Capacity",type="primary",use_container_width=True,key="run_seg")
+        if sf is not None: st.session_state["seg_imp_bytes"]=sf.getvalue()
+        elif st.session_state.get("seg_imp_bytes"): st.caption("✓ Segment & Import Part file retained from earlier upload. Re-upload to replace.")
         if run_seg:
-            if sf is None: st.warning("Upload Segment & Import Part file first.")
+            if not st.session_state.get("seg_imp_bytes"): st.warning("Upload Segment & Import Part file first.")
             else:
                 try:
-                    seg_bytes=sf.read(); st.session_state["seg_imp_bytes"]=seg_bytes
+                    seg_bytes=st.session_state["seg_imp_bytes"]
                     res=run_segment(mrp_r["bom"],mrp_r["stock"],seg_bytes)
                     if res: st.session_state["seg_results"]=res
                 except Exception as e: st.exception(e)
@@ -3585,9 +3645,20 @@ elif st.session_state["page"] == "settings":
     r2.metric("Segment results","Loaded" if st.session_state["seg_results"] else "Not run")
     r3.metric("Aging results",  "Loaded" if st.session_state["aging_results"] else "Not run")
     st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
+    sec("Saved uploads (kept on the server between sessions)")
+    _si=saved_uploads_info()
+    if _si: st.dataframe(pd.DataFrame(_si),use_container_width=True,hide_index=True)
+    else: st.caption("No saved uploads yet.")
+    st.caption("Uploaded files are saved next to the app and reloaded automatically after a refresh, restart or new deploy. "
+               "'Clear all session data' below also deletes these saved copies.")
     if st.button("🗑 Clear all session data",key="clr"):
         for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes",
                   "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_rec",
                   "_imp_po","imp_results"]:
             st.session_state[k]=None
+        sync_saved_uploads()
         st.success("Session cleared."); st.rerun()
+
+
+# Keep uploads on disk (runs at the end of every page render)
+sync_saved_uploads()
