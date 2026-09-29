@@ -1088,14 +1088,14 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
         else: nib.append(f"ODU {odu}")
     if nib: st.warning(f"Not in BOM: {', '.join(sorted(set(nib)))}")
     with status: st.write("► LP optimisation ...")
-    fg_list=[]; fgseg={}; fgidu={}; fgodu={}; fgcomb={}; skipped=[]
+    fg_list=[]; fgseg={}; fgidu={}; fgodu={}; fgcomb={}; fgside={}; skipped=[]
     for _,row in seg_df.iterrows():
         fg=row["FG_Code"]; seg=row["Segment"]; idu=row["IDU"]; odu=row["Compatible_ODU"]
         if not odu or odu=="nan": skipped.append(f"{fg}: no ODU"); continue
         ir=idu_r.get(idu,{}); or_=odu_r.get(odu,{})
         if not ir and not or_: skipped.append(f"{fg}: no import parts"); continue
         ap=set(ir)|set(or_); comb={p:ir.get(p,0)+or_.get(p,0) for p in ap if ir.get(p,0)+or_.get(p,0)>0}
-        fg_list.append(fg); fgseg[fg]=seg; fgidu[fg]=idu; fgodu[fg]=odu; fgcomb[fg]=comb
+        fg_list.append(fg); fgseg[fg]=seg; fgidu[fg]=idu; fgodu[fg]=odu; fgcomb[fg]=comb; fgside[fg]=(dict(ir),dict(or_))
     if not fg_list: st.error("No valid FG codes."); return None
     # Interchangeable parts: pool member codes into one group row (qty per set and stock both summed)
     ig_act={p:g for p,g in ig_map.items() if p in tset}
@@ -1125,7 +1125,8 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
         fg_res.append({"Segment":fgseg[fg],"FG_Code":fg,"FG_Desc":dmap.get(fg,""),"IDU":fgidu[fg],
                        "IDU_Desc":dmap.get(fgidu[fg],""),"Compatible_ODU":fgodu[fg],
                        "ODU_Desc":dmap.get(fgodu[fg],""),"Max_Sets":int(qty),"Limiting_Part":lp,
-                       "Limiting_Stock":int(stock.get(lp,0)) if lp!="—" else 0,"combined_req":cq})
+                       "Limiting_Stock":int(stock.get(lp,0)) if lp!="—" else 0,"combined_req":cq,
+                       "IDU_req":fgside[fg][0],"ODU_req":fgside[fg][1]})
     st_tot=defaultdict(int); st_fg=defaultdict(list)
     for f2 in fg_res: st_tot[f2["Segment"]]+=f2["Max_Sets"]; st_fg[f2["Segment"]].append(f2)
     sdata={}
@@ -1251,12 +1252,57 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
             wk={w:inc[(fg,m,w)] for w in WEEKS}; tot_arr=sum(wk.values())
             rq=fg_req[fg][m]; have=avail+tot_arr
             bal=max(0.0,have-rq); sf=max(0.0,rq-have)
-            rows.append({"Segment":f["Segment"],"FG Code":fg,"FG Description":f.get("FG_Desc",""),
+            rows.append({"Segment":f["Segment"],"FG Code":fg,"FG Description":f.get("FG_Desc","") or f.get("IDU_Desc",""),
                          "Alt BOM":fg_alt[fg],"Req matched on":fg_src[fg],"Month":m,"Sets Available":avail,"Requirement":rq,
                          **{w:wk[w] for w in WEEKS},"Arrival Sets":tot_arr,
                          "Balance c/f":bal,"Net Shortfall":sf})
             avail=bal
-    return pd.DataFrame(rows),mcols
+    out=pd.DataFrame(rows)
+    out.attrs["ctx"]=dict(fg_req=fg_req,arr={"|".join(k):v for k,v in arr.items()})
+    return out,mcols
+
+def component_monthwise(seg_r, mw, mcols):
+    """Component-level ledger in pieces: one row per FG × BOM header (IDU/ODU) × import component.
+    Req = FG req × qty per set. Stock (pooled per interchange group) and PO arrivals are shared by all rows using
+    that component and consumed in table order: Available = what is left when the row is reached, Balance is handed
+    to the next row using the same component, and the last balance carries into next month."""
+    ctx=mw.attrs.get("ctx",{}); fg_req=ctx.get("fg_req",{}); arr=ctx.get("arr",{})
+    pg=seg_r.get("part_group",{}); stock=seg_r["stock"]
+    meta=mw.drop_duplicates("FG Code").set_index("FG Code")
+    order=meta.sort_values("Segment",kind="stable").index.tolist()
+    lines=[]
+    for f in seg_r["fg_results"]:
+        if f["FG_Code"] not in meta.index: continue
+        sides=[("IDU",f["IDU"],f.get("IDU_req")),("ODU",f["Compatible_ODU"],f.get("ODU_req"))]
+        if sides[0][2] is None: sides=[("IDU+ODU",f"{f['IDU']} + {f['Compatible_ODU']}",f["combined_req"])]
+        for side,hdr,rq in sides:
+            for p,q in sorted((rq or {}).items()):
+                if q>0: lines.append((f["FG_Code"],f"{side}: {hdr}",p,pg.get(p,p),q))
+    lines.sort(key=lambda x:order.index(x[0]) if x[0] in order else 1e9)
+    left={}; firsts=defaultdict(set); rows=[]
+    for k in {l[3] for l in lines}: left[k]=float(stock.get(k,0))
+    for m in mcols:
+        seen=set()
+        for fg,hdr,p,key,q in lines:
+            av=left[key]
+            wk={w:(float(arr.get(f"{key}|{m}|{w}",0.0)) if key not in seen else 0.0) for w in WEEKS}; seen.add(key)
+            rq=float(fg_req.get(fg,{}).get(m,0.0))*q; tot=sum(wk.values())
+            bal=max(0.0,av+tot-rq); sf=max(0.0,rq-av-tot); left[key]=bal
+            mt=meta.loc[fg]
+            rows.append({"Segment":mt["Segment"],"Alt BOM":mt["Alt BOM"],"FG Description":mt["FG Description"],"FG Code":fg,
+                         "IDU / ODU":hdr,"Component":p+(f"  ({key})" if key!=p else ""),"Qty / set":q,"Month":m,
+                         "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf})
+    return pd.DataFrame(rows)
+
+def pretty_months(months):
+    """Display labels: 'Sep-26' (or '26-Sep-26' when two columns fall in the same month)."""
+    ts=_month_starts(months); full={}
+    for m in months:
+        t,_=parse_col_to_date(m); full[m]=pd.Timestamp(t) if t is not None else None
+    if any(v is None for v in full.values()): return {m:str(m) for m in months}
+    lab={m:full[m].strftime("%b-%y") for m in months}
+    if len(set(lab.values()))<len(months): lab={m:full[m].strftime("%d-%b-%y") for m in months}
+    return lab
 
 MW_METRICS=["Available","Req"]+WEEKS+["Balance","Shortfall","Remarks"]
 
@@ -1268,13 +1314,15 @@ def _mw_remark(av,rq,arrivals,sf):
     if arrivals>0 and av<rq: return "Covered by arrival"
     return "OK"
 
-def monthwise_grouped(long_df,keys,mcols):
+def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
     """Rows = keys (e.g. Segment); for each month the MW_METRICS block, like the planning sheet."""
     agg=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall"]
     g=long_df.groupby(keys+["Month"],as_index=False,sort=False)[agg].sum()
     base=long_df[keys].drop_duplicates().reset_index(drop=True)
     tot_req=long_df.groupby(keys,sort=False)["Requirement"].sum().rename("_r").reset_index()
-    base=base.merge(tot_req,on=keys).sort_values("_r",ascending=False,kind="stable").drop(columns="_r").reset_index(drop=True)
+    base=base.merge(tot_req,on=keys)
+    if not keep_order: base=base.sort_values("_r",ascending=False,kind="stable")
+    base=base.drop(columns="_r").reset_index(drop=True)
     cols={}
     for m in mcols:
         gm=base.merge(g[g["Month"]==m],on=keys,how="left").fillna(0)
@@ -1285,6 +1333,7 @@ def monthwise_grouped(long_df,keys,mcols):
     out=pd.DataFrame(cols); out.columns=pd.MultiIndex.from_tuples(out.columns)
     left=base.copy(); left.columns=pd.MultiIndex.from_tuples([("",k) for k in keys])
     out=pd.concat([left,out],axis=1)
+    if not total: return out
     # TOTAL row: Available = opening, Balance = closing, flows summed per month block
     tr={("",k):"" for k in keys}; tr[("",keys[0])]="TOTAL"
     for m in mcols:
@@ -1301,7 +1350,8 @@ def grouped_table_html(df,key_labels):
     th='style="border:1px solid #d1d5db;padding:4px 8px;background:#f3f4f6;font-weight:700;text-align:center;white-space:nowrap;"'
     thm='style="border:1px solid #d1d5db;padding:4px 8px;background:#e0ecff;font-weight:700;text-align:center;"'
     h0="<tr>"+"".join(f'<th {th} rowspan="3">{_h.escape(key_labels.get(k[1],k[1]))}</th>' for k in keys)
-    h0+="".join(f'<th {thm} colspan="{len(MW_METRICS)}">{_h.escape(m)}</th>' for m in months)+"</tr>"
+    pm=pretty_months(months)
+    h0+="".join(f'<th {thm} colspan="{len(MW_METRICS)}">{_h.escape(pm[m])}</th>' for m in months)+"</tr>"
     h1="<tr>"; h2="<tr>"
     for m in months:
         h1+=f'<th {th} rowspan="2">Available</th><th {th} rowspan="2">Req</th><th {th} colspan="4">Arrival Week</th>'
@@ -1312,7 +1362,8 @@ def grouped_table_html(df,key_labels):
     for i,row in df.iterrows():
         is_tot=str(row[keys[0]])=="TOTAL"
         tr_style=' style="background:#f9fafb;font-weight:700;"' if is_tot else ""
-        cells="".join(f'<td style="border:1px solid #e5e7eb;padding:4px 8px;white-space:nowrap;">{_h.escape(str(row[k]))}</td>' for k in keys)
+        _kv=lambda v:f"{v:g}" if isinstance(v,float) else str(v)
+        cells="".join(f'<td style="border:1px solid #e5e7eb;padding:4px 8px;white-space:nowrap;">{_h.escape(_kv(row[k]))}</td>' for k in keys)
         for m in months:
             for mt in MW_METRICS:
                 v=row[(m,mt)]; st_="border:1px solid #e5e7eb;padding:4px 8px;text-align:right;"
@@ -1341,7 +1392,7 @@ def grouped_to_excel(w,df,sheet,key_labels):
     for k in keys:
         ws.cell(1,c,key_labels.get(k[1],k[1])); ws.merge_cells(start_row=1,start_column=c,end_row=3,end_column=c); c+=1
     for m in months:
-        ws.cell(1,c,m); ws.merge_cells(start_row=1,start_column=c,end_row=1,end_column=c+len(MW_METRICS)-1)
+        ws.cell(1,c,pretty_months(months)[m]); ws.merge_cells(start_row=1,start_column=c,end_row=1,end_column=c+len(MW_METRICS)-1)
         for off,lbl in enumerate(["Available","Req"]):
             ws.cell(2,c+off,lbl); ws.merge_cells(start_row=2,start_column=c+off,end_row=3,end_column=c+off)
         ws.cell(2,c+2,"Arrival Week"); ws.merge_cells(start_row=2,start_column=c+2,end_row=2,end_column=c+5)
@@ -2739,20 +2790,26 @@ elif st.session_state["page"] == "segment":
                                "Balance = Available + Arrivals − Req (min 0) · Shortfall = Req − Available − Arrivals (min 0)")
 
                     seg_keys={"Segment":"Segment"}
-                    fg_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"Material code"}
+                    fg_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code",
+                             "IDU / ODU":"IDU / ODU","Component":"Component","Qty / set":"Qty / set"}
                     seg_g=monthwise_grouped(mw,["Segment"],mw_months)
-                    fg_g=monthwise_grouped(mw,["Segment","Alt BOM","FG Description","FG Code"],mw_months)
-                    fg_g=pd.concat([fg_g.iloc[:-1].sort_values(("","Segment"),kind="stable"),fg_g.iloc[-1:]],ignore_index=True)
+                    cmw=component_monthwise(r,mw,mw_months)
+                    fg_g=monthwise_grouped(cmw,list(fg_keys),mw_months,keep_order=True,total=False) if not cmw.empty else pd.DataFrame()
                     sw1,sw2,sw3=st.tabs(["Segment-wise","Model-wise","Single FG / segment view"])
                     with sw1:
                         st.markdown(grouped_table_html(seg_g,seg_keys),unsafe_allow_html=True)
                     with sw2:
-                        only_sf=st.checkbox("Show only models with shortfall",key="seg_mw_sf")
-                        fv=fg_g
-                        if only_sf:
-                            sfc=[c for c in fg_g.columns if c[1]=="Shortfall"]
-                            body=fg_g.iloc[:-1]; fv=pd.concat([body[body[sfc].sum(axis=1)>0],fg_g.iloc[-1:]],ignore_index=True)
-                        st.markdown(grouped_table_html(fv,fg_keys),unsafe_allow_html=True)
+                        st.caption("Pieces of each import component · Req = FG req × Qty/set · Stock and PO arrivals of a component "
+                                   "(or its ⇄ interchange group) are shared by every row that uses it, in table order: Balance of one row "
+                                   "is Available for the next row with the same component; the last one carries into next month.")
+                        if fg_g.empty: st.info("No import components found for these FGs.")
+                        else:
+                            only_sf=st.checkbox("Show only components with shortfall",key="seg_mw_sf")
+                            fv=fg_g
+                            if only_sf:
+                                sfc=[c for c in fg_g.columns if c[1]=="Shortfall"]
+                                fv=fg_g[fg_g[sfc].sum(axis=1)>0]
+                            st.markdown(grouped_table_html(fv,fg_keys),unsafe_allow_html=True)
                     with sw3:
                         v1,v2=st.columns(2)
                         with v1: vseg=st.selectbox("Segment",["All"]+sorted(mw["Segment"].unique()),key="seg_mw_seg")
@@ -2806,7 +2863,7 @@ elif st.session_state["page"] == "segment":
                 _mwx=st.session_state.get("_seg_mw_export")
                 if fg_res and _mwx:
                     grouped_to_excel(w,_mwx[0],"Monthwise Segment",_mwx[3])
-                    grouped_to_excel(w,_mwx[1],"Monthwise Model",_mwx[4])
+                    if not _mwx[1].empty: grouped_to_excel(w,_mwx[1],"Monthwise Model",_mwx[4])
                     _mwx[2].to_excel(w,sheet_name="Monthwise Detail",index=False)
             buf.seek(0)
             st.download_button("⬇ Download Segment Capacity (.xlsx)",data=buf,file_name="segment_capacity.xlsx",
