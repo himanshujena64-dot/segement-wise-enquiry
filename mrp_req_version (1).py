@@ -1365,17 +1365,15 @@ MODEL_KEYS={"Segment":"Segment","FG Code":"FG Code","Category":"Category","IDU /
             "Alt BOM":"Alt BOM","Component":"Component","Qty / set":"Qty / set","Unit":"Unit"}
 
 def model_with_components(mw, cmw):
-    """Long table for the Model-wise view: per FG one 'Sets' row (what can be built) followed by its import
-    component rows in pieces (which part is short, per BOM header)."""
+    """Long table for the Model + components view: per FG its import component rows in pieces
+    (which part is short, per BOM header). FG set totals are in the Model-wise (sets) tab."""
     num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall"]
     parts=[]
     comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["Month"]+num)
     if not comp.empty:
         comp["Qty / set"]=comp["Qty / set"].map(lambda v:f"{v:g}"); comp["Unit"]="Pcs"
     for fg in mw["FG Code"].drop_duplicates():
-        f=mw[mw["FG Code"]==fg].copy()
-        f["Category"]="▶ Complete set"; f["IDU / ODU"]=""; f["Alt BOM"]=""; f["Component"]=""; f["Qty / set"]=""; f["Unit"]="Sets"
-        parts.append(f); parts.append(comp[comp["FG Code"]==fg])
+        parts.append(comp[comp["FG Code"]==fg])
     out=pd.concat(parts,ignore_index=True)
     return out[list(MODEL_KEYS)+["Month"]+num]
 
@@ -2943,21 +2941,20 @@ elif st.session_state["page"] == "segment":
                             body=fgo_g.iloc[:-1]; fgv=pd.concat([body[body[sfc].sum(axis=1)>0],fgo_g.iloc[-1:]],ignore_index=True)
                         st.markdown(grouped_table_html(fgv,fgo_keys),unsafe_allow_html=True)
                     with sw2:
-                        st.caption("Blue row = complete sets of the FG you can make (all components together). Rows under it = each import "
-                                   "component per BOM header (IDU / ODU) in pieces: Req = FG req × Qty/set; stock and PO arrivals of a component "
+                        st.caption("Each import component per BOM header (IDU / ODU) in pieces (complete sets per FG are in the Model-wise (sets) tab): "
+                                   "Req = FG req × Qty/set; stock and PO arrivals of a component "
                                    "(or its ⇄ interchange group) are shared by all FGs using it, in table order.")
                         o1,o2=st.columns(2)
                         with o1: only_fg=st.checkbox("Only FGs with a set shortfall",key="seg_mw_sf")
-                        with o2: comp_mode=st.radio("Component rows",["Short only","All","Hide"],horizontal=True,key="seg_mw_comp")
+                        with o2: comp_mode=st.radio("Component rows",["Short only","All"],horizontal=True,key="seg_mw_comp")
                         fv=fg_g
                         sfc=[c for c in fg_g.columns if c[1]=="Shortfall"]
-                        is_set=fv[("","Unit")]=="Sets"
-                        keep=is_set | (comp_mode=="All")
-                        if comp_mode=="Short only": keep=keep | (fv[sfc].sum(axis=1)>0)
+                        keep=pd.Series(comp_mode=="All",index=fv.index) | (fv[sfc].sum(axis=1)>0)
                         if only_fg:
-                            short_fg=set(fv[is_set & (fv[sfc].sum(axis=1)>0)][("","FG Code")])
+                            short_fg=set(mw[mw["Net Shortfall"]>0]["FG Code"])
                             keep=keep & fv[("","FG Code")].isin(short_fg)
-                        st.markdown(grouped_table_html(fv[keep],fg_keys),unsafe_allow_html=True)
+                        if not keep.any(): st.success("No component rows to show with these filters.")
+                        else: st.markdown(grouped_table_html(fv[keep],fg_keys),unsafe_allow_html=True)
                     with sw4:
                         if cs_g.empty: st.info("No import components found for these FGs.")
                         else:
