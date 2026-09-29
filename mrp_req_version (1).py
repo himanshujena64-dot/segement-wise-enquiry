@@ -1455,7 +1455,7 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
         tr[(m,"Remarks")]=_mw_remark(tr[(m,"Available")],tr[(m,"Req")],sum(tr[(m,w)] for w in WEEKS),tr[(m,"Shortfall")])
     return pd.concat([out,pd.DataFrame([tr],columns=out.columns)],ignore_index=True)
 
-KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":62,"Component":135,
+KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":76,"Component":135,
                "Qty / set":66,"Unit":48,"Codes":160,"Used in BOM headers":150,"FG codes":170}
 
 def grouped_table_html(df,key_labels,freeze=()):
