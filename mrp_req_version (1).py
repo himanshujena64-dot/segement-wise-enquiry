@@ -1455,13 +1455,27 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
         tr[(m,"Remarks")]=_mw_remark(tr[(m,"Available")],tr[(m,"Req")],sum(tr[(m,w)] for w in WEEKS),tr[(m,"Shortfall")])
     return pd.concat([out,pd.DataFrame([tr],columns=out.columns)],ignore_index=True)
 
-def grouped_table_html(df,key_labels):
-    """Two-row header HTML table: month blocks with 'Arrival Week' spanning WK01-WK04."""
+KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":76,"Component":135,
+               "Qty / set":66,"Unit":48,"Codes":160,"Used in BOM headers":150,"FG codes":170}
+
+def grouped_table_html(df,key_labels,freeze=()):
+    """Two-row header HTML table: month blocks with 'Arrival Week' spanning WK01-WK04.
+    freeze: key columns that stay pinned on the left while scrolling sideways through the months."""
     import html as _h
     keys=[c for c in df.columns if c[0]==""]; months=list(dict.fromkeys(c[0] for c in df.columns if c[0]!=""))
-    th='style="border:1px solid #d1d5db;padding:4px 8px;background:#f3f4f6;font-weight:700;text-align:center;white-space:nowrap;"'
+    labels=[key_labels.get(k[1],k[1]) for k in keys]
+    widths=[KEY_COL_WIDTH.get(l,110) for l in labels]
+    fz=[i for i,l in enumerate(labels) if l in freeze]
+    lefts={i:sum(widths[j] for j in fz if j<i) for i in fz}
+    def kst(i,bg,z):
+        w=widths[i]; base=f"min-width:{w}px;max-width:{w}px;width:{w}px;box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;"
+        if i not in lefts: return base
+        edge="box-shadow:inset -2px 0 0 #94a3b8;" if i==fz[-1] else ""
+        return base+f"position:sticky;left:{lefts[i]}px;z-index:{z};background:{bg};{edge}"
+    th_base="border:1px solid #d1d5db;padding:4px 8px;background:#f3f4f6;font-weight:700;text-align:center;white-space:nowrap;"
+    th=f'style="{th_base}"'
     thm='style="border:1px solid #d1d5db;padding:4px 8px;background:#e0ecff;font-weight:700;text-align:center;"'
-    h0="<tr>"+"".join(f'<th {th} rowspan="3">{_h.escape(key_labels.get(k[1],k[1]))}</th>' for k in keys)
+    h0="<tr>"+"".join(f'<th style="{th_base}{kst(i,"#f3f4f6",4)}" rowspan="3" title="{_h.escape(l)}">{_h.escape(l)}</th>' for i,l in enumerate(labels))
     pm=pretty_months(months)
     h0+="".join(f'<th {thm} colspan="{len(MW_METRICS)}">{_h.escape(pm[m])}</th>' for m in months)+"</tr>"
     h1="<tr>"; h2="<tr>"
@@ -1475,8 +1489,10 @@ def grouped_table_html(df,key_labels):
         is_tot=str(row[keys[0]])=="TOTAL"
         is_set=("","Unit") in df.columns and row[("","Unit")]=="Sets"
         tr_style=' style="background:#f9fafb;font-weight:700;"' if is_tot else (' style="background:#eef4ff;font-weight:700;border-top:2px solid #93c5fd;"' if is_set else "")
+        rbg="#f9fafb" if is_tot else ("#eef4ff" if is_set else "#ffffff")
         _kv=lambda v:f"{v:g}" if isinstance(v,float) else str(v)
-        cells="".join(f'<td style="border:1px solid #e5e7eb;padding:4px 8px;white-space:nowrap;">{_h.escape(_kv(row[k]))}</td>' for k in keys)
+        cells="".join(f'<td style="border:1px solid #e5e7eb;padding:4px 8px;white-space:nowrap;{kst(i,rbg,2)}" title="{_h.escape(_kv(row[k]))}">{_h.escape(_kv(row[k]))}</td>'
+                      for i,k in enumerate(keys))
         for m in months:
             for mt in MW_METRICS:
                 v=row[(m,mt)]; st_="border:1px solid #e5e7eb;padding:4px 8px;text-align:right;"
@@ -2932,14 +2948,14 @@ elif st.session_state["page"] == "segment":
                     sw1,sw5,sw2,sw4,sw3=st.tabs(["Segment-wise (sets)","Model-wise (sets)","Model + components (drill-down)",
                                                  "Component shortage & arrivals","Single FG / segment view"])
                     with sw1:
-                        st.markdown(grouped_table_html(seg_g,seg_keys),unsafe_allow_html=True)
+                        st.markdown(grouped_table_html(seg_g,seg_keys,freeze=("Segment",)),unsafe_allow_html=True)
                     with sw5:
                         only_fgo=st.checkbox("Show only models with shortfall",key="seg_fgo_sf")
                         fgv=fgo_g
                         if only_fgo:
                             sfc=[c for c in fgo_g.columns if c[1]=="Shortfall"]
                             body=fgo_g.iloc[:-1]; fgv=pd.concat([body[body[sfc].sum(axis=1)>0],fgo_g.iloc[-1:]],ignore_index=True)
-                        st.markdown(grouped_table_html(fgv,fgo_keys),unsafe_allow_html=True)
+                        st.markdown(grouped_table_html(fgv,fgo_keys,freeze=("FG Code",)),unsafe_allow_html=True)
                     with sw2:
                         st.caption("Each import component per BOM header (IDU / ODU) in pieces (complete sets per FG are in the Model-wise (sets) tab): "
                                    "Req = FG req × Qty/set; stock and PO arrivals of a component "
@@ -2954,7 +2970,7 @@ elif st.session_state["page"] == "segment":
                             short_fg=set(mw[mw["Net Shortfall"]>0]["FG Code"])
                             keep=keep & fv[("","FG Code")].isin(short_fg)
                         if not keep.any(): st.success("No component rows to show with these filters.")
-                        else: st.markdown(grouped_table_html(fv[keep],fg_keys),unsafe_allow_html=True)
+                        else: st.markdown(grouped_table_html(fv[keep],fg_keys,freeze=("FG Code","Component")),unsafe_allow_html=True)
                     with sw4:
                         if cs_g.empty: st.info("No import components found for these FGs.")
                         else:
@@ -2966,7 +2982,7 @@ elif st.session_state["page"] == "segment":
                             if only_cs:
                                 sfc2=[c for c in cs_g.columns if c[1]=="Shortfall"]; cv=cs_g[cs_g[sfc2].sum(axis=1)>0]
                             if cv.empty: st.success("No import component is short in the horizon.")
-                            else: st.markdown(grouped_table_html(cv,cs_keys),unsafe_allow_html=True)
+                            else: st.markdown(grouped_table_html(cv,cs_keys,freeze=("Component",)),unsafe_allow_html=True)
                     with sw3:
                         v1,v2=st.columns(2)
                         with v1: vseg=st.selectbox("Segment",["All"]+sorted(mw["Segment"].unique()),key="seg_mw_seg")
