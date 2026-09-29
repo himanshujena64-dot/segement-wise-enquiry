@@ -2916,6 +2916,18 @@ elif st.session_state["page"] == "segment":
                     fg_g=monthwise_grouped(mdl,list(fg_keys),mw_months,keep_order=True,total=False)
                     cs_long,cs_info=component_shortage(cmw,mw_months,mw.attrs.get("ctx",{}).get("arr",{}),r)
                     cs_g=monthwise_grouped(cs_long,list(cs_keys),mw_months,keep_order=True,total=False) if not cs_long.empty else pd.DataFrame()
+                    _xb=io.BytesIO()
+                    with pd.ExcelWriter(_xb,engine="openpyxl") as _w:
+                        pd.DataFrame({"Month-wise sets vs requirement":[f"Basis: {basis}",f"Months: {', '.join(pretty_months(mw_months).values())}"]}).to_excel(_w,sheet_name="Info",index=False)
+                        grouped_to_excel(_w,seg_g,"Segment-wise",seg_keys)
+                        if not fg_g.empty: grouped_to_excel(_w,fg_g,"Model-wise",fg_keys)
+                        if not cs_g.empty:
+                            cs_info.to_excel(_w,sheet_name="Component Shortage",index=False)
+                            grouped_to_excel(_w,cs_g,"Component Monthwise",cs_keys)
+                    _xb.seek(0)
+                    st.download_button("⬇ Download month-wise tables (.xlsx)",data=_xb,file_name="segment_monthwise.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       type="primary",key="dl_seg_mw")
                     sw1,sw2,sw4,sw3=st.tabs(["Segment-wise (sets)","Model-wise (sets + components)","Component shortage & arrivals","Single FG / segment view"])
                     with sw1:
                         st.markdown(grouped_table_html(seg_g,seg_keys),unsafe_allow_html=True)
