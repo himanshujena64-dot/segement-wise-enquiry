@@ -889,7 +889,8 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     bom["Parent"]=parents
     drop_cols=["Plant","Usage","Quantity","Unit","BOM L/T","BOM code","Item","Mat. Group","Mat. Group Desc.","Pur. Group","Pur. Group Desc.","MRP Controller","MRP Controller Desc."]
     bom=bom.drop(columns=[c for c in drop_cols if c in bom.columns],errors="ignore")
-    for old,new in [("Component description","Component descriptio"),("BOM header description","BOM header descripti")]:
+    for old,new in [("Component description","Component descriptio"),("BOM header description","BOM header descripti"),
+                    ("BOM Header Desc","BOM header descripti")]:
         if old in bom.columns: bom=bom.rename(columns={old:new})
     keep=["BOM Header","BOM header descripti","Alt","Level","Path","Parent","Component","Component descriptio","Required Qty","Base unit","Procurement type","Special procurement"]
     bom=bom[[c for c in keep if c in bom.columns]].copy()
@@ -1458,7 +1459,7 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
 KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":76,"Component":135,
                "Qty / set":66,"Unit":48,"Codes":160,"Used in BOM headers":150,"FG codes":170}
 
-def grouped_table_html(df,key_labels,freeze=()):
+def grouped_table_html(df,key_labels,freeze=(),weeks=True):
     """Two-row header HTML table: month blocks with 'Arrival Week' spanning WK01-WK04.
     freeze: key columns that stay pinned on the left while scrolling sideways through the months."""
     import html as _h
@@ -1477,9 +1478,12 @@ def grouped_table_html(df,key_labels,freeze=()):
     thm='style="border:1px solid #d1d5db;padding:4px 8px;background:#e0ecff;font-weight:700;text-align:center;"'
     h0="<tr>"+"".join(f'<th style="{th_base}{kst(i,"#f3f4f6",4)}" rowspan="3" title="{_h.escape(l)}">{_h.escape(l)}</th>' for i,l in enumerate(labels))
     pm=pretty_months(months)
-    h0+="".join(f'<th {thm} colspan="{len(MW_METRICS)}">{_h.escape(pm[m])}</th>' for m in months)+"</tr>"
+    mets=MW_METRICS if weeks else [x for x in MW_METRICS if x not in WEEKS]
+    h0+="".join(f'<th {thm} colspan="{len(mets)}">{_h.escape(pm[m])}</th>' for m in months)+"</tr>"
     h1="<tr>"; h2="<tr>"
     for m in months:
+        if not weeks:
+            h1+="".join(f'<th {th} rowspan="2">{x}</th>' for x in mets); continue
         h1+=f'<th {th} rowspan="2">Available</th><th {th} rowspan="2">Req</th><th {th} colspan="4">Arrival Week</th>'
         h1+=f'<th {th} rowspan="2">Balance</th><th {th} rowspan="2">Shortfall</th><th {th} rowspan="2">Remarks</th>'
         h2+="".join(f"<th {th}>{w}</th>" for w in WEEKS)
@@ -1494,7 +1498,7 @@ def grouped_table_html(df,key_labels,freeze=()):
         cells="".join(f'<td style="border:1px solid #e5e7eb;padding:4px 8px;white-space:nowrap;{kst(i,rbg,2)}" title="{_h.escape(_kv(row[k]))}">{_h.escape(_kv(row[k]))}</td>'
                       for i,k in enumerate(keys))
         for m in months:
-            for mt in MW_METRICS:
+            for mt in mets:
                 v=row[(m,mt)]; st_="border:1px solid #e5e7eb;padding:4px 8px;text-align:right;"
                 if mt=="Remarks":
                     col="#dc2626" if str(v).startswith(("Short","No ")) else "#15803d" if v else "#6b7280"
@@ -1510,10 +1514,10 @@ def grouped_table_html(df,key_labels,freeze=()):
             '<table style="border-collapse:collapse;font-size:12px;font-family:\'Plus Jakarta Sans\',sans-serif;background:#fff;">'
             f"<thead>{h0}{h1}{h2}</thead><tbody>{body}</tbody></table></div>")
 
-def show_grouped_table(df,key_labels,freeze=()):
+def show_grouped_table(df,key_labels,freeze=(),weeks=True):
     """Render the grouped table inside its own frame so every Streamlit version shows it exactly as built
     (merged month headers, colours, pinned columns, sideways scroll) — st.markdown may strip the styling."""
-    html=grouped_table_html(df,key_labels,freeze=freeze)   # every cell value is html-escaped
+    html=grouped_table_html(df,key_labels,freeze=freeze,weeks=weeks)   # every cell value is html-escaped
     h=min(600,3*30+len(df)*29+30)
     page=('<html><head><style>body{margin:0;font-family:"Plus Jakarta Sans","Segoe UI",Arial,sans-serif;}'
           'div::-webkit-scrollbar{height:10px;width:10px}div::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:5px}'
@@ -2921,7 +2925,9 @@ elif st.session_state["page"] == "segment":
                 if st.session_state.get("_imp_po"):
                     po_df,po_err=load_import_po(st.session_state["_imp_po"],st.session_state.get("imp_transit",30))
                     if po_err: st.warning(f"Import PO file: {po_err}"); po_df=None
-                mw,mw_months=segment_monthwise(r,mrp_r,"req" if basis.startswith("Aligned") else "max",po_df)
+                _bs="req" if basis.startswith("Aligned") else "max"
+                mw,mw_months=segment_monthwise(r,mrp_r,_bs,None)          # sets: stock only (no PO arrivals)
+                mw_arr,_=segment_monthwise(r,mrp_r,_bs,po_df)             # component view: with weekly PO arrivals
                 if mw.empty or not mw_months:
                     st.info("No month-wise requirement found in the MRP Requirement sheet.")
                 else:
@@ -2929,15 +2935,16 @@ elif st.session_state["page"] == "segment":
                     t_open=mw[mw["Month"]==mw_months[0]]["Sets Available"].sum()
                     q1,q2,q3,q4,q5=st.columns(5)
                     q1.metric(f"Sets available ({mw_months[0]})",f"{t_open:,.0f}")
-                    q2.metric("Sets from arrivals",f"{mw['Arrival Sets'].sum():,.0f}")
+                    q2.metric("Extra sets possible from PO arrivals",f"{mw_arr['Arrival Sets'].sum():,.0f}")
                     q3.metric("Total requirement",f"{t_req:,.0f}")
                     q4.metric("Total net shortfall",f"{t_sf:,.0f}")
                     q5.metric("FGs with shortfall",f"{mw[mw['Net Shortfall']>0]['FG Code'].nunique()} / {mw['FG Code'].nunique()}")
                     nmc=(mw.drop_duplicates("FG Code")["Req matched on"]=="Not in Req").sum()
                     if nmc: st.caption(f"⚠ {nmc} FG code(s) not found in the Requirement sheet (by FG or IDU code) — treated as zero requirement.")
-                    if po_df is None: st.caption("ℹ Upload the Import PO file to fill the Arrival Week columns.")
-                    st.caption("Available = balance carried from previous month · Arrival Week = extra sets possible from import parts landing that week (ETA day 1-7 WK01, 8-14 WK02, 15-21 WK03, 22+ WK04) · "
-                               "Balance = Available + Arrivals − Req (min 0) · Shortfall = Req − Available − Arrivals (min 0)")
+                    if po_df is None: st.caption("ℹ Upload the Import PO file to fill the Arrival Week columns in Model + components.")
+                    st.caption("Segment-wise / Model-wise (sets): from stock only · Available = balance carried from previous month · "
+                               "Balance = Available − Req (min 0) · Shortfall = Req − Available (min 0). "
+                               "PO arrivals by week (ETA day 1-7 WK01, 8-14 WK02, 15-21 WK03, 22+ WK04) are shown per component in Model + components.")
 
                     seg_keys={"Segment":"Segment"}
                     fg_keys=MODEL_KEYS
@@ -2946,10 +2953,10 @@ elif st.session_state["page"] == "segment":
                     fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code"}
                     fgo_g=monthwise_grouped(mw,list(fgo_keys),mw_months)
                     fgo_g=pd.concat([fgo_g.iloc[:-1].sort_values(("","Segment"),kind="stable"),fgo_g.iloc[-1:]],ignore_index=True)
-                    cmw=component_monthwise(r,mw,mw_months)
-                    mdl=model_with_components(mw,cmw)
+                    cmw=component_monthwise(r,mw_arr,mw_months)
+                    mdl=model_with_components(mw_arr,cmw)
                     fg_g=monthwise_grouped(mdl,list(fg_keys),mw_months,keep_order=True,total=False)
-                    cs_long,cs_info=component_shortage(cmw,mw_months,mw.attrs.get("ctx",{}).get("arr",{}),r)
+                    cs_long,cs_info=component_shortage(cmw,mw_months,mw_arr.attrs.get("ctx",{}).get("arr",{}),r)
                     cs_g=monthwise_grouped(cs_long,list(cs_keys),mw_months,keep_order=True,total=False) if not cs_long.empty else pd.DataFrame()
                     _xb=io.BytesIO()
                     with pd.ExcelWriter(_xb,engine="openpyxl") as _w:
@@ -2964,14 +2971,14 @@ elif st.session_state["page"] == "segment":
                     sw1,sw5,sw2,sw4,sw3=st.tabs(["Segment-wise (sets)","Model-wise (sets)","Model + components (drill-down)",
                                                  "Component shortage & arrivals","Single FG / segment view"])
                     with sw1:
-                        show_grouped_table(seg_g,seg_keys,freeze=("Segment",))
+                        show_grouped_table(seg_g,seg_keys,freeze=("Segment",),weeks=False)
                     with sw5:
                         only_fgo=st.checkbox("Show only models with shortfall",key="seg_fgo_sf")
                         fgv=fgo_g
                         if only_fgo:
                             sfc=[c for c in fgo_g.columns if c[1]=="Shortfall"]
                             body=fgo_g.iloc[:-1]; fgv=pd.concat([body[body[sfc].sum(axis=1)>0],fgo_g.iloc[-1:]],ignore_index=True)
-                        show_grouped_table(fgv,fgo_keys,freeze=("FG Code",))
+                        show_grouped_table(fgv,fgo_keys,freeze=("FG Code",),weeks=False)
                     with sw2:
                         st.caption("Each import component per BOM header (IDU / ODU) in pieces (complete sets per FG are in the Model-wise (sets) tab): "
                                    "Req = FG req × Qty/set; stock and PO arrivals of a component "
@@ -3005,7 +3012,7 @@ elif st.session_state["page"] == "segment":
                         sub=mw if vseg=="All" else mw[mw["Segment"]==vseg]
                         with v2: vfg=st.selectbox("FG code",["All"]+sorted(sub["FG Code"].unique()),key="seg_mw_fg")
                         if vfg!="All": sub=sub[sub["FG Code"]==vfg]
-                        cc=["Sets Available","Requirement"]+WEEKS+["Balance c/f","Net Shortfall"]
+                        cc=["Sets Available","Requirement","Balance c/f","Net Shortfall"]
                         one=sub.groupby("Month",as_index=False,sort=False)[cc].sum()
                         st.dataframe(one.style.apply(lambda c:["color:#dc2626;font-weight:600" if v>0 else "" for v in c],subset=["Net Shortfall"])
                                      .format({c:"{:,.0f}" for c in cc}),use_container_width=True,hide_index=True)
@@ -3051,8 +3058,8 @@ elif st.session_state["page"] == "segment":
                 pudf.to_excel(w,sheet_name="Import Part Utilisation",index=False)
                 _mwx=st.session_state.get("_seg_mw_export")
                 if fg_res and _mwx:
-                    grouped_to_excel(w,_mwx[0],"Monthwise Segment",_mwx[3])
-                    grouped_to_excel(w,_mwx[8],"Monthwise Model (sets)",_mwx[9])
+                    grouped_to_excel(w,_mwx[0],"Monthwise Segment",_mwx[3],weeks=False)
+                    grouped_to_excel(w,_mwx[8],"Monthwise Model (sets)",_mwx[9],weeks=False)
                     if not _mwx[1].empty: grouped_to_excel(w,_mwx[1],"Monthwise Model+Comp",_mwx[4])
                     if not _mwx[5].empty:
                         _mwx[7].to_excel(w,sheet_name="Component Shortage",index=False)
