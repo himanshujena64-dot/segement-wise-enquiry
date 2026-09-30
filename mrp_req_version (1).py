@@ -1549,31 +1549,36 @@ def show_grouped_table(df,key_labels,freeze=(),weeks=True):
         components.html(page,height=h,scrolling=False)
 
 def grouped_to_excel(w,df,sheet,key_labels,weeks=True):
-    """Write the grouped table with merged month / 'Arrival Week' headers (weeks=False leaves out WK01-WK04)."""
+    """Write the grouped table for Excel filtering: row 3 carries a label in every column (with AutoFilter on),
+    row 1 holds the month band and row 2 'Arrival Week' above WK01-WK04 — nothing is merged down into row 3."""
     from openpyxl.styles import Alignment,Font,PatternFill,Border,Side
+    from openpyxl.utils import get_column_letter
     ws=w.book.create_sheet(sheet)
     keys=[c for c in df.columns if c[0]==""]; months=list(dict.fromkeys(c[0] for c in df.columns if c[0]!=""))
     bold=Font(bold=True); ctr=Alignment(horizontal="center",vertical="center",wrap_text=True)
-    fill=PatternFill("solid",fgColor="E0ECFF"); thin=Side(style="thin",color="BFBFBF"); bd=Border(thin,thin,thin,thin)
-    c=1
+    fill=PatternFill("solid",fgColor="E0ECFF"); hfill=PatternFill("solid",fgColor="F3F4F6")
+    thin=Side(style="thin",color="BFBFBF"); bd=Border(thin,thin,thin,thin)
+    widths=[]; c=1
     for k in keys:
-        ws.cell(1,c,key_labels.get(k[1],k[1])); ws.merge_cells(start_row=1,start_column=c,end_row=3,end_column=c); c+=1
-    mets=_block_metrics(df,months,weeks); nwk=sum(x in WEEKS for x in mets)
+        lbl=key_labels.get(k[1],k[1]); ws.cell(3,c,lbl)
+        widths.append(min(45,max(len(str(lbl)),*(len(str(v)) for v in df[k].head(500))) + 2)); c+=1
+    mets=_block_metrics(df,months,weeks); nwk=sum(x in WEEKS for x in mets); pm=pretty_months(months)
     for m in months:
-        ws.cell(1,c,pretty_months(months)[m]); ws.merge_cells(start_row=1,start_column=c,end_row=1,end_column=c+len(mets)-1)
+        ws.cell(1,c,pm[m]); ws.merge_cells(start_row=1,start_column=c,end_row=1,end_column=c+len(mets)-1)
         for off,mt in enumerate(mets):
-            if mt in WEEKS:
-                if mt==WEEKS[0]:
-                    ws.cell(2,c+off,"Arrival Week"); ws.merge_cells(start_row=2,start_column=c+off,end_row=2,end_column=c+off+nwk-1)
-                ws.cell(3,c+off,mt)
-            else:
-                ws.cell(2,c+off,_metric_label(mt,mets)); ws.merge_cells(start_row=2,start_column=c+off,end_row=3,end_column=c+off)
+            if mt==WEEKS[0] and nwk:
+                ws.cell(2,c+off,"Arrival Week"); ws.merge_cells(start_row=2,start_column=c+off,end_row=2,end_column=c+off+nwk-1)
+            lbl=_metric_label(mt,mets); ws.cell(3,c+off,lbl)
+            widths.append(9 if mt in WEEKS else (14 if "Shortfall" in lbl else 11))
         c+=len(mets)
     ncol=c-1
     for r_ in range(1,4):
         for cc in range(1,ncol+1):
             cell=ws.cell(r_,cc); cell.font=bold; cell.alignment=ctr; cell.border=bd
-            if r_==1 and cc>len(keys): cell.fill=fill
+            if cc>len(keys): cell.fill=fill if r_==1 else hfill
+            elif r_==3: cell.fill=hfill
+    ws.row_dimensions[3].height=32
+    last=3
     for i,(_,row) in enumerate(df.iterrows(),start=4):
         vals=[row[k] for k in keys]+[row[(m,mt)] for m in months for mt in mets]
         for j,v in enumerate(vals,start=1):
@@ -1582,6 +1587,9 @@ def grouped_to_excel(w,df,sheet,key_labels,weeks=True):
             cell.border=bd
             if isinstance(v,float): cell.number_format="#,##0"
             if str(row[keys[0]])=="TOTAL": cell.font=bold
+        last=i
+    for j,wd in enumerate(widths,start=1): ws.column_dimensions[get_column_letter(j)].width=wd
+    ws.auto_filter.ref=f"A3:{get_column_letter(ncol)}{last}"
     ws.freeze_panes=ws.cell(4,len(keys)+1)
 
 
