@@ -314,7 +314,7 @@ for k, v in {
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_prod": None, "_receipt": None,
     "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None, "plan_open": False,
-    "_imp_po": None, "imp_results": None,
+    "_imp_po": None, "imp_results": None, "_sup_master": None,
     "authenticated": False, "_login_error": "",
 }.items():
     if k not in st.session_state:
@@ -327,7 +327,8 @@ import os, hashlib, datetime as _dt
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".saved_uploads")
 PERSIST_KEYS = {"_bom":"BOM", "_req":"Req & Stock", "_prod":"Production Orders", "_receipt":"Receipts",
                 "seg_imp_bytes":"Segment & Import Part", "_imp_po":"Import PO",
-                "_aging":"Aging", "_ag_bom":"Aging BOM", "_ag_req":"Aging Req", "_ag_rec":"Aging Receipts"}
+                "_aging":"Aging", "_ag_bom":"Aging BOM", "_ag_req":"Aging Req", "_ag_rec":"Aging Receipts",
+                "_sup_master":"Supplier Master"}
 
 def _saved_path(k): return os.path.join(UPLOAD_DIR, k.strip("_") + ".bin")
 
@@ -1329,7 +1330,7 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
     out.attrs["ctx"]=dict(fg_req=fg_req,arr={"|".join(k):v for k,v in arr.items()},hdr_alt=hdr_alt)
     return out,mcols
 
-def component_monthwise(seg_r, mw, mcols):
+def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
     """Component-level ledger in pieces: one row per FG × BOM header (IDU/ODU) × import component.
     Req = FG req × qty per set. Stock (pooled per interchange group) and PO arrivals are shared by all rows using
     that component and consumed in table order: Available = what is left when the row is reached, Balance is handed
@@ -1347,8 +1348,8 @@ def component_monthwise(seg_r, mw, mcols):
             for p,q in sorted((rq or {}).items()):
                 if q>0: lines.append((f["FG_Code"],side,hdr,p,pg.get(p,p),q,hdr_alt.get(hdr,"")))
     lines.sort(key=lambda x:order.index(x[0]) if x[0] in order else 1e9)
-    left={}; firsts=defaultdict(set); rows=[]
-    for k in {l[4] for l in lines}: left[k]=float(stock.get(k,0))
+    left={}; left0={}; rows=[]
+    for k in {l[4] for l in lines}: left[k]=left0[k]=float(stock.get(k,0))   # left0: stock-only ledger (no POs)
     for m in mcols:
         seen=set()
         for fg,side,hdr,p,key,q,alt in lines:
@@ -1356,19 +1357,24 @@ def component_monthwise(seg_r, mw, mcols):
             wk={w:(float(arr.get(f"{key}|{m}|{w}",0.0)) if key not in seen else 0.0) for w in WEEKS}; seen.add(key)
             rq=float(fg_req.get(fg,{}).get(m,0.0))*q; tot=sum(wk.values())
             bal=max(0.0,av+tot-rq); sf=max(0.0,rq-av-tot); left[key]=bal
+            av0=left0[key]; sf0=max(0.0,rq-av0); left0[key]=max(0.0,av0-rq)
             mt=meta.loc[fg]
             rows.append({"Segment":mt["Segment"],"Alt BOM":alt,"FG Description":mt["FG Description"],"FG Code":fg,
-                         "Category":side,"IDU / ODU":hdr,"Component":p,"Key":key,"Qty / set":q,"Month":m,
-                         "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf})
+                         "Category":side,"IDU / ODU":hdr,"Component":p,
+                         "Description":(desc_map or {}).get(p,""),"Supplier":(sup_map or {}).get(p,""),
+                         "Key":key,"Qty / set":q,"Month":m,
+                         "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf,
+                         "Shortfall Before":sf0})
     return pd.DataFrame(rows)
 
 MODEL_KEYS={"Segment":"Segment","FG Code":"FG Code","Category":"Category","IDU / ODU":"IDU / ODU",
-            "Alt BOM":"Alt BOM","Component":"Component","Qty / set":"Qty / set","Unit":"Unit"}
+            "Alt BOM":"Alt BOM","Component":"Component","Description":"Description","Supplier":"Supplier",
+            "Qty / set":"Qty / set","Unit":"Unit"}
 
 def model_with_components(mw, cmw):
     """Long table for the Model + components view: per FG its import component rows in pieces
     (which part is short, per BOM header). FG set totals are in the Model-wise (sets) tab."""
-    num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall"]
+    num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall","Shortfall Before"]
     parts=[]
     comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["Month"]+num)
     if not comp.empty:
@@ -1430,6 +1436,8 @@ def _mw_remark(av,rq,arrivals,sf):
 def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
     """Rows = keys (e.g. Segment); for each month the MW_METRICS block, like the planning sheet."""
     agg=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall"]
+    has0="Shortfall Before" in long_df.columns
+    if has0: agg=agg+["Shortfall Before"]
     g=long_df.groupby(keys+["Month"],as_index=False,sort=False)[agg].sum()
     base=long_df[keys].drop_duplicates().reset_index(drop=True)
     tot_req=long_df.groupby(keys,sort=False)["Requirement"].sum().rename("_r").reset_index()
@@ -1441,7 +1449,9 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
         gm=base.merge(g[g["Month"]==m],on=keys,how="left").fillna(0)
         cols[(m,"Available")]=gm["Sets Available"].values; cols[(m,"Req")]=gm["Requirement"].values
         for w in WEEKS: cols[(m,w)]=gm[w].values
-        cols[(m,"Balance")]=gm["Balance c/f"].values; cols[(m,"Shortfall")]=gm["Net Shortfall"].values
+        cols[(m,"Balance")]=gm["Balance c/f"].values
+        if has0: cols[(m,"Shortfall before arrival")]=gm["Shortfall Before"].values
+        cols[(m,"Shortfall")]=gm["Net Shortfall"].values
         cols[(m,"Remarks")]=[_mw_remark(a,r,x,s) for a,r,x,s in zip(gm["Sets Available"],gm["Requirement"],gm["Arrival Sets"],gm["Net Shortfall"])]
     out=pd.DataFrame(cols); out.columns=pd.MultiIndex.from_tuples(out.columns)
     left=base.copy(); left.columns=pd.MultiIndex.from_tuples([("",k) for k in keys])
@@ -1456,8 +1466,17 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
         tr[(m,"Remarks")]=_mw_remark(tr[(m,"Available")],tr[(m,"Req")],sum(tr[(m,w)] for w in WEEKS),tr[(m,"Shortfall")])
     return pd.concat([out,pd.DataFrame([tr],columns=out.columns)],ignore_index=True)
 
+METRIC_ORDER=["Available","Req"]+WEEKS+["Balance","Shortfall before arrival","Shortfall","Remarks"]
+
+def _block_metrics(df,months,weeks=True):
+    """Metric columns present in each month block, in display order."""
+    return [mt for mt in METRIC_ORDER if (months[0],mt) in df.columns and (weeks or mt not in WEEKS)]
+
+def _metric_label(mt,mets):
+    return "Shortfall after arrival" if mt=="Shortfall" and "Shortfall before arrival" in mets else mt
+
 KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":76,"Component":135,
-               "Qty / set":66,"Unit":48,"Codes":160,"Used in BOM headers":150,"FG codes":170}
+               "Qty / set":66,"Unit":48,"Description":190,"Supplier":150,"Codes":160,"Used in BOM headers":150,"FG codes":170}
 
 def grouped_table_html(df,key_labels,freeze=(),weeks=True):
     """Two-row header HTML table: month blocks with 'Arrival Week' spanning WK01-WK04.
@@ -1478,15 +1497,15 @@ def grouped_table_html(df,key_labels,freeze=(),weeks=True):
     thm='style="border:1px solid #d1d5db;padding:4px 8px;background:#e0ecff;font-weight:700;text-align:center;"'
     h0="<tr>"+"".join(f'<th style="{th_base}{kst(i,"#f3f4f6",4)}" rowspan="3" title="{_h.escape(l)}">{_h.escape(l)}</th>' for i,l in enumerate(labels))
     pm=pretty_months(months)
-    mets=MW_METRICS if weeks else [x for x in MW_METRICS if x not in WEEKS]
+    mets=_block_metrics(df,months,weeks)
     h0+="".join(f'<th {thm} colspan="{len(mets)}">{_h.escape(pm[m])}</th>' for m in months)+"</tr>"
     h1="<tr>"; h2="<tr>"
     for m in months:
-        if not weeks:
-            h1+="".join(f'<th {th} rowspan="2">{x}</th>' for x in mets); continue
-        h1+=f'<th {th} rowspan="2">Available</th><th {th} rowspan="2">Req</th><th {th} colspan="4">Arrival Week</th>'
-        h1+=f'<th {th} rowspan="2">Balance</th><th {th} rowspan="2">Shortfall</th><th {th} rowspan="2">Remarks</th>'
-        h2+="".join(f"<th {th}>{w}</th>" for w in WEEKS)
+        for mt in mets:
+            if mt in WEEKS:
+                if mt==WEEKS[0]: h1+=f'<th {th} colspan="{sum(x in WEEKS for x in mets)}">Arrival Week</th>'
+                h2+=f"<th {th}>{mt}</th>"
+            else: h1+=f'<th {th} rowspan="2">{_h.escape(_metric_label(mt,mets))}</th>'
     h1+="</tr>"; h2+="</tr>"
     body=""
     for i,row in df.iterrows():
@@ -1504,7 +1523,7 @@ def grouped_table_html(df,key_labels,freeze=(),weeks=True):
                     col="#dc2626" if str(v).startswith(("Short","No ")) else "#15803d" if v else "#6b7280"
                     cells+=f'<td style="{st_}text-align:left;color:{col};white-space:nowrap;">{_h.escape(str(v))}</td>'; continue
                 v=float(v)
-                if mt=="Shortfall" and v>0: st_+="color:#dc2626;font-weight:700;background:#fef2f2;"
+                if mt in ("Shortfall","Shortfall before arrival") and v>0: st_+="color:#dc2626;font-weight:700;background:#fef2f2;"
                 elif mt=="Balance": st_+="background:#f0fdf4;"
                 elif mt in WEEKS and v>0: st_+="color:#1d4ed8;background:#eff6ff;"
                 txt="" if (mt in WEEKS and v==0) else f"{v:,.0f}"
@@ -1537,20 +1556,17 @@ def grouped_to_excel(w,df,sheet,key_labels,weeks=True):
     c=1
     for k in keys:
         ws.cell(1,c,key_labels.get(k[1],k[1])); ws.merge_cells(start_row=1,start_column=c,end_row=3,end_column=c); c+=1
-    mets=MW_METRICS if weeks else [x for x in MW_METRICS if x not in WEEKS]
+    mets=_block_metrics(df,months,weeks); nwk=sum(x in WEEKS for x in mets)
     for m in months:
         ws.cell(1,c,pretty_months(months)[m]); ws.merge_cells(start_row=1,start_column=c,end_row=1,end_column=c+len(mets)-1)
-        if not weeks:
-            for off,lbl in enumerate(mets):
-                ws.cell(2,c+off,lbl); ws.merge_cells(start_row=2,start_column=c+off,end_row=3,end_column=c+off)
-            c+=len(mets); continue
-        for off,lbl in enumerate(["Available","Req"]):
-            ws.cell(2,c+off,lbl); ws.merge_cells(start_row=2,start_column=c+off,end_row=3,end_column=c+off)
-        ws.cell(2,c+2,"Arrival Week"); ws.merge_cells(start_row=2,start_column=c+2,end_row=2,end_column=c+5)
-        for i,wk in enumerate(WEEKS): ws.cell(3,c+2+i,wk)
-        for off,lbl in enumerate(["Balance","Shortfall","Remarks"]):
-            ws.cell(2,c+6+off,lbl); ws.merge_cells(start_row=2,start_column=c+6+off,end_row=3,end_column=c+6+off)
-        c+=len(MW_METRICS)
+        for off,mt in enumerate(mets):
+            if mt in WEEKS:
+                if mt==WEEKS[0]:
+                    ws.cell(2,c+off,"Arrival Week"); ws.merge_cells(start_row=2,start_column=c+off,end_row=2,end_column=c+off+nwk-1)
+                ws.cell(3,c+off,mt)
+            else:
+                ws.cell(2,c+off,_metric_label(mt,mets)); ws.merge_cells(start_row=2,start_column=c+off,end_row=3,end_column=c+off)
+        c+=len(mets)
     ncol=c-1
     for r_ in range(1,4):
         for cc in range(1,ncol+1):
@@ -2187,6 +2203,33 @@ def create_seg_imp_template():
         ins.cell(i,1,t).font=F(size=12 if i==1 else 10,bold=b_)
     ins.column_dimensions["A"].width=115
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+def load_supplier_master(sup_bytes, known_codes=()):
+    """Part-wise supplier master: first column (or 'Part/Material/Component') = part code, 'Supplier'/'Vendor' column
+    = supplier (several suppliers for one part are joined). Returns ({part: supplier}, error)."""
+    try:
+        df=pd.read_excel(io.BytesIO(sup_bytes),dtype=str); df.columns=[str(c).strip() for c in df.columns]
+    except Exception as e: return {},f"Could not read Supplier Master: {e}"
+    if df.empty or len(df.columns)<2: return {},"Supplier Master needs a part code column and a supplier column."
+    n=lambda c:c.lower()
+    pc=next((c for c in df.columns if any(k in n(c) for k in ["part","material","component","item"]) and "desc" not in n(c)),df.columns[0])
+    sc=next((c for c in df.columns if c!=pc and any(k in n(c) for k in ["supplier","vendor"]) and "code" not in n(c)),None) \
+       or next((c for c in df.columns if c!=pc and any(k in n(c) for k in ["supplier","vendor"])),None) \
+       or next(c for c in df.columns if c!=pc)
+    d=df[[pc,sc]].dropna(); d[pc]=d[pc].astype(str).str.strip(); d[sc]=d[sc].astype(str).str.strip()
+    d=d[(d[pc]!="")&(d[sc]!="")&(d[sc].str.lower()!="nan")]
+    if known_codes: d[pc]=align_part_codes(d.rename(columns={pc:"Part"}),set(known_codes))["Part"].values
+    return {p:", ".join(dict.fromkeys(g[sc])) for p,g in d.groupby(pc,sort=False)},None
+
+def create_supplier_master_template():
+    df=pd.DataFrame({"Part Code":["0011800613Z","0011801843WNP","0010205068HNP"],
+                     "Description":["IDU PCB-70R","ODU PCB","Compressor"],
+                     "Supplier":["Supplier A","Supplier B","Supplier C"]})
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as w:
+        df.to_excel(w,sheet_name="Supplier Master",index=False)
+        for c in w.sheets["Supplier Master"]["A"]: c.number_format="@"
+    buf.seek(0); return buf
 
 def create_import_po_template():
     """Import PO template: one row per PO line; red headers required; grey columns show the ETA month / week."""
@@ -2921,6 +2964,13 @@ elif st.session_state["page"] == "segment":
                     st.download_button("📥 Import PO template (week-wise ETA / ETD)",data=create_import_po_template().getvalue(),
                                        file_name="import_po_weekly_template.xlsx",key="dl_seg_po",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    smf=st.file_uploader("Supplier Master — part-wise supplier (optional)",type=["xlsx","xls"],key="seg_sup_u",
+                                         help="Columns: Part Code, Supplier (Description optional). Fills the Supplier column in Model + components.")
+                    if smf: st.session_state["_sup_master"]=smf.getvalue()
+                    elif st.session_state.get("_sup_master"): st.caption("✓ Using Supplier Master already in session.")
+                    st.download_button("📥 Supplier Master template",data=create_supplier_master_template().getvalue(),
+                                       file_name="supplier_master_template.xlsx",key="dl_seg_sup",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 po_df=None
                 if st.session_state.get("_imp_po"):
                     po_df,po_err=load_import_po(st.session_state["_imp_po"],st.session_state.get("imp_transit",30))
@@ -2953,7 +3003,18 @@ elif st.session_state["page"] == "segment":
                     fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code"}
                     fgo_g=monthwise_grouped(mw,list(fgo_keys),mw_months)
                     fgo_g=pd.concat([fgo_g.iloc[:-1].sort_values(("","Segment"),kind="stable"),fgo_g.iloc[-1:]],ignore_index=True)
-                    cmw=component_monthwise(r,mw_arr,mw_months)
+                    _bom=mrp_r["bom"]
+                    desc_map=dict(zip(_bom["Component"].astype(str),_bom["Component descriptio"].astype(str).replace("nan",""))) \
+                             if "Component descriptio" in _bom.columns else {}
+                    sup_map={}
+                    if po_df is not None and "Supplier" in po_df.columns:     # fallback: supplier on the PO lines
+                        _p=align_part_codes(po_df,_mrp_known_codes(mrp_r)); _p=_p[_p["Supplier"].astype(str).str.strip()!=""]
+                        sup_map={k:", ".join(dict.fromkeys(g["Supplier"].astype(str).str.strip())) for k,g in _p.groupby("Part")}
+                    if st.session_state.get("_sup_master"):                      # Supplier Master wins
+                        _sm,_se=load_supplier_master(st.session_state["_sup_master"],_mrp_known_codes(mrp_r))
+                        if _se: st.warning(_se)
+                        sup_map.update(_sm)
+                    cmw=component_monthwise(r,mw_arr,mw_months,desc_map,sup_map)
                     mdl=model_with_components(mw_arr,cmw)
                     fg_g=monthwise_grouped(mdl,list(fg_keys),mw_months,keep_order=True,total=False)
                     cs_long,cs_info=component_shortage(cmw,mw_months,mw_arr.attrs.get("ctx",{}).get("arr",{}),r)
@@ -2988,6 +3049,7 @@ elif st.session_state["page"] == "segment":
                         with o2: comp_mode=st.radio("Component rows",["All","Short only"],horizontal=True,key="seg_mw_comp")
                         fv=fg_g
                         sfc=[c for c in fg_g.columns if c[1]=="Shortfall"]
+                        sfc=sfc+[c for c in fg_g.columns if c[1]=="Shortfall before arrival"]
                         keep=pd.Series(comp_mode=="All",index=fv.index) | (fv[sfc].sum(axis=1)>0)
                         if only_fg:
                             short_fg=set(mw[mw["Net Shortfall"]>0]["FG Code"])
@@ -3714,7 +3776,7 @@ elif st.session_state["page"] == "settings":
     if st.button("🗑 Clear all session data",key="clr"):
         for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes",
                   "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_rec",
-                  "_imp_po","imp_results"]:
+                  "_imp_po","imp_results","_sup_master"]:
             st.session_state[k]=None
         sync_saved_uploads()
         st.success("Session cleared."); st.rerun()
