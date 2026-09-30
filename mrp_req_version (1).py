@@ -1513,16 +1513,18 @@ def grouped_table_html(df,key_labels,freeze=()):
 def show_grouped_table(df,key_labels,freeze=()):
     """Render the grouped table inside its own frame so every Streamlit version shows it exactly as built
     (merged month headers, colours, pinned columns, sideways scroll) — st.markdown may strip the styling."""
-    import streamlit.components.v1 as components
-    html=grouped_table_html(df,key_labels,freeze=freeze)
+    html=grouped_table_html(df,key_labels,freeze=freeze)   # every cell value is html-escaped
     h=min(600,3*30+len(df)*29+30)
-    components.html('<html><head><style>body{margin:0;font-family:"Plus Jakarta Sans","Segoe UI",Arial,sans-serif;}'
-                    'div::-webkit-scrollbar{height:10px;width:10px}div::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:5px}'
-                    '</style></head><body>'+html.replace("max-height:560px","max-height:590px")+'</body></html>',
-                    height=h,scrolling=False)
+    page=('<html><head><style>body{margin:0;font-family:"Plus Jakarta Sans","Segoe UI",Arial,sans-serif;}'
+          'div::-webkit-scrollbar{height:10px;width:10px}div::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:5px}'
+          '</style></head><body>'+html.replace("max-height:560px","max-height:590px")+'</body></html>')
+    if hasattr(st,"iframe"): st.iframe(page,height=h)            # newer Streamlit
+    else:
+        import streamlit.components.v1 as components               # older Streamlit
+        components.html(page,height=h,scrolling=False)
 
-def grouped_to_excel(w,df,sheet,key_labels):
-    """Write the grouped table with merged month / 'Arrival Week' headers."""
+def grouped_to_excel(w,df,sheet,key_labels,weeks=True):
+    """Write the grouped table with merged month / 'Arrival Week' headers (weeks=False leaves out WK01-WK04)."""
     from openpyxl.styles import Alignment,Font,PatternFill,Border,Side
     ws=w.book.create_sheet(sheet)
     keys=[c for c in df.columns if c[0]==""]; months=list(dict.fromkeys(c[0] for c in df.columns if c[0]!=""))
@@ -1531,8 +1533,13 @@ def grouped_to_excel(w,df,sheet,key_labels):
     c=1
     for k in keys:
         ws.cell(1,c,key_labels.get(k[1],k[1])); ws.merge_cells(start_row=1,start_column=c,end_row=3,end_column=c); c+=1
+    mets=MW_METRICS if weeks else [x for x in MW_METRICS if x not in WEEKS]
     for m in months:
-        ws.cell(1,c,pretty_months(months)[m]); ws.merge_cells(start_row=1,start_column=c,end_row=1,end_column=c+len(MW_METRICS)-1)
+        ws.cell(1,c,pretty_months(months)[m]); ws.merge_cells(start_row=1,start_column=c,end_row=1,end_column=c+len(mets)-1)
+        if not weeks:
+            for off,lbl in enumerate(mets):
+                ws.cell(2,c+off,lbl); ws.merge_cells(start_row=2,start_column=c+off,end_row=3,end_column=c+off)
+            c+=len(mets); continue
         for off,lbl in enumerate(["Available","Req"]):
             ws.cell(2,c+off,lbl); ws.merge_cells(start_row=2,start_column=c+off,end_row=3,end_column=c+off)
         ws.cell(2,c+2,"Arrival Week"); ws.merge_cells(start_row=2,start_column=c+2,end_row=2,end_column=c+5)
@@ -1546,9 +1553,10 @@ def grouped_to_excel(w,df,sheet,key_labels):
             cell=ws.cell(r_,cc); cell.font=bold; cell.alignment=ctr; cell.border=bd
             if r_==1 and cc>len(keys): cell.fill=fill
     for i,(_,row) in enumerate(df.iterrows(),start=4):
-        vals=[row[k] for k in keys]+[row[(m,mt)] for m in months for mt in MW_METRICS]
+        vals=[row[k] for k in keys]+[row[(m,mt)] for m in months for mt in mets]
         for j,v in enumerate(vals,start=1):
-            cell=ws.cell(i,j,(None if isinstance(v,float) and v==0 and df.columns[j-1][1] in WEEKS else v))
+            is_wk=weeks and j>len(keys) and mets[(j-len(keys)-1)%len(mets)] in WEEKS
+            cell=ws.cell(i,j,(None if isinstance(v,float) and v==0 and is_wk else v))
             cell.border=bd
             if isinstance(v,float): cell.number_format="#,##0"
             if str(row[keys[0]])=="TOTAL": cell.font=bold
@@ -2945,13 +2953,10 @@ elif st.session_state["page"] == "segment":
                     cs_g=monthwise_grouped(cs_long,list(cs_keys),mw_months,keep_order=True,total=False) if not cs_long.empty else pd.DataFrame()
                     _xb=io.BytesIO()
                     with pd.ExcelWriter(_xb,engine="openpyxl") as _w:
-                        pd.DataFrame({"Month-wise sets vs requirement":[f"Basis: {basis}",f"Months: {', '.join(pretty_months(mw_months).values())}"]}).to_excel(_w,sheet_name="Info",index=False)
-                        grouped_to_excel(_w,seg_g,"Segment-wise",seg_keys)
-                        grouped_to_excel(_w,fgo_g,"Model-wise (sets)",fgo_keys)
+                        grouped_to_excel(_w,seg_g,"Segment-wise",seg_keys,weeks=False)
+                        grouped_to_excel(_w,fgo_g,"Model-wise (sets)",fgo_keys,weeks=False)
                         if not fg_g.empty: grouped_to_excel(_w,fg_g,"Model + components",fg_keys)
-                        if not cs_g.empty:
-                            cs_info.to_excel(_w,sheet_name="Component Shortage",index=False)
-                            grouped_to_excel(_w,cs_g,"Component Monthwise",cs_keys)
+                        if "Sheet" in _w.book.sheetnames and len(_w.book.sheetnames)>1: del _w.book["Sheet"]
                     _xb.seek(0)
                     st.download_button("⬇ Download month-wise tables (.xlsx)",data=_xb,file_name="segment_monthwise.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
