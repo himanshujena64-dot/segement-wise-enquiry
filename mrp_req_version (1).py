@@ -1336,7 +1336,7 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
     that component and consumed in table order: Available = what is left when the row is reached, Balance is handed
     to the next row using the same component, and the last balance carries into next month."""
     ctx=mw.attrs.get("ctx",{}); fg_req=ctx.get("fg_req",{}); arr=ctx.get("arr",{}); hdr_alt=ctx.get("hdr_alt",{})
-    pg=seg_r.get("part_group",{}); stock=seg_r["stock"]
+    pg=seg_r.get("part_group",{}); stock=seg_r["stock"]; rmm=seg_r.get("rm_map",{}) or {}
     meta=mw.drop_duplicates("FG Code").set_index("FG Code")
     order=meta.sort_values("Segment",kind="stable").index.tolist()
     lines=[]
@@ -1360,7 +1360,9 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
             av0=left0[key]; sf0=max(0.0,rq-av0); left0[key]=max(0.0,av0-rq)
             mt=meta.loc[fg]
             rows.append({"Segment":mt["Segment"],"Alt BOM":alt,"FG Description":mt["FG Description"],"FG Code":fg,
-                         "Category":side,"IDU / ODU":hdr,"Component":p,
+                         "Category":side,"IDU / ODU":hdr,
+                         "RM Group":(lambda g:"" if str(g).lower() in ("","nan","none","—") else str(g))(rmm.get(p,rmm.get(key,""))),
+                         "Component":p,
                          "Description":(desc_map or {}).get(p,""),"Supplier":(sup_map or {}).get(p,""),
                          "Key":key,"Qty / set":q,"Month":m,
                          "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf,
@@ -1368,7 +1370,7 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
     return pd.DataFrame(rows)
 
 MODEL_KEYS={"Segment":"Segment","FG Code":"FG Code","Category":"Category","IDU / ODU":"IDU / ODU",
-            "Alt BOM":"Alt BOM","Component":"Component","Description":"Description","Supplier":"Supplier",
+            "Alt BOM":"Alt BOM","RM Group":"RM Group","Component":"Component","Description":"Description","Supplier":"Supplier",
             "Qty / set":"Qty / set","Unit":"Unit"}
 
 def model_with_components(mw, cmw):
@@ -1476,7 +1478,7 @@ def _metric_label(mt,mets):
     return "Shortfall after arrival" if mt=="Shortfall" and "Shortfall before arrival" in mets else mt
 
 KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":76,"Component":135,
-               "Qty / set":66,"Unit":48,"Description":190,"Supplier":150,"Codes":160,"Used in BOM headers":150,"FG codes":170}
+               "Qty / set":66,"Unit":48,"Description":190,"Supplier":150,"RM Group":110,"Codes":160,"Used in BOM headers":150,"FG codes":170}
 
 def grouped_table_html(df,key_labels,freeze=(),weeks=True):
     """Two-row header HTML table: month blocks with 'Arrival Week' spanning WK01-WK04.
