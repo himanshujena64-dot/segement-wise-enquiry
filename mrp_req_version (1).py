@@ -1128,7 +1128,7 @@ def explode_seg(hdr,bom,tset,alt=None):
             dfs(comp,eff,d+1)
     dfs(hdr,1.0); return res
 
-def run_segment(bom,stock,seg_bytes,active_rm=None):
+def run_segment(bom,stock,seg_bytes,active_rm=None,req_df=None):
     f=io.BytesIO(seg_bytes)
     status=st.status("Running Segment Capacity ...",expanded=True)
     with status: st.write("► Loading data ...")
@@ -1154,21 +1154,37 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
         if odu and odu!="nan" and odu not in bhdrs: nib.append(f"ODU {odu}")
     if nib: st.warning(f"Not in BOM: {', '.join(sorted(set(nib)))}")
     with status: st.write("► LP optimisation ...")
-    # One variant per FG × IDU Alt BOM (e.g. Alt 10 and Alt 11 differ in compressor → separate sets).
-    # The ODU uses the same alt number when its BOM has it, otherwise its first alt.
+    # One variant per FG × Alt BOM, where the Requirement sheet is the master for the alts:
+    # IDU alts = alts listed in the Requirement sheet for the FG code (else the IDU code). The ODU alt comes from the
+    # Requirement sheet too when the ODU header is listed there (same number if listed, else its first listed alt);
+    # otherwise from the BOM (same number if it exists, else the first). Not in the Requirement sheet → first BOM alt.
+    req_alts=defaultdict(list)
+    if req_df is not None and not req_df.empty and "Alt" in req_df.columns:
+        for h,a in zip(req_df["BOM Header"].astype(str).str.strip(),req_df["Alt"].astype(str).str.strip()):
+            if a not in req_alts[h]: req_alts[h].append(a)
+    _srt=lambda L:sorted(L,key=lambda x:(0,int(x)) if str(x).isdigit() else (1,str(x)))
+    alt_miss=[]
     fg_list=[]; fgseg={}; fgidu={}; fgodu={}; fgcomb={}; fgside={}; fgcode={}; fgalt={}; skipped=[]
     for _,row in seg_df.iterrows():
         fg=row["FG_Code"]; seg=row["Segment"]; idu=row["IDU"]; odu=row["Compatible_ODU"]
         if not odu or odu=="nan": skipped.append(f"{fg}: no ODU"); continue
-        ialts=bom_alts(idu,bom) or [""]; oalts=bom_alts(odu,bom)
+        bi=bom_alts(idu,bom); bo=bom_alts(odu,bom)
+        ialts=_srt(req_alts.get(fg) or req_alts.get(idu) or [])
+        if ialts:
+            for a in ialts:
+                if bi and a not in bi: alt_miss.append(f"{idu} Alt {a}")
+        else: ialts=bi[:1] or [""]
+        oreq=_srt(req_alts.get(odu,[]))
         for ia in ialts:
-            oa=ia if ia in oalts else (oalts[0] if oalts else "")
+            if oreq: oa=ia if ia in oreq else oreq[0]
+            else: oa=ia if ia in bo else (bo[0] if bo else "")
             ir=exp(idu,ia) if idu in bhdrs else {}; or_=exp(odu,oa) if odu in bhdrs else {}
             vk=fg if len(ialts)==1 else f"{fg} | Alt {ia}"
             if not ir and not or_: skipped.append(f"{vk}: no import parts"); continue
             ap=set(ir)|set(or_); comb={p:ir.get(p,0)+or_.get(p,0) for p in ap if ir.get(p,0)+or_.get(p,0)>0}
             fg_list.append(vk); fgseg[vk]=seg; fgidu[vk]=idu; fgodu[vk]=odu; fgcomb[vk]=comb
             fgside[vk]=(dict(ir),dict(or_)); fgcode[vk]=fg; fgalt[vk]=(ia,oa)
+    if alt_miss: st.warning("Alt in Requirement sheet not found in BOM (first BOM alt used instead): "+", ".join(sorted(set(alt_miss))))
     if not fg_list: st.error("No valid FG codes."); return None
     # Interchangeable parts: pool member codes into one group row (qty per set and stock both summed)
     ig_act={p:g for p,g in ig_map.items() if p in tset}
@@ -2842,7 +2858,7 @@ elif st.session_state["page"] == "segment":
             else:
                 try:
                     seg_bytes=st.session_state["seg_imp_bytes"]
-                    res=run_segment(mrp_r["bom"],mrp_r["stock"],seg_bytes)
+                    res=run_segment(mrp_r["bom"],mrp_r["stock"],seg_bytes,req_df=mrp_r.get("req"))
                     if res: st.session_state["seg_results"]=res
                 except Exception as e: st.exception(e)
 
@@ -2925,7 +2941,7 @@ elif st.session_state["page"] == "segment":
                         sb = st.session_state.get("seg_imp_bytes")
                         if sb:
                             with st.spinner("Recalculating capacity …"):
-                                nr = run_segment(mrp_r["bom"], mrp_r["stock"], sb, active_rm=sg)
+                                nr = run_segment(mrp_r["bom"], mrp_r["stock"], sb, active_rm=sg, req_df=mrp_r.get("req"))
                                 if nr: st.session_state["seg_results"] = nr; st.rerun()
 
             # ── Overview metrics — reflect the latest (possibly filtered) results ──
