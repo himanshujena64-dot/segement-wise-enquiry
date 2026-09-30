@@ -1106,10 +1106,16 @@ def load_seg_imp(f):
             seg["IDU"].notna()&(seg["IDU"]!="")&(seg["IDU"]!="nan")].copy().reset_index(drop=True)
     return import_parts,seg,rm_map,ig_map
 
-def explode_seg(hdr,bom,tset):
-    alts=sorted(bom[bom["BOM Header"]==hdr]["Alt"].unique())
+def bom_alts(hdr,bom):
+    """Alt BOMs of a header, numeric order (e.g. 10, 11, 20)."""
+    a=bom[bom["BOM Header"]==hdr]["Alt"].astype(str).unique().tolist()
+    return sorted(a,key=lambda x:(0,int(x)) if str(x).isdigit() else (1,str(x)))
+
+def explode_seg(hdr,bom,tset,alt=None):
+    alts=bom_alts(hdr,bom)
     if not alts: return {}
-    sub=bom[(bom["BOM Header"]==hdr)&(bom["Alt"]==alts[0])]
+    use=alt if alt in alts else alts[0]
+    sub=bom[(bom["BOM Header"]==hdr)&(bom["Alt"].astype(str)==use)]
     cmap=defaultdict(list)
     for _,r in sub.iterrows(): cmap[r["Parent"]].append(r)
     res={}
@@ -1138,24 +1144,31 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
     dc="BOM header descripti" if "BOM header descripti" in bom.columns else None
     dmap=(bom[["BOM Header",dc]].drop_duplicates("BOM Header").set_index("BOM Header")[dc].to_dict()) if dc else {}
     with status: st.write("► Exploding BOMs ...")
-    idu_r={}; odu_r={}; nib=[]
+    nib=[]; _ex={}
+    def exp(h,a):
+        if (h,a) not in _ex: _ex[(h,a)]=explode_seg(h,bom,tset,a)
+        return _ex[(h,a)]
     for idu in seg_df["IDU"].unique():
-        if idu in bhdrs: idu_r[idu]=explode_seg(idu,bom,tset)
-        else: nib.append(f"IDU {idu}")
+        if idu not in bhdrs: nib.append(f"IDU {idu}")
     for odu in seg_df["Compatible_ODU"].unique():
-        if not odu or odu=="nan": continue
-        if odu in bhdrs: odu_r[odu]=explode_seg(odu,bom,tset)
-        else: nib.append(f"ODU {odu}")
+        if odu and odu!="nan" and odu not in bhdrs: nib.append(f"ODU {odu}")
     if nib: st.warning(f"Not in BOM: {', '.join(sorted(set(nib)))}")
     with status: st.write("► LP optimisation ...")
-    fg_list=[]; fgseg={}; fgidu={}; fgodu={}; fgcomb={}; fgside={}; skipped=[]
+    # One variant per FG × IDU Alt BOM (e.g. Alt 10 and Alt 11 differ in compressor → separate sets).
+    # The ODU uses the same alt number when its BOM has it, otherwise its first alt.
+    fg_list=[]; fgseg={}; fgidu={}; fgodu={}; fgcomb={}; fgside={}; fgcode={}; fgalt={}; skipped=[]
     for _,row in seg_df.iterrows():
         fg=row["FG_Code"]; seg=row["Segment"]; idu=row["IDU"]; odu=row["Compatible_ODU"]
         if not odu or odu=="nan": skipped.append(f"{fg}: no ODU"); continue
-        ir=idu_r.get(idu,{}); or_=odu_r.get(odu,{})
-        if not ir and not or_: skipped.append(f"{fg}: no import parts"); continue
-        ap=set(ir)|set(or_); comb={p:ir.get(p,0)+or_.get(p,0) for p in ap if ir.get(p,0)+or_.get(p,0)>0}
-        fg_list.append(fg); fgseg[fg]=seg; fgidu[fg]=idu; fgodu[fg]=odu; fgcomb[fg]=comb; fgside[fg]=(dict(ir),dict(or_))
+        ialts=bom_alts(idu,bom) or [""]; oalts=bom_alts(odu,bom)
+        for ia in ialts:
+            oa=ia if ia in oalts else (oalts[0] if oalts else "")
+            ir=exp(idu,ia) if idu in bhdrs else {}; or_=exp(odu,oa) if odu in bhdrs else {}
+            vk=fg if len(ialts)==1 else f"{fg} | Alt {ia}"
+            if not ir and not or_: skipped.append(f"{vk}: no import parts"); continue
+            ap=set(ir)|set(or_); comb={p:ir.get(p,0)+or_.get(p,0) for p in ap if ir.get(p,0)+or_.get(p,0)>0}
+            fg_list.append(vk); fgseg[vk]=seg; fgidu[vk]=idu; fgodu[vk]=odu; fgcomb[vk]=comb
+            fgside[vk]=(dict(ir),dict(or_)); fgcode[vk]=fg; fgalt[vk]=(ia,oa)
     if not fg_list: st.error("No valid FG codes."); return None
     # Interchangeable parts: pool member codes into one group row (qty per set and stock both summed)
     ig_act={p:g for p,g in ig_map.items() if p in tset}
@@ -1182,7 +1195,8 @@ def run_segment(bom,stock,seg_bytes,active_rm=None):
             if req>0:
                 r=float(stock.get(p,0))/req
                 if r<lr: lr,lp=r,p
-        fg_res.append({"Segment":fgseg[fg],"FG_Code":fg,"FG_Desc":dmap.get(fg,""),"IDU":fgidu[fg],
+        fg_res.append({"Segment":fgseg[fg],"FG_Code":fgcode[fg],"VKey":fg,"IDU_Alt":fgalt[fg][0],"ODU_Alt":fgalt[fg][1],
+                       "FG_Desc":dmap.get(fgcode[fg],""),"IDU":fgidu[fg],
                        "IDU_Desc":dmap.get(fgidu[fg],""),"Compatible_ODU":fgodu[fg],
                        "ODU_Desc":dmap.get(fgodu[fg],""),"Max_Sets":int(qty),"Limiting_Part":lp,
                        "Limiting_Stock":int(stock.get(lp,0)) if lp!="—" else 0,"combined_req":cq,
@@ -1249,25 +1263,30 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
     hdrs=set(req_by_hdr.index); fg_res=seg_r["fg_results"]
     if not fg_res or not mcols: return pd.DataFrame(),mcols
 
-    # Requirement per FG: match on FG code, else IDU code (ODU is shared across sets, so not used)
+    # Requirement per variant (FG × IDU Alt BOM): rows of the Requirement sheet for the FG code, else the IDU code,
+    # with the SAME Alt. (ODU is shared across sets, so not used.) An FG with a single Alt BOM takes all its alts.
     fg_req={}; fg_src={}; fg_alt={}
-    req["_tot"]=req[mcols].sum(axis=1)
-    bom=mrp_r["bom"]
-    def _alts(code):
-        a=req[(req["BOM Header"]==code)&(req["_tot"]>0)]["Alt"].astype(str).unique().tolist() or \
-          req[req["BOM Header"]==code]["Alt"].astype(str).unique().tolist()
-        return ", ".join(sorted(a,key=lambda x:(len(x),x)))
+    req["Alt"]=req["Alt"].astype(str).str.strip()
+    req_by_alt=req.groupby(["BOM Header","Alt"])[mcols].sum()
+    vk_of=lambda f:f.get("VKey",f["FG_Code"])
+    n_var=defaultdict(int)
+    for f in fg_res: n_var[f["FG_Code"]]+=1
     for f in fg_res:
+        vk=vk_of(f); ia=str(f.get("IDU_Alt",""))
         for lbl,code in [("FG",f["FG_Code"]),("IDU",f["IDU"])]:
-            if code in hdrs:
-                fg_req[f["FG_Code"]]={m:float(req_by_hdr.at[code,m]) for m in mcols}; fg_src[f["FG_Code"]]=lbl
-                fg_alt[f["FG_Code"]]=_alts(code); break
+            if code not in hdrs: continue
+            if n_var[f["FG_Code"]]==1:
+                fg_req[vk]={m:float(req_by_hdr.at[code,m]) for m in mcols}
+            elif (code,ia) in req_by_alt.index:
+                fg_req[vk]={m:float(req_by_alt.loc[(code,ia),m]) for m in mcols}
+            else:
+                fg_req[vk]={m:0.0 for m in mcols}
+            fg_src[vk]=lbl; break
         else:
-            fg_req[f["FG_Code"]]={m:0.0 for m in mcols}; fg_src[f["FG_Code"]]="Not in Req"
-            ba=sorted(bom[bom["BOM Header"]==f["IDU"]]["Alt"].astype(str).unique().tolist())
-            fg_alt[f["FG_Code"]]=ba[0] if ba else ""  # alt used by the segment BOM explosion
+            fg_req[vk]={m:0.0 for m in mcols}; fg_src[vk]="Not in Req"
+        fg_alt[vk]=ia
 
-    fgs=[f["FG_Code"] for f in fg_res]; stock=seg_r["stock"]
+    fgs=[vk_of(f) for f in fg_res]; stock=seg_r["stock"]
     parts=sorted({p for f in fg_res for p in f["combined_req"]})
     A=np.array([[f["combined_req"].get(p,0) for f in fg_res] for p in parts],dtype=float)
     ub=[sum(fg_req[fg].values()) if basis=="req" else None for fg in fgs]
@@ -1307,27 +1326,18 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
 
     rows=[]
     for f in fg_res:
-        fg=f["FG_Code"]; avail=float(opening0[fg])
+        fg=vk_of(f); avail=float(opening0[fg])
         for m in mcols:
             wk={w:inc[(fg,m,w)] for w in WEEKS}; tot_arr=sum(wk.values())
             rq=fg_req[fg][m]; have=avail+tot_arr
             bal=max(0.0,have-rq); sf=max(0.0,rq-have)
-            rows.append({"Segment":f["Segment"],"FG Code":fg,"FG Description":f.get("FG_Desc","") or f.get("IDU_Desc",""),
+            rows.append({"Segment":f["Segment"],"FG Code":f["FG_Code"],"VKey":fg,"FG Description":f.get("FG_Desc","") or f.get("IDU_Desc",""),
                          "Alt BOM":fg_alt[fg],"Req matched on":fg_src[fg],"Month":m,"Sets Available":avail,"Requirement":rq,
                          **{w:wk[w] for w in WEEKS},"Arrival Sets":tot_arr,
                          "Balance c/f":bal,"Net Shortfall":sf})
             avail=bal
     out=pd.DataFrame(rows)
-    # Alt per BOM header: alt(s) with demand in the Requirement sheet, else the alt used by the segment explosion
-    hdr_alt={}
-    for f in fg_res:
-        for code in (f["IDU"],f["Compatible_ODU"]):
-            if code in hdr_alt or not code: continue
-            a=_alts(code) if code in hdrs else ""
-            if not a:
-                ba=sorted(bom[bom["BOM Header"]==code]["Alt"].astype(str).unique().tolist()); a=ba[0] if ba else ""
-            hdr_alt[code]=a
-    out.attrs["ctx"]=dict(fg_req=fg_req,arr={"|".join(k):v for k,v in arr.items()},hdr_alt=hdr_alt)
+    out.attrs["ctx"]=dict(fg_req=fg_req,arr={"|".join(k):v for k,v in arr.items()})
     return out,mcols
 
 def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
@@ -1335,18 +1345,19 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
     Req = FG req × qty per set. Stock (pooled per interchange group) and PO arrivals are shared by all rows using
     that component and consumed in table order: Available = what is left when the row is reached, Balance is handed
     to the next row using the same component, and the last balance carries into next month."""
-    ctx=mw.attrs.get("ctx",{}); fg_req=ctx.get("fg_req",{}); arr=ctx.get("arr",{}); hdr_alt=ctx.get("hdr_alt",{})
+    ctx=mw.attrs.get("ctx",{}); fg_req=ctx.get("fg_req",{}); arr=ctx.get("arr",{})
     pg=seg_r.get("part_group",{}); stock=seg_r["stock"]; rmm=seg_r.get("rm_map",{}) or {}
-    meta=mw.drop_duplicates("FG Code").set_index("FG Code")
+    meta=mw.drop_duplicates("VKey").set_index("VKey")
     order=meta.sort_values("Segment",kind="stable").index.tolist()
     lines=[]
     for f in seg_r["fg_results"]:
-        if f["FG_Code"] not in meta.index: continue
-        sides=[("IDU",f["IDU"],f.get("IDU_req")),("ODU",f["Compatible_ODU"],f.get("ODU_req"))]
-        if sides[0][2] is None: sides=[("IDU+ODU",f"{f['IDU']} + {f['Compatible_ODU']}",f["combined_req"])]
-        for side,hdr,rq in sides:
+        vk=f.get("VKey",f["FG_Code"])
+        if vk not in meta.index: continue
+        sides=[("IDU",f["IDU"],f.get("IDU_req"),f.get("IDU_Alt","")),("ODU",f["Compatible_ODU"],f.get("ODU_req"),f.get("ODU_Alt",""))]
+        if sides[0][2] is None: sides=[("IDU+ODU",f"{f['IDU']} + {f['Compatible_ODU']}",f["combined_req"],"")]
+        for side,hdr,rq,alt in sides:
             for p,q in sorted((rq or {}).items()):
-                if q>0: lines.append((f["FG_Code"],side,hdr,p,pg.get(p,p),q,hdr_alt.get(hdr,"")))
+                if q>0: lines.append((vk,side,hdr,p,pg.get(p,p),q,str(alt)))
     lines.sort(key=lambda x:order.index(x[0]) if x[0] in order else 1e9)
     left={}; left0={}; rows=[]
     for k in {l[4] for l in lines}: left[k]=left0[k]=float(stock.get(k,0))   # left0: stock-only ledger (no POs)
@@ -1359,7 +1370,7 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
             bal=max(0.0,av+tot-rq); sf=max(0.0,rq-av-tot); left[key]=bal
             av0=left0[key]; sf0=max(0.0,rq-av0); left0[key]=max(0.0,av0-rq)
             mt=meta.loc[fg]
-            rows.append({"Segment":mt["Segment"],"Alt BOM":alt,"FG Description":mt["FG Description"],"FG Code":fg,
+            rows.append({"Segment":mt["Segment"],"Alt BOM":alt,"FG Description":mt["FG Description"],"FG Code":mt["FG Code"],"VKey":fg,
                          "Category":side,"IDU / ODU":hdr,
                          "RM Group":(lambda g:"" if str(g).lower() in ("","nan","none","—") else str(g))(rmm.get(p,rmm.get(key,""))),
                          "Component":p,
@@ -1378,13 +1389,13 @@ def model_with_components(mw, cmw):
     (which part is short, per BOM header). FG set totals are in the Model-wise (sets) tab."""
     num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall","Shortfall Before"]
     parts=[]
-    comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["Month"]+num)
+    comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["VKey","Month"]+num)
     if not comp.empty:
         comp["Qty / set"]=comp["Qty / set"].map(lambda v:f"{v:g}"); comp["Unit"]="Pcs"
-    for fg in mw["FG Code"].drop_duplicates():
-        parts.append(comp[comp["FG Code"]==fg])
+    for vk in mw["VKey"].drop_duplicates():
+        parts.append(comp[comp["VKey"]==vk])
     out=pd.concat(parts,ignore_index=True)
-    return out[list(MODEL_KEYS)+["Month"]+num]
+    return out[list(MODEL_KEYS)+["VKey","Month"]+num]
 
 def component_shortage(cmw, mcols, arr, seg_r):
     """One row per import component (or ⇄ interchange group), all FGs together, in pieces; plus where it is used
@@ -2941,7 +2952,7 @@ elif st.session_state["page"] == "segment":
             sec("Sets producible per FG code")
             fg_res=r.get("fg_results",[])
             if fg_res:
-                fgdf=pd.DataFrame([{"Segment":f["Segment"],"FG Code":f["FG_Code"],"FG Description":f.get("FG_Desc",""),
+                fgdf=pd.DataFrame([{"Segment":f["Segment"],"FG Code":f["FG_Code"],"Alt BOM":f.get("IDU_Alt",""),"FG Description":f.get("FG_Desc",""),
                                      "IDU":f["IDU"],"IDU Desc":f.get("IDU_Desc",""),"Compatible ODU":f["Compatible_ODU"],
                                      "ODU Desc":f.get("ODU_Desc",""),"Max Sets":f["Max_Sets"],
                                      "Limiting Part":f["Limiting_Part"],"Limiting Stock":f["Limiting_Stock"]}
@@ -3026,14 +3037,15 @@ elif st.session_state["page"] == "segment":
                         sup_map.update(_sm)
                     cmw=component_monthwise(r,mw_arr,mw_months,desc_map,sup_map)
                     mdl=model_with_components(mw_arr,cmw)
-                    fg_g=monthwise_grouped(mdl,list(fg_keys),mw_months,keep_order=True,total=False)
+                    fg_g=monthwise_grouped(mdl,list(fg_keys)+["VKey"],mw_months,keep_order=True,total=False)   # VKey keeps each Alt apart
+                    _novk=lambda d:d.drop(columns=[("","VKey")]) if ("","VKey") in d.columns else d
                     cs_long,cs_info=component_shortage(cmw,mw_months,mw_arr.attrs.get("ctx",{}).get("arr",{}),r)
                     cs_g=monthwise_grouped(cs_long,list(cs_keys),mw_months,keep_order=True,total=False) if not cs_long.empty else pd.DataFrame()
                     _xb=io.BytesIO()
                     with pd.ExcelWriter(_xb,engine="openpyxl") as _w:
                         grouped_to_excel(_w,seg_g,"Segment-wise",seg_keys,weeks=False)
                         grouped_to_excel(_w,fgo_g,"Model-wise (sets)",fgo_keys,weeks=False)
-                        if not fg_g.empty: grouped_to_excel(_w,fg_g,"Model + components",fg_keys)
+                        if not fg_g.empty: grouped_to_excel(_w,_novk(fg_g),"Model + components",fg_keys)
                         if "Sheet" in _w.book.sheetnames and len(_w.book.sheetnames)>1: del _w.book["Sheet"]
                     _xb.seek(0)
                     st.download_button("⬇ Download month-wise tables (.xlsx)",data=_xb,file_name="segment_monthwise.xlsx",
@@ -3062,10 +3074,10 @@ elif st.session_state["page"] == "segment":
                         sfc=sfc+[c for c in fg_g.columns if c[1]=="Shortfall before arrival"]
                         keep=pd.Series(comp_mode=="All",index=fv.index) | (fv[sfc].sum(axis=1)>0)
                         if only_fg:
-                            short_fg=set(mw[mw["Net Shortfall"]>0]["FG Code"])
-                            keep=keep & fv[("","FG Code")].isin(short_fg)
+                            short_fg=set(mw[mw["Net Shortfall"]>0]["VKey"])
+                            keep=keep & fv[("","VKey")].isin(short_fg)
                         if not keep.any(): st.success("No component rows to show with these filters.")
-                        else: show_grouped_table(fv[keep],fg_keys,freeze=("FG Code","Component"))
+                        else: show_grouped_table(_novk(fv[keep]),fg_keys,freeze=("FG Code","Component"))
                     with sw4:
                         if cs_g.empty: st.info("No import components found for these FGs.")
                         else:
@@ -3092,10 +3104,11 @@ elif st.session_state["page"] == "segment":
                     st.session_state["_seg_mw_export"]=(seg_g,fg_g,mw,seg_keys,fg_keys,cs_g,cs_keys,cs_info,fgo_g,fgo_keys)
 
             sec("FG detail — import part breakdown")
-            opts=sorted([f["FG_Code"] for f in fg_res],key=lambda fg:-next(f["Max_Sets"] for f in fg_res if f["FG_Code"]==fg))
-            sfg=st.selectbox("Select FG code",options=opts,key="sfg")
+            _vk=lambda f:f.get("VKey",f["FG_Code"])
+            opts=[_vk(f) for f in sorted(fg_res,key=lambda f:-f["Max_Sets"])]
+            sfg=st.selectbox("Select FG code (and Alt BOM)",options=opts,key="sfg")
             if sfg:
-                fgr=next(f for f in fg_res if f["FG_Code"]==sfg); sets=fgr["Max_Sets"]
+                fgr=next(f for f in fg_res if _vk(f)==sfg); sets=fgr["Max_Sets"]
                 st.markdown(f"**{sfg}** — {fgr.get('FG_Desc','')} · Segment: `{fgr['Segment']}` · IDU: `{fgr['IDU']}` · ODU: `{fgr['Compatible_ODU']}` · **Max sets: {sets:,}**")
                 irows=[]
                 for p,req in sorted(fgr["combined_req"].items(),key=lambda x:-x[1]):
@@ -3132,7 +3145,7 @@ elif st.session_state["page"] == "segment":
                 if fg_res and _mwx:
                     grouped_to_excel(w,_mwx[0],"Monthwise Segment",_mwx[3],weeks=False)
                     grouped_to_excel(w,_mwx[8],"Monthwise Model (sets)",_mwx[9],weeks=False)
-                    if not _mwx[1].empty: grouped_to_excel(w,_mwx[1],"Monthwise Model+Comp",_mwx[4])
+                    if not _mwx[1].empty: grouped_to_excel(w,_mwx[1].drop(columns=[("","VKey")],errors="ignore"),"Monthwise Model+Comp",_mwx[4])
                     if not _mwx[5].empty:
                         _mwx[7].to_excel(w,sheet_name="Component Shortage",index=False)
                         grouped_to_excel(w,_mwx[5],"Component Monthwise",_mwx[6])
