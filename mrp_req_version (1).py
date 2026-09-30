@@ -314,7 +314,7 @@ for k, v in {
     "cfg_vl2": "0010748458", "cfg_vl3": "0010748814", "cfg_vl4": "0010300601DEL",
     "_bom": None, "_req": None, "_prod": None, "_receipt": None,
     "_aging": None, "_ag_bom": None, "_ag_req": None, "_ag_rec": None, "plan_open": False,
-    "_imp_po": None, "imp_results": None,
+    "_imp_po": None, "imp_results": None, "_sup_master": None,
     "authenticated": False, "_login_error": "",
 }.items():
     if k not in st.session_state:
@@ -327,7 +327,8 @@ import os, hashlib, datetime as _dt
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".saved_uploads")
 PERSIST_KEYS = {"_bom":"BOM", "_req":"Req & Stock", "_prod":"Production Orders", "_receipt":"Receipts",
                 "seg_imp_bytes":"Segment & Import Part", "_imp_po":"Import PO",
-                "_aging":"Aging", "_ag_bom":"Aging BOM", "_ag_req":"Aging Req", "_ag_rec":"Aging Receipts"}
+                "_aging":"Aging", "_ag_bom":"Aging BOM", "_ag_req":"Aging Req", "_ag_rec":"Aging Receipts",
+                "_sup_master":"Supplier Master"}
 
 def _saved_path(k): return os.path.join(UPLOAD_DIR, k.strip("_") + ".bin")
 
@@ -1329,7 +1330,7 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
     out.attrs["ctx"]=dict(fg_req=fg_req,arr={"|".join(k):v for k,v in arr.items()},hdr_alt=hdr_alt)
     return out,mcols
 
-def component_monthwise(seg_r, mw, mcols):
+def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
     """Component-level ledger in pieces: one row per FG × BOM header (IDU/ODU) × import component.
     Req = FG req × qty per set. Stock (pooled per interchange group) and PO arrivals are shared by all rows using
     that component and consumed in table order: Available = what is left when the row is reached, Balance is handed
@@ -1358,12 +1359,15 @@ def component_monthwise(seg_r, mw, mcols):
             bal=max(0.0,av+tot-rq); sf=max(0.0,rq-av-tot); left[key]=bal
             mt=meta.loc[fg]
             rows.append({"Segment":mt["Segment"],"Alt BOM":alt,"FG Description":mt["FG Description"],"FG Code":fg,
-                         "Category":side,"IDU / ODU":hdr,"Component":p,"Key":key,"Qty / set":q,"Month":m,
+                         "Category":side,"IDU / ODU":hdr,"Component":p,
+                         "Description":(desc_map or {}).get(p,""),"Supplier":(sup_map or {}).get(p,""),
+                         "Key":key,"Qty / set":q,"Month":m,
                          "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf})
     return pd.DataFrame(rows)
 
 MODEL_KEYS={"Segment":"Segment","FG Code":"FG Code","Category":"Category","IDU / ODU":"IDU / ODU",
-            "Alt BOM":"Alt BOM","Component":"Component","Qty / set":"Qty / set","Unit":"Unit"}
+            "Alt BOM":"Alt BOM","Component":"Component","Description":"Description","Supplier":"Supplier",
+            "Qty / set":"Qty / set","Unit":"Unit"}
 
 def model_with_components(mw, cmw):
     """Long table for the Model + components view: per FG its import component rows in pieces
@@ -1457,7 +1461,7 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
     return pd.concat([out,pd.DataFrame([tr],columns=out.columns)],ignore_index=True)
 
 KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":76,"Component":135,
-               "Qty / set":66,"Unit":48,"Codes":160,"Used in BOM headers":150,"FG codes":170}
+               "Qty / set":66,"Unit":48,"Description":190,"Supplier":150,"Codes":160,"Used in BOM headers":150,"FG codes":170}
 
 def grouped_table_html(df,key_labels,freeze=(),weeks=True):
     """Two-row header HTML table: month blocks with 'Arrival Week' spanning WK01-WK04.
@@ -2187,6 +2191,33 @@ def create_seg_imp_template():
         ins.cell(i,1,t).font=F(size=12 if i==1 else 10,bold=b_)
     ins.column_dimensions["A"].width=115
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+def load_supplier_master(sup_bytes, known_codes=()):
+    """Part-wise supplier master: first column (or 'Part/Material/Component') = part code, 'Supplier'/'Vendor' column
+    = supplier (several suppliers for one part are joined). Returns ({part: supplier}, error)."""
+    try:
+        df=pd.read_excel(io.BytesIO(sup_bytes),dtype=str); df.columns=[str(c).strip() for c in df.columns]
+    except Exception as e: return {},f"Could not read Supplier Master: {e}"
+    if df.empty or len(df.columns)<2: return {},"Supplier Master needs a part code column and a supplier column."
+    n=lambda c:c.lower()
+    pc=next((c for c in df.columns if any(k in n(c) for k in ["part","material","component","item"]) and "desc" not in n(c)),df.columns[0])
+    sc=next((c for c in df.columns if c!=pc and any(k in n(c) for k in ["supplier","vendor"]) and "code" not in n(c)),None) \
+       or next((c for c in df.columns if c!=pc and any(k in n(c) for k in ["supplier","vendor"])),None) \
+       or next(c for c in df.columns if c!=pc)
+    d=df[[pc,sc]].dropna(); d[pc]=d[pc].astype(str).str.strip(); d[sc]=d[sc].astype(str).str.strip()
+    d=d[(d[pc]!="")&(d[sc]!="")&(d[sc].str.lower()!="nan")]
+    if known_codes: d[pc]=align_part_codes(d.rename(columns={pc:"Part"}),set(known_codes))["Part"].values
+    return {p:", ".join(dict.fromkeys(g[sc])) for p,g in d.groupby(pc,sort=False)},None
+
+def create_supplier_master_template():
+    df=pd.DataFrame({"Part Code":["0011800613Z","0011801843WNP","0010205068HNP"],
+                     "Description":["IDU PCB-70R","ODU PCB","Compressor"],
+                     "Supplier":["Supplier A","Supplier B","Supplier C"]})
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as w:
+        df.to_excel(w,sheet_name="Supplier Master",index=False)
+        for c in w.sheets["Supplier Master"]["A"]: c.number_format="@"
+    buf.seek(0); return buf
 
 def create_import_po_template():
     """Import PO template: one row per PO line; red headers required; grey columns show the ETA month / week."""
@@ -2921,6 +2952,13 @@ elif st.session_state["page"] == "segment":
                     st.download_button("📥 Import PO template (week-wise ETA / ETD)",data=create_import_po_template().getvalue(),
                                        file_name="import_po_weekly_template.xlsx",key="dl_seg_po",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    smf=st.file_uploader("Supplier Master — part-wise supplier (optional)",type=["xlsx","xls"],key="seg_sup_u",
+                                         help="Columns: Part Code, Supplier (Description optional). Fills the Supplier column in Model + components.")
+                    if smf: st.session_state["_sup_master"]=smf.getvalue()
+                    elif st.session_state.get("_sup_master"): st.caption("✓ Using Supplier Master already in session.")
+                    st.download_button("📥 Supplier Master template",data=create_supplier_master_template().getvalue(),
+                                       file_name="supplier_master_template.xlsx",key="dl_seg_sup",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 po_df=None
                 if st.session_state.get("_imp_po"):
                     po_df,po_err=load_import_po(st.session_state["_imp_po"],st.session_state.get("imp_transit",30))
@@ -2953,7 +2991,18 @@ elif st.session_state["page"] == "segment":
                     fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code"}
                     fgo_g=monthwise_grouped(mw,list(fgo_keys),mw_months)
                     fgo_g=pd.concat([fgo_g.iloc[:-1].sort_values(("","Segment"),kind="stable"),fgo_g.iloc[-1:]],ignore_index=True)
-                    cmw=component_monthwise(r,mw_arr,mw_months)
+                    _bom=mrp_r["bom"]
+                    desc_map=dict(zip(_bom["Component"].astype(str),_bom["Component descriptio"].astype(str).replace("nan",""))) \
+                             if "Component descriptio" in _bom.columns else {}
+                    sup_map={}
+                    if po_df is not None and "Supplier" in po_df.columns:     # fallback: supplier on the PO lines
+                        _p=align_part_codes(po_df,_mrp_known_codes(mrp_r)); _p=_p[_p["Supplier"].astype(str).str.strip()!=""]
+                        sup_map={k:", ".join(dict.fromkeys(g["Supplier"].astype(str).str.strip())) for k,g in _p.groupby("Part")}
+                    if st.session_state.get("_sup_master"):                      # Supplier Master wins
+                        _sm,_se=load_supplier_master(st.session_state["_sup_master"],_mrp_known_codes(mrp_r))
+                        if _se: st.warning(_se)
+                        sup_map.update(_sm)
+                    cmw=component_monthwise(r,mw_arr,mw_months,desc_map,sup_map)
                     mdl=model_with_components(mw_arr,cmw)
                     fg_g=monthwise_grouped(mdl,list(fg_keys),mw_months,keep_order=True,total=False)
                     cs_long,cs_info=component_shortage(cmw,mw_months,mw_arr.attrs.get("ctx",{}).get("arr",{}),r)
@@ -3714,7 +3763,7 @@ elif st.session_state["page"] == "settings":
     if st.button("🗑 Clear all session data",key="clr"):
         for k in ["mrp_results","seg_results","aging_results","seg_imp_bytes",
                   "_bom","_req","_prod","_receipt","_aging","_ag_bom","_ag_req","_ag_rec",
-                  "_imp_po","imp_results"]:
+                  "_imp_po","imp_results","_sup_master"]:
             st.session_state[k]=None
         sync_saved_uploads()
         st.success("Session cleared."); st.rerun()
