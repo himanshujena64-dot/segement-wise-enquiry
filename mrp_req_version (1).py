@@ -1061,30 +1061,54 @@ def _interchange_col(cols):
     keys=("interchang","common group","alt group","alt. group","alternate group")
     return next((c for c in cols if any(k in str(c).lower() for k in keys)),None)
 
-def _interchange_checks(imp,part_col,ig_col,rm_col):
+UNIQUE_WORDS={"unique","unique pcb","standalone","stand-alone","stand alone","none","na","n/a","-","no","nil","not interchangeable"}
+
+def _ig_value(v):
+    """Interchange Group cell -> group name, or '' when the code stands alone (blank / UNIQUE / NA ...)."""
+    t="" if v is None else str(v).strip()
+    return "" if t.lower() in UNIQUE_WORDS or t.lower()=="nan" else t
+
+def _interchange_checks(imp,part_col,ig_col,rm_col,blank_undecided=False):
     """Master-data checks on the Interchange Group column: codes listed in more than one group (the last one is used),
-    groups with a single code (nothing to pool) and groups whose codes carry different Categories."""
-    info=dict(col=ig_col,multi={},single=[],mixed_cat={})
+    groups with a single code (nothing to pool), groups whose codes carry different Categories and - on the
+    PCB Mapping sheet, where every code needs a group or UNIQUE - codes left blank."""
+    info=dict(col=ig_col,multi={},single=[],mixed_cat={},undecided=[])
     if not ig_col or ig_col==part_col: return info
     if rm_col in (part_col,ig_col): rm_col=None
     g=imp[[part_col,ig_col]+([rm_col] if rm_col else [])].copy()
-    g[ig_col]=g[ig_col].fillna("").astype(str).str.strip()
-    g=g[(g[ig_col]!="")&(g[ig_col].str.lower()!="nan")]
+    if blank_undecided:
+        raw=g[ig_col].fillna("").astype(str).str.strip()
+        done=set(g.loc[(raw!="")&(raw.str.lower()!="nan"),part_col])
+        info["undecided"]=sorted(set(g[part_col])-done)
+    g[ig_col]=g[ig_col].map(_ig_value)
+    g=g[g[ig_col]!=""]
     for p,s in g.groupby(part_col,sort=True)[ig_col]:
         if s.nunique()>1: info["multi"][p]=list(dict.fromkeys(s))
     for grp,s in g.groupby(ig_col,sort=True):
         if s[part_col].nunique()==1: info["single"].append(grp)
         if rm_col:
-            cats=[c for c in dict.fromkeys(s[rm_col].astype(str).str.strip()) if c and c.lower()!="nan"]
+            cats=[c for c in dict.fromkeys(s[rm_col].fillna("").astype(str).str.strip()) if c and c.lower()!="nan"]
             if len(cats)>1: info["mixed_cat"][grp]=cats
     return info
 
 def _interchange_map(df,part_col,ig_col):
-    """{part code: group name} for rows with a group; blank group = part stands alone."""
+    """{part code: group name} for rows with a group; blank / UNIQUE = part stands alone. Last row wins."""
     if not ig_col: return {}
-    g=df[[part_col,ig_col]].copy(); g[ig_col]=g[ig_col].fillna("").astype(str).str.strip()
-    g=g[(g[ig_col]!="")&(g[ig_col].str.lower()!="nan")]
-    return {str(p).strip():"⇄ "+v for p,v in zip(g[part_col],g[ig_col])}
+    out={}
+    for p,v in zip(df[part_col],df[ig_col]):
+        g=_ig_value(v)
+        if g: out[str(p).strip()]="⇄ "+g
+    return out
+
+def _read_code_sheet(f,sh):
+    """Sheet with the part code in the first column: text, trimmed, blank rows dropped."""
+    d=pd.read_excel(f,sheet_name=sh,header=0,dtype=str); d.columns=[str(c).strip() for c in d.columns]
+    cc=d.columns[0]; d=d[d[cc].notna()].copy(); d[cc]=d[cc].astype(str).str.strip()
+    return d[(d[cc]!="")&(d[cc].str.lower()!="nan")],cc
+
+def _pcb_sheet(sheets):
+    """The 'PCB Mapping' sheet (name with 'pcb' and 'map' / 'group' / 'interchang'), if the file has one."""
+    return next((s for s in sheets if "pcb" in s.lower() and any(k in s.lower() for k in ("map","group","interchang"))),None)
 
 def load_interchange_map(seg_bytes):
     """Interchange groups from the Segment & Import Part file's import-part sheet (empty if none)."""
@@ -1102,19 +1126,37 @@ def pool_interchange(stock, ig_map, parts=None):
     return pooled,{g:sorted(m) for g,m in members.items()}
 
 def load_seg_imp(f):
+    """Import Part sheet (Part Code, Desc., Category) + Segment sheet. PCB alternates come from the 'PCB Mapping' sheet
+    (Part Code, Desc., Category, Interchange Group: group name, or UNIQUE when the PCB cannot be interchanged); without
+    that sheet, from an 'Interchange Group' column on the Import Part sheet (older files)."""
     xl=pd.ExcelFile(f); sheets=xl.sheet_names
     imp_sh=next((s for s in sheets if "import" in s.lower()),sheets[0])
-    imp=pd.read_excel(f,sheet_name=imp_sh,header=0,dtype=str); imp.columns=[str(c).strip() for c in imp.columns]
-    cc=imp.columns[0]; imp=imp[imp[cc].notna()].copy(); imp[cc]=imp[cc].astype(str).str.strip()
-    imp=imp[(imp[cc]!="")&(imp[cc].str.lower()!="nan")]
+    imp,cc=_read_code_sheet(f,imp_sh)
     ig_col=_interchange_col(imp.columns)
     rm_col=next((c for c in imp.columns if c not in (cc,ig_col) and ("rm" in c.lower() or "group" in c.lower() or "category" in c.lower())),None)
     rm_map={}
     if rm_col: imp[rm_col]=imp[rm_col].fillna("").astype(str).str.strip(); rm_map=dict(zip(imp[cc],imp[rm_col]))
-    ig_map=_interchange_map(imp,cc,ig_col)
-    try: ig_info=_interchange_checks(imp,cc,ig_col,rm_col)      # advisory only: must never block loading
-    except Exception: ig_info=dict(col=ig_col,multi={},single=[],mixed_cat={})
     import_parts=sorted(imp[cc].unique())
+    pcb_sh=_pcb_sheet(sheets); pcb=None
+    if pcb_sh:
+        pcb,pc=_read_code_sheet(f,pcb_sh)
+        pig=_interchange_col(pcb.columns) or next((c for c in pcb.columns if c.lower() in ("group","pcb group")),None)
+        if not pig: pcb=None
+    if pcb is not None:                       # PCB Mapping sheet is the master for PCB codes
+        pcat=next((c for c in pcb.columns if c not in (pc,pig) and ("category" in c.lower() or "rm group" in c.lower())),None)
+        ig_map=_interchange_map(pcb,pc,pig)
+        try: ig_info=_interchange_checks(pcb,pc,pig,pcat,blank_undecided=True)
+        except Exception: ig_info=dict(col=pig,multi={},single=[],mixed_cat={},undecided=[])
+        ig_info["col"]=f"sheet '{pcb_sh}'"
+        ig_info["import_col_ignored"]=bool(ig_col and imp[ig_col].map(_ig_value).astype(bool).any())
+        for p,c in zip(pcb[pc],pcb[pcat] if pcat else [""]*len(pcb)):   # PCB codes count as import parts
+            c="" if c is None or str(c).strip().lower() in ("","nan") else str(c).strip()
+            rm_map[p]=c or rm_map.get(p) or "PCB"
+        import_parts=sorted(set(import_parts)|set(pcb[pc]))
+    else:
+        ig_map=_interchange_map(imp,cc,ig_col)
+        try: ig_info=_interchange_checks(imp,cc,ig_col,rm_col)      # advisory only: must never block loading
+        except Exception: ig_info=dict(col=ig_col,multi={},single=[],mixed_cat={},undecided=[])
     seg_sh=next((s for s in sheets if "seg" in s.lower()),sheets[min(1,len(sheets)-1)])
     seg=pd.read_excel(f,sheet_name=seg_sh,header=0); seg.columns=[str(c).strip() for c in seg.columns]
     cm={seg.columns[0]:"Segment",seg.columns[1]:"FG_Code",seg.columns[2]:"IDU"}
@@ -2296,8 +2338,9 @@ def load_import_po(po_bytes, transit_days=30):
     return df.reset_index(drop=True),None
 
 def create_seg_imp_template():
-    """Segment & Import Part template. 'Interchange Group': same name = same hardware (only EPROM / firmware differs),
-    stock is pooled across those codes; blank = code stands alone. 'Category' drives the RM Group filter."""
+    """Segment & Import Part template: Import Part (Part Code, Desc., Category), PCB Mapping (Part Code, Desc., Category,
+    Interchange Group: same name = same hardware, only EPROM / firmware differs, stock pooled; UNIQUE = cannot be
+    interchanged), Segment. 'Category' drives the RM Group filter."""
     from openpyxl import Workbook
     from openpyxl.styles import Font,PatternFill,Alignment,Border,Side
     def F(size=10,**k): return Font(name="Arial",size=size,**k)
@@ -2321,40 +2364,49 @@ def create_seg_imp_template():
      ("","FFFFFF","PCB-TOWER",[("0011800698BGNP","INDOOR PCB")]),
     ]
     thin=Side(style="thin",color="BFBFBF"); bd=Border(thin,thin,thin,thin)
+    def head(ws,hdr,widths,red=()):
+        ws.append(hdr)
+        for c in range(1,len(hdr)+1):
+            cell=ws.cell(1,c); cell.font=F(bold=True,color="FFFFFF"); cell.border=bd; cell.alignment=Alignment(horizontal="center")
+            cell.fill=PatternFill("solid",fgColor="C00000" if c in red else "1F4E78")
+        for i,w in enumerate(widths): ws.column_dimensions["ABCDEFGH"[i]].width=w
+        ws.freeze_panes="A2"
     wb=Workbook(); ws=wb.active; ws.title="Import Part"
-    hdr=["Part Code","Desc.","Category","Interchange Group"]; ws.append(hdr)
+    head(ws,["Part Code","Desc.","Category"],[20,26,16])
+    rows=[(code,desc,cat) for g,colr,cat,items in groups for code,desc in items]+[("0010748458","Compressor Rotary 1.5T","Compressor"),
+          ("0010748814","BLDC Fan Motor","IDU Motor")]
+    for row in rows:
+        ws.append(list(row))
+        for c in range(1,4): ws.cell(ws.max_row,c).border=bd; ws.cell(ws.max_row,c).number_format="@"; ws.cell(ws.max_row,c).font=F()
+    pm=wb.create_sheet("PCB Mapping")
+    head(pm,["Part Code","Desc.","Category","Interchange Group"],[20,26,14,20],red=(4,))
     for g,colr,cat,items in groups:
         dark=colr in ("1F6B2A","17405F")
         for code,desc in items:
-            ws.append([code,desc,cat,g]); r=ws.max_row
+            pm.append([code,desc,cat,g or "UNIQUE"]); r=pm.max_row
             for c in range(1,5):
-                cell=ws.cell(r,c); cell.border=bd; cell.font=F(color="FFFFFF" if dark and c<=2 else "0000FF" if c==4 else "000000")
-                cell.number_format="@"
+                cell=pm.cell(r,c); cell.border=bd; cell.number_format="@"
+                cell.font=F(color="FFFFFF" if dark and c<=2 else "0000FF" if c==4 else "000000")
                 if c<=2 and colr!="FFFFFF": cell.fill=PatternFill("solid",fgColor=colr)
                 if c==4: cell.fill=PatternFill("solid",fgColor="FFF2CC")
-    for c in range(1,5):
-        cell=ws.cell(1,c); cell.font=F(bold=True,color="FFFFFF"); cell.fill=PatternFill("solid",fgColor="1F4E78")
-        cell.border=bd; cell.alignment=Alignment(horizontal="center")
-    for col,w in zip("ABCD",[20,26,14,18]): ws.column_dimensions[col].width=w
-    ws.freeze_panes="A2"
-    sg=wb.create_sheet("Segment"); sg.append(["Segment","FG Code","IDU","ODU"])
+    sg=wb.create_sheet("Segment"); head(sg,["Segment","FG Code","IDU","ODU"],[18,18,18,18])
     for row in [("1 ton 3 Star","FG-1T3S-01","IDU-CODE-1","ODU-CODE-1"),("1.5 ton 5 Star","FG-15T5S-01","IDU-CODE-2","ODU-CODE-2")]:
         sg.append(list(row))
-    for c in range(1,5):
-        cell=sg.cell(1,c); cell.font=F(bold=True,color="FFFFFF"); cell.fill=PatternFill("solid",fgColor="1F4E78")
-        sg.column_dimensions["ABCD"[c-1]].width=18
     ins=wb.create_sheet("Instructions")
-    for i,(t,b_) in enumerate([("Segment & Import Part file",True),("",False),("Sheet 'Import Part'",True),
-        ("Part Code - import part code as in BOM / Stock (text, leading zeros kept).",False),
-        ("Category - used as the RM Group filter on the Segment page (e.g. PCB-IDU, PCB-ODU, PCB-Display).",False),
+    for i,(t,b_) in enumerate([("Segment & Import Part file",True),("",False),("Sheet 'Import Part' - all import parts",True),
+        ("Part Code - import part code as in BOM / Stock (first column, text, leading zeros kept).",False),
+        ("Category - used as the RM Group filter on the Segment page (e.g. PCB-IDU, PCB-ODU, PCB-Display, Compressor).",False),
+        ("",False),("Sheet 'PCB Mapping' - PCB codes only (fill this for PCB alternates)",True),
+        ("Part Code / Desc. / Category - as on Import Part (Category here wins for PCB codes).",False),
         ("Interchange Group - codes with the SAME group name are the same hardware (only EPROM / firmware differs):",False),
-        ("   their stock and PO arrivals are pooled when calculating sets and shortage. Leave blank if the code cannot be swapped.",False),
-        ("   The Segment page then shows a PCB re-flash plan: each code uses its own stock first, the rest is re-flashed from spare codes of the group.",False),
-        ("   A code must be in one group only. Keep the same Category for all codes of a group.",False),
+        ("   their stock and PO arrivals are pooled, and the Segment page shows a PCB re-flash plan",False),
+        ("   (each code uses its own stock first, the rest is re-flashed from spare codes of the group).",False),
+        ("   Write UNIQUE when the PCB cannot be interchanged with any other code. Blank = not decided yet (treated as UNIQUE, with a warning).",False),
+        ("   One code = one group. Type the group name exactly the same on every row (e.g. ODU-G4). New group = new name (e.g. ODU-G5).",False),
         ("Colours are only for reading - the app uses the group name, not the colour.",False),("",False),("Sheet 'Segment'",True),
         ("Segment name, FG (set) code, IDU BOM header, ODU BOM header - replace the 2 example rows.",False)],1):
         ins.cell(i,1,t).font=F(size=12 if i==1 else 10,bold=b_)
-    ins.column_dimensions["A"].width=115
+    ins.column_dimensions["A"].width=125
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 def load_supplier_master(sup_bytes, known_codes=()):
@@ -2960,8 +3012,8 @@ elif st.session_state["page"] == "segment":
         sc,_=st.columns([2,3])
         with sc:
             sf=st.file_uploader("Segment & Import Part (.xlsx)",type=["xlsx","xls"],key="seg_f",
-                                 help="Sheet 1: Import Part List (Part Code, Desc., Category, Interchange Group) | Sheet 2: Segment (IDU/ODU codes)")
-            st.download_button("📥 Segment & Import Part template (with Interchange Group)",data=create_seg_imp_template().getvalue(),
+                                 help="Sheets: Import Part (Part Code, Desc., Category) | PCB Mapping (Part Code, Desc., Category, Interchange Group or UNIQUE) | Segment (Segment, FG, IDU, ODU)")
+            st.download_button("📥 Segment & Import Part template (with PCB Mapping sheet)",data=create_seg_imp_template().getvalue(),
                                file_name="segment_import_part_template.xlsx",key="dl_seg_imp",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         rb,_=st.columns([1,4])
@@ -3075,12 +3127,19 @@ elif st.session_state["page"] == "segment":
 
             igi=r.get("ig_info") or {}
             if "ig_info" in r and not igi.get("col"):
-                st.info("ℹ No **Interchange Group** column found in the Import Part sheet, so PCB alternates are **not pooled** — "
-                        "each code can use only its own stock. Add an 'Interchange Group' column (same name = same hardware, "
-                        "only EPROM / firmware differs; see the template) to pool them and get the PCB re-flash plan.")
+                st.info("ℹ No **PCB Mapping** sheet found in the Segment & Import Part file, so PCB alternates are **not pooled** — "
+                        "each code can use only its own stock. Add a 'PCB Mapping' sheet (Part Code, Desc., Category, Interchange Group: "
+                        "same group name = same hardware, only EPROM / firmware differs; UNIQUE = cannot be interchanged; see the template) "
+                        "to pool them and get the PCB re-flash plan.")
             if igi.get("multi"):
                 st.warning("⇄ Code(s) listed in more than one Interchange Group — the last group is used: "
                            +"; ".join(f"{p} ({' / '.join(g)})" for p,g in igi["multi"].items()))
+            if igi.get("undecided"):
+                _u=igi["undecided"]
+                st.warning(f"⇄ {len(_u)} PCB code(s) in the {igi.get('col','PCB Mapping sheet')} have no Interchange Group yet — treated as "
+                           f"UNIQUE (cannot be interchanged). Write a group name or UNIQUE: "+", ".join(_u[:12])+(" …" if len(_u)>12 else ""))
+            if igi.get("import_col_ignored"):
+                st.caption("ℹ The Import Part sheet also has an Interchange Group column — ignored, the PCB Mapping sheet is used.")
             if r.get("group_members"):
                 with st.expander(f"⇄ {len(r['group_members'])} interchangeable part group(s) pooled — same hardware, stock shared across codes"):
                     _own=lambda c:f"{c} ({float(r['stock'].get(c,0)):,.0f})"
