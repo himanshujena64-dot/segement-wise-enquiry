@@ -1058,7 +1058,25 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
 # ═══════════════════════════════════════════════════════════════
 def _interchange_col(cols):
     """Column naming interchangeable-part groups (same hardware, only EPROM / firmware differs)."""
-    return next((c for c in cols if "interchang" in str(c).lower() or "common group" in str(c).lower()),None)
+    keys=("interchang","common group","alt group","alt. group","alternate group")
+    return next((c for c in cols if any(k in str(c).lower() for k in keys)),None)
+
+def _interchange_checks(imp,part_col,ig_col,rm_col):
+    """Master-data checks on the Interchange Group column: codes listed in more than one group (the last one is used),
+    groups with a single code (nothing to pool) and groups whose codes carry different Categories."""
+    info=dict(col=ig_col,multi={},single=[],mixed_cat={})
+    if not ig_col: return info
+    g=imp[[part_col,ig_col]+([rm_col] if rm_col else [])].copy()
+    g[ig_col]=g[ig_col].fillna("").astype(str).str.strip()
+    g=g[(g[ig_col]!="")&(g[ig_col].str.lower()!="nan")]
+    for p,s in g.groupby(part_col,sort=True)[ig_col]:
+        if s.nunique()>1: info["multi"][p]=list(dict.fromkeys(s))
+    for grp,s in g.groupby(ig_col,sort=True):
+        if s[part_col].nunique()==1: info["single"].append(grp)
+        if rm_col:
+            cats=[c for c in dict.fromkeys(s[rm_col].astype(str).str.strip()) if c and c.lower()!="nan"]
+            if len(cats)>1: info["mixed_cat"][grp]=cats
+    return info
 
 def _interchange_map(df,part_col,ig_col):
     """{part code: group name} for rows with a group; blank group = part stands alone."""
@@ -1093,6 +1111,7 @@ def load_seg_imp(f):
     rm_map={}
     if rm_col: imp[rm_col]=imp[rm_col].fillna("").astype(str).str.strip(); rm_map=dict(zip(imp[cc],imp[rm_col]))
     ig_map=_interchange_map(imp,cc,ig_col)
+    ig_info=_interchange_checks(imp,cc,ig_col,rm_col)
     import_parts=sorted(imp[cc].unique())
     seg_sh=next((s for s in sheets if "seg" in s.lower()),sheets[min(1,len(sheets)-1)])
     seg=pd.read_excel(f,sheet_name=seg_sh,header=0); seg.columns=[str(c).strip() for c in seg.columns]
@@ -1104,7 +1123,7 @@ def load_seg_imp(f):
     seg=seg[seg["Segment"].notna()&(seg["Segment"]!="")&(seg["Segment"]!="nan")&
             seg["FG_Code"].notna()&(seg["FG_Code"]!="")&(seg["FG_Code"]!="nan")&
             seg["IDU"].notna()&(seg["IDU"]!="")&(seg["IDU"]!="nan")].copy().reset_index(drop=True)
-    return import_parts,seg,rm_map,ig_map
+    return import_parts,seg,rm_map,ig_map,ig_info
 
 def bom_alts(hdr,bom):
     """Alt BOMs of a header, numeric order (e.g. 10, 11, 20)."""
@@ -1132,14 +1151,17 @@ def run_segment(bom,stock,seg_bytes,active_rm=None,req_df=None):
     f=io.BytesIO(seg_bytes)
     status=st.status("Running Segment Capacity ...",expanded=True)
     with status: st.write("► Loading data ...")
-    import_parts,seg_df,rm_map,ig_map=load_seg_imp(f)
+    import_parts,seg_df,rm_map,ig_map,ig_info=load_seg_imp(f)
     kn=set(bom["Component"].astype(str))
     _al=align_part_codes(pd.DataFrame({"Part":import_parts}),kn)["Part"].tolist()
     ren=dict(zip(import_parts,_al)); import_parts=sorted(set(_al))
     rm_map={ren.get(p,p):v for p,v in rm_map.items()}; ig_map={ren.get(p,p):v for p,v in ig_map.items()}
     all_rm=sorted(set(rm_map.values())) if rm_map else []
     if active_rm is None: active_rm=all_rm
-    if rm_map and active_rm: import_parts=[p for p in import_parts if rm_map.get(p,"Unknown") in active_rm]
+    if rm_map and active_rm:
+        # An interchange group is one physical part: keep all its codes when any of them is in a ticked RM Group
+        act_g={ig_map[p] for p in import_parts if p in ig_map and rm_map.get(p,"Unknown") in active_rm}
+        import_parts=[p for p in import_parts if rm_map.get(p,"Unknown") in active_rm or ig_map.get(p) in act_g]
     tset=set(import_parts); bhdrs=set(bom["BOM Header"].unique())
     dc="BOM header descripti" if "BOM header descripti" in bom.columns else None
     dmap=(bom[["BOM Header",dc]].drop_duplicates("BOM Header").set_index("BOM Header")[dc].to_dict()) if dc else {}
@@ -1194,7 +1216,9 @@ def run_segment(bom,stock,seg_bytes,active_rm=None,req_df=None):
             pc=defaultdict(float)
             for p,q in fgcomb[fg].items(): pc[ig_act.get(p,p)]+=q
             fgcomb[fg]=dict(pc)
-        for g,mem in group_members.items(): rm_map[g]=rm_map.get(mem[0],"—")
+        for g,mem in group_members.items():   # group's RM Group = most common Category of its codes
+            cats=[rm_map[m] for m in mem if rm_map.get(m)]
+            rm_map[g]=max(dict.fromkeys(cats),key=cats.count) if cats else "—"
         import_parts=sorted({ig_act.get(p,p) for p in import_parts})
     n=len(fg_list); cp=[]; AR=[]; br=[]
     for p in import_parts:
@@ -1234,7 +1258,7 @@ def run_segment(bom,stock,seg_bytes,active_rm=None,req_df=None):
     return dict(segs=segs,alloc_int=sai,total_sets=total,segments_data=sdata,fg_results=fg_res,
                 import_parts=import_parts,constrained_parts=cp,part_usage=pu,stock=stock,
                 skipped_segs=skipped,rm_map=rm_map,active_rm_groups=active_rm,
-                group_members=group_members,part_group=ig_act)
+                group_members=group_members,part_group=ig_act,ig_info=ig_info)
 
 
 WEEKS=["WK01","WK02","WK03","WK04"]
@@ -1307,7 +1331,9 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
     A=np.array([[f["combined_req"].get(p,0) for f in fg_res] for p in parts],dtype=float)
     ub=[sum(fg_req[fg].values()) if basis=="req" else None for fg in fgs]
     po_al=align_part_codes(po_df,_mrp_known_codes(mrp_r))
+    arr_code={}                                                # per code, before pooling (for the PCB re-flash plan)
     if po_al is not None and seg_r.get("part_group"):
+        arr_code=import_arrivals_by_week(po_al,mcols)
         po_al=po_al.copy(); po_al["Part"]=po_al["Part"].map(lambda p:seg_r["part_group"].get(p,p))
     arr=import_arrivals_by_week(po_al,mcols)
 
@@ -1353,7 +1379,8 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None):
                          "Balance c/f":bal,"Net Shortfall":sf})
             avail=bal
     out=pd.DataFrame(rows)
-    out.attrs["ctx"]=dict(fg_req=fg_req,arr={"|".join(k):v for k,v in arr.items()})
+    out.attrs["ctx"]=dict(fg_req=fg_req,arr={"|".join(k):v for k,v in arr.items()},
+                          arr_code={"|".join(k):v for k,v in arr_code.items()})
     return out,mcols
 
 def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
@@ -1397,18 +1424,20 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
     return pd.DataFrame(rows)
 
 MODEL_KEYS={"Segment":"Segment","FG Code":"FG Code","Category":"Category","IDU / ODU":"IDU / ODU",
-            "Alt BOM":"Alt BOM","RM Group":"RM Group","Component":"Component","Description":"Description","Supplier":"Supplier",
-            "Qty / set":"Qty / set","Unit":"Unit"}
+            "Alt BOM":"Alt BOM","RM Group":"RM Group","Component":"Component","Interchange Group":"Interchange Group",
+            "Description":"Description","Supplier":"Supplier","Qty / set":"Qty / set","Unit":"Unit"}
 
 def model_with_components(mw, cmw):
     """Long table for the Model + components view: per FG its import component rows in pieces
-    (which part is short, per BOM header). FG set totals are in the Model-wise (sets) tab."""
+    (which part is short, per BOM header). FG set totals are in the Model-wise (sets) tab.
+    Rows follow the order component_monthwise consumed stock in (by Segment), so Available / Balance read top-down."""
     num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall","Shortfall Before"]
     parts=[]
     comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["VKey","Month"]+num)
     if not comp.empty:
         comp["Qty / set"]=comp["Qty / set"].map(lambda v:f"{v:g}"); comp["Unit"]="Pcs"
-    for vk in mw["VKey"].drop_duplicates():
+        comp["Interchange Group"]=[k[2:] if str(k).startswith("⇄ ") else "" for k in comp["Key"]]
+    for vk in mw.drop_duplicates("VKey").sort_values("Segment",kind="stable")["VKey"]:
         parts.append(comp[comp["VKey"]==vk])
     out=pd.concat(parts,ignore_index=True)
     return out[list(MODEL_KEYS)+["VKey","Month"]+num]
@@ -1441,6 +1470,75 @@ def component_shortage(cmw, mcols, arr, seg_r):
     long["_o"]=long["Component"].map({k:i for i,k in enumerate(order["Component"])})
     long=long.sort_values(["_o"],kind="stable").drop(columns="_o")
     return long,order.reset_index(drop=True)
+
+REFLASH_KEYS={"Interchange Group":"Interchange Group","Component":"Component","Description":"Description",
+              "Own stock":"Own stock","Used in FG codes":"Used in FG codes"}
+
+def pcb_reflash_plan(seg_r, cmw, mcols, arr_code=None, desc_map=None):
+    """Code-level plan for interchangeable PCBs (⇄ groups), month by month with carry-forward.
+    Each code first uses its OWN stock (+ its own PO arrivals); only the demand left over is covered by re-flashing
+    spare stock of another code in the same group — the fewest re-flashes possible. Group totals (served / short)
+    equal the pooled figures in Model + components; demand = FG requirement × qty per set of that code.
+    Returns (grid, flows, summary): grid = month blocks per code, flows = one row per month × from-code × to-code."""
+    members=seg_r.get("group_members") or {}
+    if not members or cmw is None or cmw.empty: return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+    stock=seg_r["stock"]; arr_code=arr_code or {}; desc_map=desc_map or {}
+    g=cmw[cmw["Key"].isin(list(members))]
+    dem=g.groupby(["Key","Component","Month"])["Requirement"].sum().to_dict()
+    fgs=g.groupby("Component")["FG Code"].agg(lambda s:", ".join(sorted(s.astype(str).unique()))).to_dict()
+    left={c:float(stock.get(c,0)) for mem in members.values() for c in mem}
+    own0=dict(left); rec={}; flows=[]; eps=1e-9
+    for m in mcols:
+        for grp,mem in members.items():
+            wk={c:[float(arr_code.get(f"{c}|{m}|{w}",0.0)) for w in WEEKS] for c in mem}   # own PO arrivals
+            av={c:left[c]+sum(wk[c]) for c in mem}
+            rq={c:float(dem.get((grp,c,m),0.0)) for c in mem}
+            need={c:max(0.0,rq[c]-av[c]) for c in mem}                 # still needed after own stock
+            spare={c:max(0.0,av[c]-rq[c]) for c in mem}                # own stock left after own demand
+            rin=defaultdict(float); rout=defaultdict(float); src=defaultdict(list)
+            for c in sorted(mem,key=lambda c:-need[c]):                # biggest need first, biggest donor first
+                for d in sorted(mem,key=lambda d:-spare[d]):
+                    if need[c]<=eps: break
+                    if d==c or spare[d]<=eps: continue
+                    q=min(need[c],spare[d]); need[c]-=q; spare[d]-=q; rin[c]+=q; rout[d]+=q; src[c].append(d)
+                    flows.append({"Month":m,"Interchange Group":grp[2:] if grp.startswith("⇄ ") else grp,
+                                  "Re-flash from":d,"Re-flash to":c,"Qty":q,"To code used in FG codes":fgs.get(c,"")})
+            for c in mem:
+                rec[(grp,c,m)]=(left[c],rq[c],rin[c],rout[c],spare[c],need[c],src[c],wk[c])
+                left[c]=spare[c]
+
+    def remark(op,rq,ri,ro,bal,sf,src,wk):
+        av=op+sum(wk)
+        if rq==0 and av==0 and ro==0: return ""
+        out=[]
+        if ri>eps: out.append(f"Re-flash {ri:,.0f} from {', '.join(dict.fromkeys(src))}")
+        if ro>eps: out.append(f"Give {ro:,.0f} for re-flash")
+        if sf>eps: out.append("No material" if av+ri<=eps else f"Short {sf:,.0f}")
+        return " · ".join(out) if out else "OK"
+    rows=[(grp,c) for grp,mem in sorted(members.items()) for c in mem]
+    grid={("","Interchange Group"):[grp[2:] if grp.startswith("⇄ ") else grp for grp,_ in rows],
+          ("","Component"):[c for _,c in rows],("","Description"):[desc_map.get(c,"") for _,c in rows],
+          ("","Own stock"):[int(own0[c]) if float(own0[c]).is_integer() else round(own0[c],3) for _,c in rows],("","Used in FG codes"):[fgs.get(c,"") for _,c in rows]}
+    for m in mcols:
+        rr=[rec[(grp,c,m)] for grp,c in rows]
+        grid[(m,"Available")]=[float(x[0]) for x in rr]; grid[(m,"Req")]=[float(x[1]) for x in rr]
+        for j,w in enumerate(WEEKS): grid[(m,w)]=[float(x[7][j]) for x in rr]
+        for i,mt in [(2,"Re-flash in"),(3,"Re-flash out"),(4,"Balance"),(5,"Shortfall")]: grid[(m,mt)]=[float(x[i]) for x in rr]
+        grid[(m,"Remarks")]=[remark(*x) for x in rr]
+    grid=pd.DataFrame(grid); grid.columns=pd.MultiIndex.from_tuples(grid.columns)
+    fl=pd.DataFrame(flows,columns=["Month","Interchange Group","Re-flash from","Re-flash to","Qty","To code used in FG codes"])
+    if not fl.empty:
+        fl=fl.groupby(["Month","Interchange Group","Re-flash from","Re-flash to","To code used in FG codes"],as_index=False,sort=False)["Qty"].sum()
+        fl=fl[["Month","Interchange Group","Re-flash from","Re-flash to","Qty","To code used in FG codes"]]
+    pm=pretty_months(mcols); summ=[]
+    for grp,mem in sorted(members.items()):
+        tot=lambda i:sum(rec[(grp,c,m)][i] for c in mem for m in mcols)
+        sm=[m for m in mcols if sum(rec[(grp,c,m)][5] for c in mem)>eps]
+        summ.append({"Interchange Group":grp[2:] if grp.startswith("⇄ ") else grp,"Codes":len(mem),
+                     "Pooled stock":sum(own0[c] for c in mem),"Demand (horizon)":tot(1),"Re-flash qty":tot(2),
+                     "Shortfall":tot(5),"First short month":pm[sm[0]] if sm else "—",
+                     "Codes needing re-flash":", ".join(c for c in mem if any(rec[(grp,c,m)][2]>eps for m in mcols)) or "—"})
+    return grid,fl,pd.DataFrame(summ)
 
 def pretty_months(months):
     """Display labels: 'Sep-26' (or '26-Sep-26' when two columns fall in the same month)."""
@@ -1495,7 +1593,7 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True):
         tr[(m,"Remarks")]=_mw_remark(tr[(m,"Available")],tr[(m,"Req")],sum(tr[(m,w)] for w in WEEKS),tr[(m,"Shortfall")])
     return pd.concat([out,pd.DataFrame([tr],columns=out.columns)],ignore_index=True)
 
-METRIC_ORDER=["Available","Req"]+WEEKS+["Balance","Shortfall before arrival","Shortfall","Remarks"]
+METRIC_ORDER=["Available","Req"]+WEEKS+["Re-flash in","Re-flash out","Balance","Shortfall before arrival","Shortfall","Remarks"]
 
 def _block_metrics(df,months,weeks=True):
     """Metric columns present in each month block, in display order."""
@@ -1505,7 +1603,8 @@ def _metric_label(mt,mets):
     return "Shortfall after arrival" if mt=="Shortfall" and "Shortfall before arrival" in mets else mt
 
 KEY_COL_WIDTH={"Segment":140,"Model":150,"FG Code":165,"Category":78,"IDU / ODU":100,"Alt BOM":76,"Component":135,
-               "Qty / set":66,"Unit":48,"Description":190,"Supplier":150,"RM Group":110,"Codes":160,"Used in BOM headers":150,"FG codes":170}
+               "Qty / set":66,"Unit":48,"Description":190,"Supplier":150,"RM Group":110,"Codes":160,"Used in BOM headers":150,"FG codes":170,
+               "Interchange Group":110,"Own stock":80,"Used in FG codes":190}
 
 def grouped_table_html(df,key_labels,freeze=(),weeks=True):
     """Two-row header HTML table: month blocks with 'Arrival Week' spanning WK01-WK04.
@@ -1549,12 +1648,15 @@ def grouped_table_html(df,key_labels,freeze=(),weeks=True):
             for mt in mets:
                 v=row[(m,mt)]; st_="border:1px solid #e5e7eb;padding:4px 8px;text-align:right;"
                 if mt=="Remarks":
-                    col="#dc2626" if str(v).startswith(("Short","No ")) else "#15803d" if v else "#6b7280"
+                    sv=str(v)
+                    col=("#dc2626" if sv.startswith("No ") or "Short" in sv else "#b45309" if sv.startswith(("Re-flash","Give"))
+                         else "#15803d" if v else "#6b7280")
                     cells+=f'<td style="{st_}text-align:left;color:{col};white-space:nowrap;">{_h.escape(str(v))}</td>'; continue
                 v=float(v)
                 if mt in ("Shortfall","Shortfall before arrival") and v>0: st_+="color:#dc2626;font-weight:700;background:#fef2f2;"
                 elif mt=="Balance": st_+="background:#f0fdf4;"
                 elif mt in WEEKS and v>0: st_+="color:#1d4ed8;background:#eff6ff;"
+                elif mt in ("Re-flash in","Re-flash out") and v>0: st_+="color:#b45309;font-weight:700;background:#fffbeb;"
                 txt="" if (mt in WEEKS and v==0) else f"{v:,.0f}"
                 cells+=f'<td style="{st_}">{txt}</td>'
         body+=f"<tr{tr_style}>{cells}</tr>"
@@ -2235,6 +2337,8 @@ def create_seg_imp_template():
         ("Category - used as the RM Group filter on the Segment page (e.g. PCB-IDU, PCB-ODU, PCB-Display).",False),
         ("Interchange Group - codes with the SAME group name are the same hardware (only EPROM / firmware differs):",False),
         ("   their stock and PO arrivals are pooled when calculating sets and shortage. Leave blank if the code cannot be swapped.",False),
+        ("   The Segment page then shows a PCB re-flash plan: each code uses its own stock first, the rest is re-flashed from spare codes of the group.",False),
+        ("   A code must be in one group only. Keep the same Category for all codes of a group.",False),
         ("Colours are only for reading - the app uses the group name, not the colour.",False),("",False),("Sheet 'Segment'",True),
         ("Segment name, FG (set) code, IDU BOM header, ODU BOM header - replace the 2 example rows.",False)],1):
         ins.cell(i,1,t).font=F(size=12 if i==1 else 10,bold=b_)
@@ -2957,10 +3061,25 @@ elif st.session_state["page"] == "segment":
             m3.metric("Active segments",f"{(r['alloc_int']>0).sum()} / {len(r['segs'])}")
             m4.metric("Constrained parts",f"{len(r['constrained_parts'])}")
 
+            igi=r.get("ig_info") or {}
+            if "ig_info" in r and not igi.get("col"):
+                st.info("ℹ No **Interchange Group** column found in the Import Part sheet, so PCB alternates are **not pooled** — "
+                        "each code can use only its own stock. Add an 'Interchange Group' column (same name = same hardware, "
+                        "only EPROM / firmware differs; see the template) to pool them and get the PCB re-flash plan.")
+            if igi.get("multi"):
+                st.warning("⇄ Code(s) listed in more than one Interchange Group — the last group is used: "
+                           +"; ".join(f"{p} ({' / '.join(g)})" for p,g in igi["multi"].items()))
             if r.get("group_members"):
                 with st.expander(f"⇄ {len(r['group_members'])} interchangeable part group(s) pooled — same hardware, stock shared across codes"):
-                    st.dataframe(pd.DataFrame([{"Group":g,"Codes":len(m),"Pooled stock":int(r["stock"].get(g,0)),"Member codes":", ".join(m)}
+                    _own=lambda c:f"{c} ({float(r['stock'].get(c,0)):,.0f})"
+                    st.dataframe(pd.DataFrame([{"Group":g,"Codes":len(m),"Pooled stock":int(r["stock"].get(g,0)),
+                                                "Member codes (own stock)":", ".join(_own(c) for c in m)}
                                                for g,m in r["group_members"].items()]),use_container_width=True,hide_index=True)
+                    if igi.get("mixed_cat"):
+                        st.caption("Groups whose codes have different Categories (the whole group stays in when any of them is ticked "
+                                   "in the RM Group filter): "+"; ".join(f"{g}: {', '.join(c)}" for g,c in igi["mixed_cat"].items()))
+                    if igi.get("single"):
+                        st.caption("Groups with only one code (nothing to pool): "+", ".join(igi["single"]))
             if r.get("skipped_segs"):
                 with st.expander(f"⚠ {len(r['skipped_segs'])} FGs skipped"):
                     for s in r["skipped_segs"]: st.text(f"  · {s}")
@@ -2990,9 +3109,10 @@ elif st.session_state["page"] == "segment":
                 st.session_state["_seg_mw_export"]=None
                 bcol,pcol=st.columns([2,2])
                 with bcol:
-                    basis=st.radio("Opening sets basis",["Max Sets (as above)","Aligned to requirement"],horizontal=True,key="seg_mw_basis",
-                                   help="Max Sets: LP maximum total sets (may give sets to FGs with no demand). "
-                                        "Aligned: LP re-run with each FG capped at its total requirement, so material goes to FGs that have demand.")
+                    basis=st.radio("Opening sets basis",["Max Sets (as above)","Aligned to requirement"],index=1,horizontal=True,key="seg_mw_basis",
+                                   help="Aligned (default): LP re-run with each FG capped at its month-wise requirement, so material goes to "
+                                        "FGs that have demand, earlier months first. Max Sets: LP maximum total sets — may give sets to FGs with "
+                                        "no demand (and with interchangeable PCBs pick an arbitrary Alt / FG), showing shortfall and surplus side by side.")
                 with pcol:
                     pof=st.file_uploader("Import PO file for Arrival Weeks (optional — same file as Import Shortage page)",
                                          type=["xlsx","xls"],key="seg_po_u")
@@ -3034,7 +3154,8 @@ elif st.session_state["page"] == "segment":
                                "PO arrivals by week (ETA day 1-7 WK01, 8-14 WK02, 15-21 WK03, 22+ WK04) are shown per component in Model + components.")
 
                     seg_keys={"Segment":"Segment"}
-                    fg_keys=MODEL_KEYS
+                    has_ig=bool(r.get("group_members"))
+                    fg_keys={k:v for k,v in MODEL_KEYS.items() if has_ig or k!="Interchange Group"}
                     cs_keys={"Component":"Component","Codes":"Codes","Used in BOM headers":"Used in BOM headers","FG codes":"FG codes"}
                     seg_g=monthwise_grouped(mw,["Segment"],mw_months)
                     fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code"}
@@ -3057,18 +3178,48 @@ elif st.session_state["page"] == "segment":
                     _novk=lambda d:d.drop(columns=[("","VKey")]) if ("","VKey") in d.columns else d
                     cs_long,cs_info=component_shortage(cmw,mw_months,mw_arr.attrs.get("ctx",{}).get("arr",{}),r)
                     cs_g=monthwise_grouped(cs_long,list(cs_keys),mw_months,keep_order=True,total=False) if not cs_long.empty else pd.DataFrame()
+                    rf_grid,rf_flows,rf_sum=pcb_reflash_plan(r,cmw,mw_months,mw_arr.attrs.get("ctx",{}).get("arr_code",{}),desc_map)
+                    if not rf_flows.empty: rf_flows["Month"]=rf_flows["Month"].map(pretty_months(mw_months))
+                    rf_wk=bool(po_df is not None and not rf_grid.empty and rf_grid[[c for c in rf_grid.columns if c[1] in WEEKS]].to_numpy().sum()>0)
                     _xb=io.BytesIO()
                     with pd.ExcelWriter(_xb,engine="openpyxl") as _w:
                         grouped_to_excel(_w,seg_g,"Segment-wise",seg_keys,weeks=False)
                         grouped_to_excel(_w,fgo_g,"Model-wise (sets)",fgo_keys,weeks=False)
                         if not fg_g.empty: grouped_to_excel(_w,_novk(fg_g),"Model + components",fg_keys)
+                        if not rf_grid.empty:                                 # only when interchange groups are pooled
+                            rf_flows.to_excel(_w,sheet_name="PCB Re-flash list",index=False)
+                            grouped_to_excel(_w,rf_grid,"PCB Code ledger",REFLASH_KEYS,weeks=rf_wk)
                         if "Sheet" in _w.book.sheetnames and len(_w.book.sheetnames)>1: del _w.book["Sheet"]
                     _xb.seek(0)
                     st.download_button("⬇ Download month-wise tables (.xlsx)",data=_xb,file_name="segment_monthwise.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                        type="primary",key="dl_seg_mw")
-                    sw1,sw5,sw2,sw4,sw3=st.tabs(["Segment-wise (sets)","Model-wise (sets)","Model + components (drill-down)",
-                                                 "Component shortage & arrivals","Single FG / segment view"])
+                    _tabs=st.tabs(["Segment-wise (sets)","Model-wise (sets)","Model + components (drill-down)",
+                                   "Component shortage & arrivals","Single FG / segment view"]+(["⇄ PCB re-flash plan"] if has_ig else []))
+                    sw1,sw5,sw2,sw4,sw3=_tabs[:5]
+                    if has_ig:
+                        with _tabs[5]:
+                            st.caption("Interchangeable PCBs (same hardware, only EPROM / firmware differs). Each code first uses its own "
+                                       "stock and its own PO arrivals; only the demand left over is covered by re-flashing spare stock of "
+                                       "another code in the same group — the fewest re-flashes possible. Month by month with carry-forward; "
+                                       "demand = FG requirement × qty per set (same as Model + components), so group shortfalls match it.")
+                            if rf_sum.empty: st.info("No interchange group is used by these FGs.")
+                            else:
+                                st.dataframe(rf_sum.style.apply(lambda c:["color:#dc2626;font-weight:600" if v>0 else "" for v in c],subset=["Shortfall"])
+                                             .apply(lambda c:["color:#b45309;font-weight:600" if v>0 else "" for v in c],subset=["Re-flash qty"])
+                                             .format({c:"{:,.0f}" for c in ["Pooled stock","Demand (horizon)","Re-flash qty","Shortfall"]}),
+                                             use_container_width=True,hide_index=True)
+                                st.markdown("**Re-flash list** — convert these quantities (from-code → to-code) in the month shown")
+                                if rf_flows.empty: st.success("No re-flash needed: every code's demand is covered by its own stock (or the group is short).")
+                                else: st.dataframe(rf_flows.style.format({"Qty":"{:,.0f}"}),use_container_width=True,hide_index=True)
+                                st.markdown("**Code ledger** — own stock per code, month-wise")
+                                only_rf=st.checkbox("Only codes with re-flash or shortfall",value=True,key="seg_rf_only")
+                                rv=rf_grid
+                                if only_rf:
+                                    act=[c for c in rf_grid.columns if c[1] in ("Re-flash in","Re-flash out","Shortfall")]
+                                    rv=rf_grid[rf_grid[act].sum(axis=1)>0]
+                                if rv.empty: st.success("No code needs a re-flash or is short in the horizon.")
+                                else: show_grouped_table(rv,REFLASH_KEYS,freeze=("Component",),weeks=rf_wk)
                     with sw1:
                         show_grouped_table(seg_g,seg_keys,freeze=("Segment",),weeks=False)
                     with sw5:
@@ -3081,7 +3232,7 @@ elif st.session_state["page"] == "segment":
                     with sw2:
                         st.caption("Each import component per BOM header (IDU / ODU) in pieces (complete sets per FG are in the Model-wise (sets) tab): "
                                    "Req = FG req × Qty/set; stock and PO arrivals of a component "
-                                   "(or its ⇄ interchange group) are shared by all FGs using it, in table order.")
+                                   "(or its ⇄ interchange group — see the Interchange Group column) are shared by all FGs using it, in table order.")
                         o1,o2=st.columns(2)
                         with o1: only_fg=st.checkbox("Only FGs with a set shortfall",key="seg_mw_sf")
                         with o2: comp_mode=st.radio("Component rows",["All","Short only"],horizontal=True,key="seg_mw_comp")
@@ -3117,7 +3268,8 @@ elif st.session_state["page"] == "segment":
                         st.dataframe(one.style.apply(lambda c:["color:#dc2626;font-weight:600" if v>0 else "" for v in c],subset=["Net Shortfall"])
                                      .format({c:"{:,.0f}" for c in cc}),use_container_width=True,hide_index=True)
                         st.line_chart(one.set_index("Month")[["Sets Available","Requirement"]],use_container_width=True,height=240)
-                    st.session_state["_seg_mw_export"]=(seg_g,fg_g,mw,seg_keys,fg_keys,cs_g,cs_keys,cs_info,fgo_g,fgo_keys)
+                    st.session_state["_seg_mw_export"]=(seg_g,fg_g,mw,seg_keys,fg_keys,cs_g,cs_keys,cs_info,fgo_g,fgo_keys,
+                                                        rf_grid,rf_flows,rf_sum,rf_wk)
 
             sec("FG detail — import part breakdown")
             _vk=lambda f:f.get("VKey",f["FG_Code"])
@@ -3165,6 +3317,10 @@ elif st.session_state["page"] == "segment":
                     if not _mwx[5].empty:
                         _mwx[7].to_excel(w,sheet_name="Component Shortage",index=False)
                         grouped_to_excel(w,_mwx[5],"Component Monthwise",_mwx[6])
+                    if len(_mwx)>10 and not _mwx[10].empty:               # PCB re-flash plan (interchange groups pooled)
+                        _mwx[12].to_excel(w,sheet_name="PCB Re-flash summary",index=False)
+                        _mwx[11].to_excel(w,sheet_name="PCB Re-flash list",index=False)
+                        grouped_to_excel(w,_mwx[10],"PCB Code ledger",REFLASH_KEYS,weeks=_mwx[13])
                     _mwx[2].to_excel(w,sheet_name="Monthwise Detail",index=False)
             buf.seek(0)
             st.download_button("⬇ Download Segment Capacity (.xlsx)",data=buf,file_name="segment_capacity.xlsx",
