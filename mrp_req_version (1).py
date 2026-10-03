@@ -1065,7 +1065,8 @@ def _interchange_checks(imp,part_col,ig_col,rm_col):
     """Master-data checks on the Interchange Group column: codes listed in more than one group (the last one is used),
     groups with a single code (nothing to pool) and groups whose codes carry different Categories."""
     info=dict(col=ig_col,multi={},single=[],mixed_cat={})
-    if not ig_col: return info
+    if not ig_col or ig_col==part_col: return info
+    if rm_col in (part_col,ig_col): rm_col=None
     g=imp[[part_col,ig_col]+([rm_col] if rm_col else [])].copy()
     g[ig_col]=g[ig_col].fillna("").astype(str).str.strip()
     g=g[(g[ig_col]!="")&(g[ig_col].str.lower()!="nan")]
@@ -1107,11 +1108,12 @@ def load_seg_imp(f):
     cc=imp.columns[0]; imp=imp[imp[cc].notna()].copy(); imp[cc]=imp[cc].astype(str).str.strip()
     imp=imp[(imp[cc]!="")&(imp[cc].str.lower()!="nan")]
     ig_col=_interchange_col(imp.columns)
-    rm_col=next((c for c in imp.columns if c!=ig_col and ("rm" in c.lower() or "group" in c.lower() or "category" in c.lower())),None)
+    rm_col=next((c for c in imp.columns if c not in (cc,ig_col) and ("rm" in c.lower() or "group" in c.lower() or "category" in c.lower())),None)
     rm_map={}
     if rm_col: imp[rm_col]=imp[rm_col].fillna("").astype(str).str.strip(); rm_map=dict(zip(imp[cc],imp[rm_col]))
     ig_map=_interchange_map(imp,cc,ig_col)
-    ig_info=_interchange_checks(imp,cc,ig_col,rm_col)
+    try: ig_info=_interchange_checks(imp,cc,ig_col,rm_col)      # advisory only: must never block loading
+    except Exception: ig_info=dict(col=ig_col,multi={},single=[],mixed_cat={})
     import_parts=sorted(imp[cc].unique())
     seg_sh=next((s for s in sheets if "seg" in s.lower()),sheets[min(1,len(sheets)-1)])
     seg=pd.read_excel(f,sheet_name=seg_sh,header=0); seg.columns=[str(c).strip() for c in seg.columns]
@@ -1477,7 +1479,8 @@ REFLASH_KEYS={"Interchange Group":"Interchange Group","Component":"Component","D
 def pcb_reflash_plan(seg_r, cmw, mcols, arr_code=None, desc_map=None):
     """Code-level plan for interchangeable PCBs (⇄ groups), month by month with carry-forward.
     Each code first uses its OWN stock (+ its own PO arrivals); only the demand left over is covered by re-flashing
-    spare stock of another code in the same group — the fewest re-flashes possible. Group totals (served / short)
+    spare stock of another code in the same group. Donors give stock they will not need in later months first (codes
+    no FG uses come first), so boards are not re-flashed away and then re-flashed back. Group totals (served / short)
     equal the pooled figures in Model + components; demand = FG requirement × qty per set of that code.
     Returns (grid, flows, summary): grid = month blocks per code, flows = one row per month × from-code × to-code."""
     members=seg_r.get("group_members") or {}
@@ -1488,21 +1491,30 @@ def pcb_reflash_plan(seg_r, cmw, mcols, arr_code=None, desc_map=None):
     fgs=g.groupby("Component")["FG Code"].agg(lambda s:", ".join(sorted(s.astype(str).unique()))).to_dict()
     left={c:float(stock.get(c,0)) for mem in members.values() for c in mem}
     own0=dict(left); rec={}; flows=[]; eps=1e-9
-    for m in mcols:
+    own_in=lambda c,m:sum(float(arr_code.get(f"{c}|{m}|{w}",0.0)) for w in WEEKS)
+    for mi,m in enumerate(mcols):
         for grp,mem in members.items():
             wk={c:[float(arr_code.get(f"{c}|{m}|{w}",0.0)) for w in WEEKS] for c in mem}   # own PO arrivals
             av={c:left[c]+sum(wk[c]) for c in mem}
             rq={c:float(dem.get((grp,c,m),0.0)) for c in mem}
             need={c:max(0.0,rq[c]-av[c]) for c in mem}                 # still needed after own stock
             spare={c:max(0.0,av[c]-rq[c]) for c in mem}                # own stock left after own demand
+            free={}                                                    # spare not needed for own demand in later months
+            for c in mem:
+                run=pk=0.0
+                for m2 in mcols[mi+1:]: run+=float(dem.get((grp,c,m2),0.0))-own_in(c,m2); pk=max(pk,run)
+                free[c]=max(0.0,spare[c]-pk)
             rin=defaultdict(float); rout=defaultdict(float); src=defaultdict(list)
-            for c in sorted(mem,key=lambda c:-need[c]):                # biggest need first, biggest donor first
-                for d in sorted(mem,key=lambda d:-spare[d]):
-                    if need[c]<=eps: break
-                    if d==c or spare[d]<=eps: continue
-                    q=min(need[c],spare[d]); need[c]-=q; spare[d]-=q; rin[c]+=q; rout[d]+=q; src[c].append(d)
-                    flows.append({"Month":m,"Interchange Group":grp[2:] if grp.startswith("⇄ ") else grp,
-                                  "Re-flash from":d,"Re-flash to":c,"Qty":q,"To code used in FG codes":fgs.get(c,"")})
+            for c in sorted(mem,key=lambda c:-need[c]):                # biggest need first
+                for ph in (0,1):                                       # free surplus first, then the rest (biggest first)
+                    for d in sorted(mem,key=lambda d:-(free[d] if ph==0 else spare[d])):
+                        if need[c]<=eps: break
+                        cap=free[d] if ph==0 else spare[d]
+                        if d==c or cap<=eps: continue
+                        q=min(need[c],cap); need[c]-=q; spare[d]-=q; free[d]=max(0.0,free[d]-q)
+                        rin[c]+=q; rout[d]+=q; src[c].append(d)
+                        flows.append({"Month":m,"Interchange Group":grp[2:] if grp.startswith("⇄ ") else grp,
+                                      "Re-flash from":d,"Re-flash to":c,"Qty":q,"To code used in FG codes":fgs.get(c,"")})
             for c in mem:
                 rec[(grp,c,m)]=(left[c],rq[c],rin[c],rout[c],spare[c],need[c],src[c],wk[c])
                 left[c]=spare[c]
@@ -3201,7 +3213,8 @@ elif st.session_state["page"] == "segment":
                         with _tabs[5]:
                             st.caption("Interchangeable PCBs (same hardware, only EPROM / firmware differs). Each code first uses its own "
                                        "stock and its own PO arrivals; only the demand left over is covered by re-flashing spare stock of "
-                                       "another code in the same group — the fewest re-flashes possible. Month by month with carry-forward; "
+                                       "another code in the same group, taking first the stock a code will not need in later months. "
+                                       "Month by month with carry-forward; "
                                        "demand = FG requirement × qty per set (same as Model + components), so group shortfalls match it.")
                             if rf_sum.empty: st.info("No interchange group is used by these FGs.")
                             else:
