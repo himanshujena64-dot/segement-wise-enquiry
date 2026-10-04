@@ -867,6 +867,53 @@ def create_receipts_template():
 # ═══════════════════════════════════════════════════════════════
 # MRP ENGINE
 # ═══════════════════════════════════════════════════════════════
+def bom_qty_per_parent(bom, phantom="50"):
+    """SAP multi-level BOM exports often give 'Required Qty' already per 1 header unit (multiplied through all levels):
+    child Required Qty = Quantity / base x parent Required Qty. The engines multiply level by level, so that format
+    would be counted twice. Detect it and convert each row to its quantity per parent: Required Qty / Required Qty of
+    the nearest non-phantom parent (phantom rows -> 1, their quantity is already in their children), so the level-by-level
+    product gives back the header quantity. Rows must be in BOM order (Level 1, 2, 3 ... under each header).
+    Returns (bom, info): info['mode'] = 'cumulative (converted)' or 'per parent' (unchanged)."""
+    n=len(bom); info=dict(mode="per parent",cum_votes=0,per_votes=0)
+    if n==0 or "Level" not in bom.columns or "Required Qty" not in bom.columns: return bom,info
+    lv=pd.to_numeric(bom["Level"],errors="coerce").fillna(0).astype(int).to_numpy()
+    rq=pd.to_numeric(bom["Required Qty"],errors="coerce").fillna(0).to_numpy(dtype=float)
+    sp=(bom["Special procurement"].astype(str).str.strip().to_numpy() if "Special procurement" in bom.columns
+        else np.array([""]*n,dtype=object))
+    ph=(sp==str(phantom).strip())
+    prq=np.ones(n); anc=np.ones(n); cum={}; isph={}
+    for i in range(n):
+        L=lv[i]
+        if L>1:
+            prq[i]=cum.get(L-1,np.nan)
+            a=1.0
+            for k in range(L-1,0,-1):
+                if k in cum and not isph.get(k,False): a=cum[k]; break
+            anc[i]=a
+        for k in [k for k in cum if k>=L]: cum.pop(k,None); isph.pop(k,None)
+        cum[L]=rq[i]; isph[L]=bool(ph[i])
+    m=(lv>=2)&np.isfinite(prq)&(prq>0)&(np.abs(prq-1)>1e-9)&(rq>0)
+    tol=lambda a,b:np.abs(a-b)<=np.maximum(0.0015,0.02*np.abs(b))
+    if "Quantity" in bom.columns:                                   # Quantity = per parent base qty (e.g. per 1000)
+        qy=pd.to_numeric(bom["Quantity"],errors="coerce").fillna(0).to_numpy(dtype=float)
+        l1=(lv==1)&(rq>0)&(qy>0)
+        base=float(np.median(qy[l1]/rq[l1])) if l1.any() else 1.0
+        mm=m&(qy>0)
+        info["cum_votes"]=int(tol(rq[mm],qy[mm]/base*prq[mm]).sum()); info["per_votes"]=int(tol(rq[mm],qy[mm]/base).sum())
+    else:                                                           # same parent->child pair under parents of different qty
+        d=pd.DataFrame({"pc":bom["Parent"].astype(str).to_numpy() if "Parent" in bom.columns else lv,
+                        "c":bom["Component"].astype(str).to_numpy(),"rq":rq,"prq":prq})[m]
+        for _,g in d.groupby(["pc","c"]):
+            if g["prq"].nunique()<2: continue
+            r=g["rq"]/g["prq"]
+            if (r.max()-r.min())<=0.02*r.abs().max()+1e-9: info["cum_votes"]+=1
+            elif (g["rq"].max()-g["rq"].min())<=0.02*g["rq"].abs().max()+1e-9: info["per_votes"]+=1
+    cv,pv=info["cum_votes"],info["per_votes"]
+    if cv>=3 and cv>=0.8*(cv+pv):
+        new=np.where(ph,1.0,np.where(anc>0,rq/np.where(anc>0,anc,1.0),0.0))
+        bom=bom.copy(); bom["Required Qty"]=new; info["mode"]="cumulative (converted)"
+    return bom,info
+
 def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     logs=[]; log=lambda m: logs.append(m)
     status=st.status("Running MRP engine ...",expanded=True)
@@ -888,6 +935,9 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
         lvl=bom.loc[i,"Level"]; parent=bom.loc[i,"BOM Header"] if lvl==1 else stack.get(lvl-1)
         stack={k:v for k,v in stack.items() if k<=lvl}; stack[lvl]=bom.loc[i,"Component"]; parents.append(parent)
     bom["Parent"]=parents
+    bom,qty_info=bom_qty_per_parent(bom,PHANTOM)        # 'Required Qty' per 1 header (SAP multi-level) -> per parent
+    log(f"BOM quantities: Required Qty {qty_info['mode']} (rows checked: {qty_info['cum_votes']} cumulative / {qty_info['per_votes']} per parent)")
+    with status: st.write(f"► BOM quantities: Required Qty {qty_info['mode']}")
     drop_cols=["Plant","Usage","Quantity","Unit","BOM L/T","BOM code","Item","Mat. Group","Mat. Group Desc.","Pur. Group","Pur. Group Desc.","MRP Controller","MRP Controller Desc."]
     bom=bom.drop(columns=[c for c in drop_cols if c in bom.columns],errors="ignore")
     for old,new in [("Component description","Component descriptio"),("BOM header description","BOM header descripti"),
@@ -1047,7 +1097,7 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     with st.expander("Run log"):
         for l in logs: st.text(l)
 
-    return dict(bom=bom,req=req,months=months,stock=stock,prod_summary=prod_summary,
+    return dict(bom=bom,req=req,months=months,stock=stock,prod_summary=prod_summary,qty_info=qty_info,
                 result_l1=r1,result_l2=r2,result_l3=r3,result_l4=r4,
                 raw_l1=l1a,raw_l2=l2a,raw_l3=l3a,raw_l4=l4a,
                 receipt_qty=receipt_qty,pivot=pivot,month_cols=mcols)
@@ -2000,6 +2050,7 @@ def compute_bom_consumption(bom_bytes, req_bytes, phantom_code="50"):
         stack[lvl] = bom.loc[i, "Component"]
         parents.append(parent)
     bom["Parent"] = parents
+    bom, _ = bom_qty_per_parent(bom, phantom_code)   # 'Required Qty' per 1 header (SAP multi-level) -> per parent
 
     # ── Requirement ───────────────────────────────────────────────
     hrrow = _detect_hrow(req_bytes)
