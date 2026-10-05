@@ -1532,14 +1532,37 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None, leftover=False):
         extra=_leftover_sets(A,supply-A@prev,has_req)
         supply=supply-A@extra                                  # material of the extra sets is taken
     opening0=dict(zip(fgs,(prev+extra).astype(int).tolist())); inc={}
-    for m in mcols:
-        for w in WEEKS:
-            add=np.array([arr.get((p,m,w),0.0) for p in parts],dtype=float)
-            if add.any():
-                supply=supply+add; x=solve(supply,list(prev)); cur=np.maximum(np.floor(x+1e-9),prev)
-            else: cur=prev
-            for fg,d in zip(fgs,cur-prev): inc[(fg,m,w)]=float(d)
-            prev=cur
+    if basis=="req" and parts:
+        # PO arrivals serve only requirement from their own month on (a month's shortfall is not carried), month by
+        # month and by Priority; sets already planned are kept and the material still free is used first.
+        def fill(tot,Rx):                                          # whole sets per FG over months, earliest first
+            C=np.zeros_like(Rx)
+            for f in range(nf):
+                t=float(tot[f])
+                for k in range(nm): c=min(Rx[f,k],t); C[f,k]=c; t-=c
+            return C
+        U=np.maximum(0.0,Rm-fill(prev,Rm))                         # requirement not covered yet
+        free=np.maximum(0.0,supply-A@prev)                         # stock not used (extra sets' material excluded)
+        for ki,m in enumerate(mcols):
+            for w in WEEKS:
+                add=np.array([arr.get((p,m,w),0.0) for p in parts],dtype=float); y=np.zeros(nf)
+                if add.any():
+                    free=free+add; Um=U.copy(); Um[:,:ki]=0.0
+                    if Um.sum()>0:
+                        Y=_alloc_month_first(A,free,Um,prio)
+                        if Y is not None:
+                            y=_topup_sets(A,free,np.floor(Y.sum(axis=1)+1e-9),Um,prio)
+                            free=np.maximum(0.0,free-A@y); U=np.maximum(0.0,U-fill(y,Um))
+                for fg,d in zip(fgs,y): inc[(fg,m,w)]=float(d)
+    else:
+        for m in mcols:
+            for w in WEEKS:
+                add=np.array([arr.get((p,m,w),0.0) for p in parts],dtype=float)
+                if add.any():
+                    supply=supply+add; x=solve(supply,list(prev)); cur=np.maximum(np.floor(x+1e-9),prev)
+                else: cur=prev
+                for fg,d in zip(fgs,cur-prev): inc[(fg,m,w)]=float(d)
+                prev=cur
 
     rows=[]
     for f in fg_res:
