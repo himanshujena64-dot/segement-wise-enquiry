@@ -867,6 +867,53 @@ def create_receipts_template():
 # ═══════════════════════════════════════════════════════════════
 # MRP ENGINE
 # ═══════════════════════════════════════════════════════════════
+def bom_qty_per_parent(bom, phantom="50"):
+    """SAP multi-level BOM exports often give 'Required Qty' already per 1 header unit (multiplied through all levels):
+    child Required Qty = Quantity / base x parent Required Qty. The engines multiply level by level, so that format
+    would be counted twice. Detect it and convert each row to its quantity per parent: Required Qty / Required Qty of
+    the nearest non-phantom parent (phantom rows -> 1, their quantity is already in their children), so the level-by-level
+    product gives back the header quantity. Rows must be in BOM order (Level 1, 2, 3 ... under each header).
+    Returns (bom, info): info['mode'] = 'cumulative (converted)' or 'per parent' (unchanged)."""
+    n=len(bom); info=dict(mode="per parent",cum_votes=0,per_votes=0)
+    if n==0 or "Level" not in bom.columns or "Required Qty" not in bom.columns: return bom,info
+    lv=pd.to_numeric(bom["Level"],errors="coerce").fillna(0).astype(int).to_numpy()
+    rq=pd.to_numeric(bom["Required Qty"],errors="coerce").fillna(0).to_numpy(dtype=float)
+    sp=(bom["Special procurement"].astype(str).str.strip().to_numpy() if "Special procurement" in bom.columns
+        else np.array([""]*n,dtype=object))
+    ph=(sp==str(phantom).strip())
+    prq=np.ones(n); anc=np.ones(n); cum={}; isph={}
+    for i in range(n):
+        L=lv[i]
+        if L>1:
+            prq[i]=cum.get(L-1,np.nan)
+            a=1.0
+            for k in range(L-1,0,-1):
+                if k in cum and not isph.get(k,False): a=cum[k]; break
+            anc[i]=a
+        for k in [k for k in cum if k>=L]: cum.pop(k,None); isph.pop(k,None)
+        cum[L]=rq[i]; isph[L]=bool(ph[i])
+    m=(lv>=2)&np.isfinite(prq)&(prq>0)&(np.abs(prq-1)>1e-9)&(rq>0)
+    tol=lambda a,b:np.abs(a-b)<=np.maximum(0.0015,0.02*np.abs(b))
+    if "Quantity" in bom.columns:                                   # Quantity = per parent base qty (e.g. per 1000)
+        qy=pd.to_numeric(bom["Quantity"],errors="coerce").fillna(0).to_numpy(dtype=float)
+        l1=(lv==1)&(rq>0)&(qy>0)
+        base=float(np.median(qy[l1]/rq[l1])) if l1.any() else 1.0
+        mm=m&(qy>0)
+        info["cum_votes"]=int(tol(rq[mm],qy[mm]/base*prq[mm]).sum()); info["per_votes"]=int(tol(rq[mm],qy[mm]/base).sum())
+    else:                                                           # same parent->child pair under parents of different qty
+        d=pd.DataFrame({"pc":bom["Parent"].astype(str).to_numpy() if "Parent" in bom.columns else lv,
+                        "c":bom["Component"].astype(str).to_numpy(),"rq":rq,"prq":prq})[m]
+        for _,g in d.groupby(["pc","c"]):
+            if g["prq"].nunique()<2: continue
+            r=g["rq"]/g["prq"]
+            if (r.max()-r.min())<=0.02*r.abs().max()+1e-9: info["cum_votes"]+=1
+            elif (g["rq"].max()-g["rq"].min())<=0.02*g["rq"].abs().max()+1e-9: info["per_votes"]+=1
+    cv,pv=info["cum_votes"],info["per_votes"]
+    if cv>=3 and cv>=0.8*(cv+pv):
+        new=np.where(ph,1.0,np.where(anc>0,rq/np.where(anc>0,anc,1.0),0.0))
+        bom=bom.copy(); bom["Required Qty"]=new; info["mode"]="cumulative (converted)"
+    return bom,info
+
 def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     logs=[]; log=lambda m: logs.append(m)
     status=st.status("Running MRP engine ...",expanded=True)
@@ -888,6 +935,18 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
         lvl=bom.loc[i,"Level"]; parent=bom.loc[i,"BOM Header"] if lvl==1 else stack.get(lvl-1)
         stack={k:v for k,v in stack.items() if k<=lvl}; stack[lvl]=bom.loc[i,"Component"]; parents.append(parent)
     bom["Parent"]=parents
+    if "Unit" in bom.columns and "Base unit" in bom.columns:   # Required Qty is in the base (stock) unit
+        _u=bom["Unit"].astype(str).str.strip().str.upper(); _b=bom["Base unit"].astype(str).str.strip().str.upper()
+        _mis=bom[(_u!=_b)&(_u!="NAN")&(_b!="NAN")&(_u!="")&(_b!="")]
+        if len(_mis):
+            st.warning(f"⚠ {len(_mis):,} BOM row(s) have a component unit different from the part's base unit "
+                       f"({_mis['Component'].nunique()} part(s), e.g. "+", ".join(f"{c} {a}→{b}" for c,a,b in
+                       _mis[["Component","Unit","Base unit"]].drop_duplicates("Component").head(6).values)+
+                       "). Required Qty is used as given (base unit); check Stock and PO quantities are in the base unit.")
+        log(f"BOM units: {len(_mis)} row(s) with Unit different from Base unit")
+    bom,qty_info=bom_qty_per_parent(bom,PHANTOM)        # 'Required Qty' per 1 header (SAP multi-level) -> per parent
+    log(f"BOM quantities: Required Qty {qty_info['mode']} (rows checked: {qty_info['cum_votes']} cumulative / {qty_info['per_votes']} per parent)")
+    with status: st.write(f"► BOM quantities: Required Qty {qty_info['mode']}")
     drop_cols=["Plant","Usage","Quantity","Unit","BOM L/T","BOM code","Item","Mat. Group","Mat. Group Desc.","Pur. Group","Pur. Group Desc.","MRP Controller","MRP Controller Desc."]
     bom=bom.drop(columns=[c for c in drop_cols if c in bom.columns],errors="ignore")
     for old,new in [("Component description","Component descriptio"),("BOM header description","BOM header descripti"),
@@ -1027,7 +1086,8 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     pivot=all_comps.merge(pg,on=["Component","Description"],how="left").fillna(0)
     mcols=[m for m in months if m in pivot.columns]
     if mcols: pivot[mcols]=pivot[mcols].cumsum(axis=1)
-    bm=bom[["Component","Procurement type","Special procurement"]].drop_duplicates(subset="Component")
+    bm=bom[["Component","Procurement type","Special procurement"]+(["Base unit"] if "Base unit" in bom.columns else [])] \
+       .drop_duplicates(subset="Component").rename(columns={"Base unit":"Unit"})
     sd=stock.reset_index().rename(columns={"Stock_Qty":"Stock"})
     pivot=pivot.merge(bm,on="Component",how="left").merge(sd,on="Component",how="left").merge(prod_summary,on="Component",how="left")
     for c,d in [("Procurement type",""),("Special procurement",""),("Stock",0),("Confirmed_Qty",0),("Open_Production_Qty",0)]:
@@ -1039,7 +1099,9 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
         extra=["Receipt_Qty"]
     else: extra=[]
     pivot=pivot.rename(columns={"Description":"Component descri"})
-    fc=["Component","Component descri","Procurement type","Special procurement","Confirmed_Qty","Open_Production_Qty","Stock"]+extra+mcols
+    if "Unit" not in pivot.columns: pivot["Unit"]=""
+    pivot["Unit"]=pivot["Unit"].fillna("").astype(str).replace("nan","")
+    fc=["Component","Component descri","Unit","Procurement type","Special procurement","Confirmed_Qty","Open_Production_Qty","Stock"]+extra+mcols
     for c in fc:
         if c not in pivot.columns: pivot[c]=0 if c in mcols+["Confirmed_Qty","Open_Production_Qty","Stock","Receipt_Qty"] else ""
     pivot=pivot[fc].sort_values("Component").reset_index(drop=True)
@@ -1047,7 +1109,7 @@ def run_mrp_engine(bom_bytes, req_bytes, prod_bytes, receipt_bytes):
     with st.expander("Run log"):
         for l in logs: st.text(l)
 
-    return dict(bom=bom,req=req,months=months,stock=stock,prod_summary=prod_summary,
+    return dict(bom=bom,req=req,months=months,stock=stock,prod_summary=prod_summary,qty_info=qty_info,
                 result_l1=r1,result_l2=r2,result_l3=r3,result_l4=r4,
                 raw_l1=l1a,raw_l2=l2a,raw_l3=l3a,raw_l4=l4a,
                 receipt_qty=receipt_qty,pivot=pivot,month_cols=mcols)
@@ -1162,10 +1224,13 @@ def load_seg_imp(f):
         except Exception: ig_info=dict(col=ig_col,multi={},single=[],mixed_cat={},undecided=[])
     seg_sh=next((s for s in sheets if "seg" in s.lower()),sheets[min(1,len(sheets)-1)])
     seg=pd.read_excel(f,sheet_name=seg_sh,header=0); seg.columns=[str(c).strip() for c in seg.columns]
+    pcol=next((c for c in seg.columns[3:] if "prior" in c.lower()),None)   # optional: 1 = first, blank = last
     cm={seg.columns[0]:"Segment",seg.columns[1]:"FG_Code",seg.columns[2]:"IDU"}
-    if len(seg.columns)>=4: cm[seg.columns[3]]="Compatible_ODU"
+    if len(seg.columns)>=4 and seg.columns[3]!=pcol: cm[seg.columns[3]]="Compatible_ODU"
+    if pcol: cm[pcol]="Priority"
     seg=seg.rename(columns=cm)
     if "Compatible_ODU" not in seg.columns: seg["Compatible_ODU"]=""
+    seg["Priority"]=pd.to_numeric(seg["Priority"],errors="coerce") if "Priority" in seg.columns else np.nan
     for c in ("Segment","FG_Code","IDU","Compatible_ODU"): seg[c]=seg[c].astype(str).str.strip()
     seg=seg[seg["Segment"].notna()&(seg["Segment"]!="")&(seg["Segment"]!="nan")&
             seg["FG_Code"].notna()&(seg["FG_Code"]!="")&(seg["FG_Code"]!="nan")&
@@ -1233,7 +1298,7 @@ def run_segment(bom,stock,seg_bytes,active_rm=None,req_df=None):
             if a not in req_alts[h]: req_alts[h].append(a)
     _srt=lambda L:sorted(L,key=lambda x:(0,int(x)) if str(x).isdigit() else (1,str(x)))
     alt_miss=[]
-    fg_list=[]; fgseg={}; fgidu={}; fgodu={}; fgcomb={}; fgside={}; fgcode={}; fgalt={}; skipped=[]
+    fg_list=[]; fgseg={}; fgidu={}; fgodu={}; fgcomb={}; fgside={}; fgcode={}; fgalt={}; fgpri={}; skipped=[]
     for _,row in seg_df.iterrows():
         fg=row["FG_Code"]; seg=row["Segment"]; idu=row["IDU"]; odu=row["Compatible_ODU"]
         if not odu or odu=="nan": skipped.append(f"{fg}: no ODU"); continue
@@ -1252,7 +1317,7 @@ def run_segment(bom,stock,seg_bytes,active_rm=None,req_df=None):
             if not ir and not or_: skipped.append(f"{vk}: no import parts"); continue
             ap=set(ir)|set(or_); comb={p:ir.get(p,0)+or_.get(p,0) for p in ap if ir.get(p,0)+or_.get(p,0)>0}
             fg_list.append(vk); fgseg[vk]=seg; fgidu[vk]=idu; fgodu[vk]=odu; fgcomb[vk]=comb
-            fgside[vk]=(dict(ir),dict(or_)); fgcode[vk]=fg; fgalt[vk]=(ia,oa)
+            fgside[vk]=(dict(ir),dict(or_)); fgcode[vk]=fg; fgalt[vk]=(ia,oa); fgpri[vk]=row.get("Priority",np.nan)
     if alt_miss: st.warning("Alt in Requirement sheet not found in BOM (first BOM alt used instead): "+", ".join(sorted(set(alt_miss))))
     if not fg_list: st.error("No valid FG codes."); return None
     # Interchangeable parts: pool member codes into one group row (qty per set and stock both summed)
@@ -1290,7 +1355,7 @@ def run_segment(bom,stock,seg_bytes,active_rm=None,req_df=None):
                        "IDU_Desc":dmap.get(fgidu[fg],""),"Compatible_ODU":fgodu[fg],
                        "ODU_Desc":dmap.get(fgodu[fg],""),"Max_Sets":int(qty),"Limiting_Part":lp,
                        "Limiting_Stock":int(stock.get(lp,0)) if lp!="—" else 0,"combined_req":cq,
-                       "IDU_req":fgside[fg][0],"ODU_req":fgside[fg][1]})
+                       "IDU_req":fgside[fg][0],"ODU_req":fgside[fg][1],"Priority":fgpri.get(fg,np.nan)})
     st_tot=defaultdict(int); st_fg=defaultdict(list)
     for f2 in fg_res: st_tot[f2["Segment"]]+=f2["Max_Sets"]; st_fg[f2["Segment"]].append(f2)
     sdata={}
@@ -1340,6 +1405,52 @@ def import_arrivals_by_week(po_df, months):
         arr[(str(r["Part"]).strip(),m,w)]+=float(r["PO_Qty"])
     return arr
 
+def _alloc_month_first(A,b,R,prio=None,lb=None):
+    """Sets per FG and month from supply b, strictly month by month: a month's requirement is covered as far as the
+    stock allows before any later month gets material; within a month Priority 1 models before 2, ... (blank = last,
+    equal priority shares freely). A = parts × FG qty per set, R = FG × month requirement, lb = sets per FG already
+    counted (kept). Returns the FG × month array (fractional; floor per FG for whole sets), or None if the LP fails."""
+    R=np.asarray(R,dtype=float); nf,nm=R.shape; nv=nf*nm
+    rows=[np.repeat(A,nm,axis=1) if A.size else np.zeros((0,nv))]; rhs=[np.asarray(b,dtype=float).reshape(-1)]
+    if lb is not None and np.any(np.asarray(lb,dtype=float)>0):
+        L=np.zeros((nf,nv))
+        for f in range(nf): L[f,f*nm:(f+1)*nm]=-1.0                # keep sets already counted: Σ_k x[f,k] ≥ lb[f]
+        rows.append(L); rhs.append(-np.asarray(lb,dtype=float))
+    bnd=[(0,float(R[f,k])) for f in range(nf) for k in range(nm)]
+    pr=np.array([np.inf if p is None or pd.isna(p) else float(p) for p in (list(prio) if prio is not None else [None]*nf)])
+    x=None
+    for k in range(nm):
+        for lv in sorted(set(pr)):
+            idx=[f*nm+k for f in range(nf) if pr[f]==lv and R[f,k]>0]
+            if not idx: continue
+            c=np.zeros(nv); c[idx]=-1.0
+            res=linprog(c,A_ub=np.vstack(rows),b_ub=np.concatenate(rhs),bounds=bnd,method="highs")
+            if res.status!=0: return x.reshape(nf,nm) if x is not None else None
+            x=res.x; V=float(-res.fun)
+            row=np.zeros((1,nv)); row[0,idx]=-1.0                 # keep what this month / priority got
+            rows.append(row); rhs.append(np.array([-(V-1e-7*max(1.0,V))]))
+    return x.reshape(nf,nm) if x is not None else np.zeros((nf,nm))
+
+def _topup_sets(A,b,sets,R,prio=None):
+    """Whole sets lost by rounding the LP down: give +1 set to models that still have requirement, in month order
+    (earliest unmet month first) then Priority, while the stock left allows it. Returns the topped-up sets per FG."""
+    sets=np.asarray(sets,dtype=float).copy(); R=np.asarray(R,dtype=float); nf=len(sets)
+    left=np.asarray(b,dtype=float)-(A@sets if A.size else 0)
+    cum=np.cumsum(R,axis=1)
+    pr=[np.inf if p is None or pd.isna(p) else float(p) for p in (list(prio) if prio is not None else [None]*nf)]
+    def key(f):
+        k=int(np.argmax(cum[f]>sets[f]+1e-9)) if cum[f,-1]>sets[f]+1e-9 else R.shape[1]
+        return (k,pr[f],f)
+    changed=True
+    while changed:
+        changed=False
+        for f in sorted(range(nf),key=key):
+            if cum[f,-1]<sets[f]+1-1e-9: continue                 # requirement already covered
+            col=A[:,f] if A.size else np.zeros(0)
+            if np.all(col<=left+1e-9):
+                sets[f]+=1; left=left-col; changed=True; break
+    return sets
+
 def _leftover_sets(A,b,weights=None):
     """Extra whole sets per FG from supply b still left after requirements (LP: maximise total sets).
     A = parts × FG qty per set. FGs that use none of these parts get 0 (no constraint to stop them)."""
@@ -1356,7 +1467,8 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None, leftover=False):
     Arrival sets per week = extra sets the LP can make once that week's import parts land (never taking back earlier sets).
     Balance = max(0, Opening + Arrivals − Req); Shortfall = max(0, Req − Opening − Arrivals).
     basis="max": LP maximises total sets; basis="req": requirement first — each FG capped at its month-wise requirement,
-    earlier months first; leftover=True (with basis="req") then turns the stock still left into extra sets (positive balance)."""
+    strictly month by month (Priority from the Segment sheet within a month); leftover=True (with basis="req") then
+    turns the stock still left into extra sets (positive balance)."""
     months=list(mrp_r["months"]); req=mrp_r["req"].copy()
     req["BOM Header"]=req["BOM Header"].astype(str).str.strip()
     mcols=[m for m in months if m in req.columns]
@@ -1399,24 +1511,21 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None, leftover=False):
     arr=import_arrivals_by_week(po_al,mcols)
 
     nf,nm=len(fgs),len(mcols)
+    Rm=np.array([[fg_req[fg][m] for m in mcols] for fg in fgs],dtype=float)
+    prio=[f.get("Priority",np.nan) for f in fg_res]
     def solve(b,lb):
         if not parts: return np.array(lb,dtype=float)
         if basis!="req":
             res=linprog(-np.ones(nf),A_ub=A,b_ub=b,bounds=list(zip(lb,ub)),method="highs")
             return res.x if res.status in (0,1) else np.array(lb,dtype=float)
-        # Aligned: one variable per (FG, month) capped at that month's requirement; earlier months weigh more,
-        # so material covers every model's near-term demand before anyone's later months.
-        Ax=np.repeat(A,nm,axis=1)                              # column f*nm+k uses FG f's qty per set
-        L=np.zeros((nf,nf*nm))
-        for f in range(nf): L[f,f*nm:(f+1)*nm]=-1.0           # keep sets already counted: Σ_k x[f,k] ≥ lb[f]
-        w=np.tile([1.0+0.01*(nm-k) for k in range(nm)],nf)
-        bnd=[(0,fg_req[fgs[f]][mcols[k]]) for f in range(nf) for k in range(nm)]
-        res=linprog(-w,A_ub=np.vstack([Ax,L]),b_ub=np.concatenate([b,-np.asarray(lb,dtype=float)]),bounds=bnd,method="highs")
-        return res.x.reshape(nf,nm).sum(axis=1) if res.status in (0,1) else np.array(lb,dtype=float)
+        # Requirement first: strictly month by month (first month fully before the next), Priority within a month
+        X=_alloc_month_first(A,b,Rm,prio,lb)
+        return X.sum(axis=1) if X is not None else np.array(lb,dtype=float)
 
     # Capacity timeline: stock only, then stock + cumulative arrivals after each week
     supply=np.array([float(stock.get(p,0)) for p in parts],dtype=float)
     x=solve(supply,[0.0]*len(fgs)); prev=np.floor(x+1e-9)
+    if basis=="req" and parts: prev=_topup_sets(A,supply,prev,Rm,prio)   # whole sets lost by rounding
     extra=np.zeros(nf)
     if basis=="req" and leftover and parts:                   # stock left after requirements -> extra sets
         has_req=np.array([1.0+1e-3*(sum(fg_req[fg].values())>0) for fg in fgs])
@@ -1448,7 +1557,7 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None, leftover=False):
                           arr_code={"|".join(k):v for k,v in arr_code.items()})
     return out,mcols
 
-def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
+def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None, unit_map=None):
     """Component-level ledger in pieces: one row per FG × BOM header (IDU/ODU) × import component.
     Req = FG req × qty per set. Stock (pooled per interchange group) and PO arrivals are shared by all rows using
     that component and consumed in table order: Available = what is left when the row is reached, Balance is handed
@@ -1483,7 +1592,7 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None):
                          "RM Group":(lambda g:"" if str(g).lower() in ("","nan","none","—") else str(g))(rmm.get(p,rmm.get(key,""))),
                          "Component":p,
                          "Description":(desc_map or {}).get(p,""),"Supplier":(sup_map or {}).get(p,""),
-                         "Key":key,"Qty / set":q,"Month":m,
+                         "Key":key,"Qty / set":q,"Unit":(unit_map or {}).get(p,""),"Month":m,
                          "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf,
                          "Shortfall Before":sf0})
     return pd.DataFrame(rows)
@@ -1500,7 +1609,8 @@ def model_with_components(mw, cmw):
     parts=[]
     comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["VKey","Month"]+num)
     if not comp.empty:
-        comp["Qty / set"]=comp["Qty / set"].map(lambda v:f"{v:g}"); comp["Unit"]="Pcs"
+        comp["Qty / set"]=comp["Qty / set"].map(lambda v:f"{v:g}")
+        if "Unit" not in comp.columns: comp["Unit"]=""
         comp["Interchange Group"]=[k[2:] if str(k).startswith("⇄ ") else "" for k in comp["Key"]]
     for vk in mw.drop_duplicates("VKey").sort_values("Segment",kind="stable")["VKey"]:
         parts.append(comp[comp["VKey"]==vk])
@@ -1521,13 +1631,13 @@ def component_shortage(cmw, mcols, arr, seg_r):
         for m in mcols:
             gm=g[g["Month"]==m]
             if gm.empty: continue
-            rows.append({"Component":key,"Codes":codes,"Used in BOM headers":hdrs,"FG codes":fgs,"Month":m,
+            rows.append({"Component":key,"Unit":(g["Unit"].iloc[0] if "Unit" in g.columns else ""),"Codes":codes,"Used in BOM headers":hdrs,"FG codes":fgs,"Month":m,
                          "Sets Available":gm["Sets Available"].iloc[0],"Requirement":gm["Requirement"].sum(),
                          **{w:gm[w].sum() for w in WEEKS},"Arrival Sets":gm["Arrival Sets"].sum(),
                          "Balance c/f":gm["Balance c/f"].iloc[-1],"Net Shortfall":gm["Net Shortfall"].sum()})
         sched=[(m,w,arr.get(f"{key}|{m}|{w}",0.0)) for m in mcols for w in WEEKS]
         sf=[m for m in mcols if g[g["Month"]==m]["Net Shortfall"].sum()>0]
-        info.append({"Component":key,"Codes":codes,"Used in BOM headers":hdrs,"FG codes":fgs,
+        info.append({"Component":key,"Unit":(g["Unit"].iloc[0] if "Unit" in g.columns else ""),"Codes":codes,"Used in BOM headers":hdrs,"FG codes":fgs,
                      "Total shortfall":g["Net Shortfall"].sum(),"First short month":pm[sf[0]] if sf else "—",
                      "Arrivals (week-wise)":"; ".join(f"{pm[m]} {w}: {q:,.0f}" for m,w,q in sched if q>0) or "No PO in horizon"})
     long=pd.DataFrame(rows)
@@ -1536,7 +1646,7 @@ def component_shortage(cmw, mcols, arr, seg_r):
     long=long.sort_values(["_o"],kind="stable").drop(columns="_o")
     return long,order.reset_index(drop=True)
 
-def pcb_based_sets(seg_r, mw, mcols, desc_map=None, arr=None, all_sets=None):
+def pcb_based_sets(seg_r, mw, mcols, desc_map=None, arr=None, all_sets=None, unit_map=None):
     """PCB as the base for all models. Sets the PCBs allow per model: requirement first (earlier months first), then
     the PCBs still left turn into extra sets — so all PCBs are consumed. Then, if those sets are built, every other
     import material: needed vs stock -> excess (+) / short (−), also after PO arrivals in the horizon.
@@ -1554,9 +1664,9 @@ def pcb_based_sets(seg_r, mw, mcols, desc_map=None, arr=None, all_sets=None):
     b=np.array([float(stock.get(p,0)) for p in parts],dtype=float)
     R=np.array([[float(fg_req.get(vk(f),{}).get(m,0.0)) for m in mcols] for f in fg_res],dtype=float)
     nf,nm=R.shape; has=(A>0).any(axis=0)
-    Ax=np.repeat(A,nm,axis=1); w=np.tile([1.0+0.01*(nm-k) for k in range(nm)],nf)
-    res=linprog(-w,A_ub=Ax,b_ub=b,bounds=[(0,R[f,k] if has[f] else 0) for f in range(nf) for k in range(nm)],method="highs")
-    served=np.floor(res.x.reshape(nf,nm).sum(axis=1)+1e-9) if res.status==0 else np.zeros(nf)
+    X=_alloc_month_first(A,b,R*has[:,None],[f.get("Priority",np.nan) for f in fg_res])
+    served=np.floor(X.sum(axis=1)+1e-9) if X is not None else np.zeros(nf)
+    served=_topup_sets(A,b,served,R*has[:,None],[f.get("Priority",np.nan) for f in fg_res])
     extra=_leftover_sets(A,b-A@served,np.array([1.0+1e-3*(R[f].sum()>0) for f in range(nf)]))
     tot=served+extra; left=dict(zip(parts,b-A@tot))
     side_keys=lambda rq:", ".join(sorted({nm_(pg.get(p,p)) for p in (rq or {}) if pg.get(p,p) in pk})) or "—"
@@ -1588,6 +1698,7 @@ def pcb_based_sets(seg_r, mw, mcols, desc_map=None, arr=None, all_sets=None):
         stk=float(stock.get(p,0)); bal=stk-need[p]; pq=po.get(p,0.0); fg=sorted(used[p])
         mem=members.get(p,[])
         mrows.append({"Type":"PCB" if p in pk else "Material","Part / group":nm_(p),
+                      "Unit":(unit_map or {}).get(mem[0] if mem else p,""),
                       "Description":(f"Interchangeable ({len(mem)} codes): "+", ".join(mem)) if mem else desc_map.get(p,""),
                       "RM Group":(lambda g:"" if str(g).lower() in ("","nan","none","—") else str(g))(rmm.get(p,"")),
                       "Stock":stk,"Needed for PCB sets":need[p],"Excess (+) / Short (−)":bal,"PO in horizon":pq,
@@ -2000,6 +2111,7 @@ def compute_bom_consumption(bom_bytes, req_bytes, phantom_code="50"):
         stack[lvl] = bom.loc[i, "Component"]
         parents.append(parent)
     bom["Parent"] = parents
+    bom, _ = bom_qty_per_parent(bom, phantom_code)   # 'Required Qty' per 1 header (SAP multi-level) -> per parent
 
     # ── Requirement ───────────────────────────────────────────────
     hrrow = _detect_hrow(req_bytes)
@@ -2496,8 +2608,8 @@ def create_seg_imp_template():
                 cell.font=F(color="FFFFFF" if dark and c<=2 else "0000FF" if c==4 else "000000")
                 if c<=2 and colr!="FFFFFF": cell.fill=PatternFill("solid",fgColor=colr)
                 if c==4: cell.fill=PatternFill("solid",fgColor="FFF2CC")
-    sg=wb.create_sheet("Segment"); head(sg,["Segment","FG Code","IDU","ODU"],[18,18,18,18])
-    for row in [("1 ton 3 Star","FG-1T3S-01","IDU-CODE-1","ODU-CODE-1"),("1.5 ton 5 Star","FG-15T5S-01","IDU-CODE-2","ODU-CODE-2")]:
+    sg=wb.create_sheet("Segment"); head(sg,["Segment","FG Code","IDU","ODU","Priority"],[18,18,18,18,10])
+    for row in [("1 ton 3 Star","FG-1T3S-01","IDU-CODE-1","ODU-CODE-1",2),("1.5 ton 5 Star","FG-15T5S-01","IDU-CODE-2","ODU-CODE-2",1)]:
         sg.append(list(row))
     ins=wb.create_sheet("Instructions")
     for i,(t,b_) in enumerate([("Segment & Import Part file",True),("",False),("Sheet 'Import Part' - all import parts",True),
@@ -2511,7 +2623,9 @@ def create_seg_imp_template():
         ("   Write UNIQUE when the PCB cannot be interchanged with any other code. Blank = not decided yet (treated as UNIQUE, with a warning).",False),
         ("   One code = one group. Type the group name exactly the same on every row (e.g. ODU-G4). New group = new name (e.g. ODU-G5).",False),
         ("Colours are only for reading - the app uses the group name, not the colour.",False),("",False),("Sheet 'Segment'",True),
-        ("Segment name, FG (set) code, IDU BOM header, ODU BOM header - replace the 2 example rows.",False)],1):
+        ("Segment name, FG (set) code, IDU BOM header, ODU BOM header - replace the 2 example rows.",False),
+        ("Priority (optional) - 1 = gets scarce material first, then 2, 3 ...; blank = after all numbered rows. Applied within each",False),
+        ("   month (the first month is always covered before the next). Leave the whole column blank for no priority.",False)],1):
         ins.cell(i,1,t).font=F(size=12 if i==1 else 10,bold=b_)
     ins.column_dimensions["A"].width=125
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
@@ -2595,7 +2709,8 @@ def create_import_po_template():
      ("",False),("Columns",True),
      ("Import Part - material code as in BOM / Stock (column is text, so leading zeros are kept).",False),
      ("Description / PO No / Supplier - optional, shown in reports.",False),
-     ("PO Qty - open quantity still to arrive (do not include already-received qty).",False),
+     ("PO Qty - open quantity still to arrive (do not include already-received qty), in the part's STOCK (base) unit",False),
+     ("   - e.g. grams if the part is stocked in G, even when it is purchased in KG.",False),
      ("ETD - dispatch date from supplier.",False),
      ("ETA - arrival date at plant. If blank, the app uses ETD + Transit days (default 30) - see last example row.",False),
      ("",False),("Arrival Week rule (week of the ETA month)",True),
@@ -3270,6 +3385,11 @@ elif st.session_state["page"] == "segment":
                                      "ODU Desc":f.get("ODU_Desc",""),"Max Sets":f["Max_Sets"],
                                      "Limiting Part":f["Limiting_Part"],"Limiting Stock":f["Limiting_Stock"]}
                                     for f in fg_res]).sort_values(["Segment","Max Sets"],ascending=[True,False])
+                _pr={f["FG_Code"]:f.get("Priority",np.nan) for f in fg_res}
+                if any(pd.notna(v) for v in _pr.values()):
+                    fgdf.insert(1,"Priority",fgdf["FG Code"].map(_pr))
+                    st.caption("Priority from the Segment sheet: within each month, Priority 1 models get scarce material first "
+                               "(Requirement first basis); blank = after all numbered rows.")
                 def hf(row): return ["background-color:#f0fdf4"]*len(row) if row["Max Sets"]>0 else ["background-color:#fffbeb"]*len(row)
                 st.dataframe(fgdf.style.apply(hf,axis=1).format({"Max Sets":"{:,}","Limiting Stock":"{:,}"}),use_container_width=True,hide_index=True)
 
@@ -3335,7 +3455,7 @@ elif st.session_state["page"] == "segment":
                     seg_keys={"Segment":"Segment"}
                     has_ig=bool(r.get("group_members"))
                     fg_keys={k:v for k,v in MODEL_KEYS.items() if has_ig or k!="Interchange Group"}
-                    cs_keys={"Component":"Component","Codes":"Codes","Used in BOM headers":"Used in BOM headers","FG codes":"FG codes"}
+                    cs_keys={"Component":"Component","Unit":"Unit","Codes":"Codes","Used in BOM headers":"Used in BOM headers","FG codes":"FG codes"}
                     seg_g=monthwise_grouped(mw,["Segment"],mw_months,signed=True)
                     fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code"}
                     fgo_g=monthwise_grouped(mw,list(fgo_keys),mw_months,signed=True)
@@ -3351,7 +3471,9 @@ elif st.session_state["page"] == "segment":
                         _sm,_se=load_supplier_master(st.session_state["_sup_master"],_mrp_known_codes(mrp_r))
                         if _se: st.warning(_se)
                         sup_map.update(_sm)
-                    cmw=component_monthwise(r,mw_arr,mw_months,desc_map,sup_map)
+                    unit_map=dict(zip(_bom["Component"].astype(str),_bom["Base unit"].astype(str).replace("nan",""))) \
+                             if "Base unit" in _bom.columns else {}
+                    cmw=component_monthwise(r,mw_arr,mw_months,desc_map,sup_map,unit_map)
                     mdl=model_with_components(mw_arr,cmw)
                     fg_g=monthwise_grouped(mdl,list(fg_keys)+["VKey"],mw_months,keep_order=True,total=False)   # VKey keeps each Alt apart
                     _novk=lambda d:d.drop(columns=[("","VKey")]) if ("","VKey") in d.columns else d
@@ -3361,7 +3483,7 @@ elif st.session_state["page"] == "segment":
                     if not rf_flows.empty: rf_flows["Month"]=rf_flows["Month"].map(pretty_months(mw_months))
                     rf_wk=bool(po_df is not None and not rf_grid.empty and rf_grid[[c for c in rf_grid.columns if c[1] in WEEKS]].to_numpy().sum()>0)
                     _open=mw[mw["Month"]==mw_months[0]].set_index("VKey")["Sets Available"].to_dict()
-                    pb_sets,pb_mat=pcb_based_sets(r,mw_arr,mw_months,desc_map,mw_arr.attrs.get("ctx",{}).get("arr",{}),_open)
+                    pb_sets,pb_mat=pcb_based_sets(r,mw_arr,mw_months,desc_map,mw_arr.attrs.get("ctx",{}).get("arr",{}),_open,unit_map)
                     has_pb=not pb_sets.empty
                     _xb=io.BytesIO()
                     with pd.ExcelWriter(_xb,engine="openpyxl") as _w:
