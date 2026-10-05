@@ -1530,6 +1530,7 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None, leftover=False):
     if basis=="req" and leftover and parts:                   # stock left after requirements -> extra sets
         has_req=np.array([1.0+1e-3*(sum(fg_req[fg].values())>0) for fg in fgs])
         extra=_leftover_sets(A,supply-A@prev,has_req)
+        supply=supply-A@extra                                  # material of the extra sets is taken
     opening0=dict(zip(fgs,(prev+extra).astype(int).tolist())); inc={}
     for m in mcols:
         for w in WEEKS:
@@ -1549,7 +1550,7 @@ def segment_monthwise(seg_r, mrp_r, basis="max", po_df=None, leftover=False):
             bal=max(0.0,have-rq); sf=max(0.0,rq-have)
             rows.append({"Segment":f["Segment"],"FG Code":f["FG_Code"],"VKey":fg,"FG Description":f.get("FG_Desc","") or f.get("IDU_Desc",""),
                          "Alt BOM":fg_alt[fg],"Req matched on":fg_src[fg],"Month":m,"Sets Available":avail,"Requirement":rq,
-                         **{w:wk[w] for w in WEEKS},"Arrival Sets":tot_arr,
+                         **{w:wk[w] for w in WEEKS},"Arrival Sets":tot_arr,"Total Available":have,
                          "Balance c/f":bal,"Net Shortfall":sf})
             avail=bal
     out=pd.DataFrame(rows)
@@ -1593,7 +1594,7 @@ def component_monthwise(seg_r, mw, mcols, desc_map=None, sup_map=None, unit_map=
                          "Component":p,
                          "Description":(desc_map or {}).get(p,""),"Supplier":(sup_map or {}).get(p,""),
                          "Key":key,"Qty / set":q,"Unit":(unit_map or {}).get(p,""),"Month":m,
-                         "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Balance c/f":bal,"Net Shortfall":sf,
+                         "Sets Available":av,"Requirement":rq,**wk,"Arrival Sets":tot,"Total Available":av+tot,"Balance c/f":bal,"Net Shortfall":sf,
                          "Shortfall Before":sf0})
     return pd.DataFrame(rows)
 
@@ -1605,7 +1606,7 @@ def model_with_components(mw, cmw):
     """Long table for the Model + components view: per FG its import component rows in pieces
     (which part is short, per BOM header). FG set totals are in the Model-wise (sets) tab.
     Rows follow the order component_monthwise consumed stock in (by Segment), so Available / Balance read top-down."""
-    num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall","Shortfall Before"]
+    num=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Total Available","Balance c/f","Net Shortfall","Shortfall Before"]
     parts=[]
     comp=cmw.copy() if not cmw.empty else pd.DataFrame(columns=list(MODEL_KEYS)+["VKey","Month"]+num)
     if not comp.empty:
@@ -1818,7 +1819,8 @@ def pretty_months(months):
     if len(set(lab.values()))<len(months): lab={m:full[m].strftime("%d-%b-%y") for m in months}
     return lab
 
-MW_METRICS=["Available","Req"]+WEEKS+["Balance","Shortfall","Remarks"]
+TA_LABEL="Total available (incl. arrival)"
+MW_METRICS=["Available","Req"]+WEEKS+[TA_LABEL,"Balance","Shortfall","Remarks"]
 
 def _mw_remark(av,rq,arrivals,sf):
     if rq==0 and av==0 and arrivals==0: return ""
@@ -1834,6 +1836,8 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True,signed=Fals
     agg=["Sets Available","Requirement"]+WEEKS+["Arrival Sets","Balance c/f","Net Shortfall"]
     has0="Shortfall Before" in long_df.columns
     if has0: agg=agg+["Shortfall Before"]
+    hasT="Total Available" in long_df.columns                       # stock + PO arrivals
+    if hasT: agg=agg+["Total Available"]
     g=long_df.groupby(keys+["Month"],as_index=False,sort=False)[agg].sum()
     base=long_df[keys].drop_duplicates().reset_index(drop=True)
     tot_req=long_df.groupby(keys,sort=False)["Requirement"].sum().rename("_r").reset_index()
@@ -1845,6 +1849,7 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True,signed=Fals
         gm=base.merge(g[g["Month"]==m],on=keys,how="left").fillna(0)
         cols[(m,"Available")]=gm["Sets Available"].values; cols[(m,"Req")]=gm["Requirement"].values
         for w in WEEKS: cols[(m,w)]=gm[w].values
+        if hasT: cols[(m,TA_LABEL)]=gm["Total Available"].values
         if signed:
             bal=(gm["Sets Available"]+gm["Arrival Sets"]-gm["Requirement"]).values
             cols[(m,"Balance")]=bal
@@ -1868,7 +1873,7 @@ def monthwise_grouped(long_df,keys,mcols,keep_order=False,total=True,signed=Fals
         tr[(m,"Remarks")]=_mw_remark(tr[(m,"Available")],tr[(m,"Req")],sum(tr[(m,w)] for w in WEEKS),sf)
     return pd.concat([out,pd.DataFrame([tr],columns=out.columns)],ignore_index=True)
 
-METRIC_ORDER=["Available","Req"]+WEEKS+["Re-flash in","Re-flash out","Balance","Shortfall before arrival","Shortfall","Remarks"]
+METRIC_ORDER=["Available","Req"]+WEEKS+[TA_LABEL,"Re-flash in","Re-flash out","Balance","Shortfall before arrival","Shortfall","Remarks"]
 
 def _block_metrics(df,months,weeks=True):
     """Metric columns present in each month block, in display order."""
@@ -1973,7 +1978,7 @@ def grouped_to_excel(w,df,sheet,key_labels,weeks=True):
             if mt==WEEKS[0] and nwk:
                 ws.cell(2,c+off,"Arrival Week"); ws.merge_cells(start_row=2,start_column=c+off,end_row=2,end_column=c+off+nwk-1)
             lbl=_metric_label(mt,mets); ws.cell(3,c+off,lbl)
-            widths.append(9 if mt in WEEKS else (14 if "Shortfall" in lbl else 11))
+            widths.append(9 if mt in WEEKS else (14 if ("Shortfall" in lbl or mt==TA_LABEL) else 11))
         c+=len(mets)
     ncol=c-1
     for r_ in range(1,4):
@@ -3420,7 +3425,7 @@ elif st.session_state["page"] == "segment":
                 with pcol:
                     pof=st.file_uploader("Import PO file for Arrival Weeks (optional — same file as Import Shortage page)",
                                          type=["xlsx","xls"],key="seg_po_u")
-                    if pof: st.session_state["_imp_po"]=pof.read()
+                    if pof: st.session_state["_imp_po"]=pof.getvalue()
                     if st.session_state.get("_imp_po") and not pof: st.caption("✓ Using Import PO file already in session.")
                     st.download_button("📥 Import PO template (week-wise ETA / ETD)",data=create_import_po_template().getvalue(),
                                        file_name="import_po_weekly_template.xlsx",key="dl_seg_po",
@@ -3436,9 +3441,20 @@ elif st.session_state["page"] == "segment":
                 if st.session_state.get("_imp_po"):
                     po_df,po_err=load_import_po(st.session_state["_imp_po"],st.session_state.get("imp_transit",30))
                     if po_err: st.warning(f"Import PO file: {po_err}"); po_df=None
+                if po_df is not None:                                     # PO lines the Segment page cannot use
+                    _al=align_part_codes(po_df,_mrp_known_codes(mrp_r))
+                    _use={p for p in r.get("import_parts",[])}|set((r.get("part_group") or {}).keys())
+                    _nd=_al[_al["ETA"].isna()]; _ni=_al[~_al["Part"].isin(_use)]
+                    if len(_nd): st.warning(f"⚠ Import PO: {len(_nd)} line(s) have no ETA and no ETD, so they cannot be placed in a month "
+                                            f"and are not counted — fill ETA (or ETD): "+", ".join(dict.fromkeys(_nd["Part"]))[:400])
+                    if len(_ni): st.caption(f"ℹ Import PO: {_ni['Part'].nunique()} part(s) are not in the Import Part sheet, so the Segment page "
+                                            f"does not use them: "+", ".join(dict.fromkeys(_ni["Part"]))[:400])
                 _bs="req" if basis.startswith("Requirement") else "max"
                 mw,mw_months=segment_monthwise(r,mrp_r,_bs,None,leftover=True)   # sets: stock only (no PO arrivals)
-                mw_arr,_=segment_monthwise(r,mrp_r,_bs,po_df)             # component view: with weekly PO arrivals
+                mw_arr,_=segment_monthwise(r,mrp_r,_bs,po_df,leftover=True)    # with weekly PO arrivals
+                if not mw.empty and "Total Available" in mw_arr.columns:          # set sheets: + column incl. PO arrival sets
+                    _ta=mw_arr.set_index(["VKey","Month"])["Total Available"].to_dict()
+                    mw["Total Available"]=[_ta.get((v,m),a) for v,m,a in zip(mw["VKey"],mw["Month"],mw["Sets Available"])]
                 if mw.empty or not mw_months:
                     st.info("No month-wise requirement found in the MRP Requirement sheet.")
                 else:
@@ -3453,7 +3469,8 @@ elif st.session_state["page"] == "segment":
                     nmc=(mw.drop_duplicates("FG Code")["Req matched on"]=="Not in Req").sum()
                     if nmc: st.caption(f"⚠ {nmc} FG code(s) not found in the Requirement sheet (by FG or IDU code) — treated as zero requirement.")
                     if po_df is None: st.caption("ℹ Upload the Import PO file to fill the Arrival Week columns in Model + components.")
-                    st.caption("Segment-wise / Model-wise (sets): from stock only · Balance = Available − Req (negative = short, in red) · "
+                    st.caption("Segment-wise / Model-wise (sets): Available and Balance from stock only · Total available (incl. arrival) = "
+                               "sets including the import PO arrivals up to that month · Balance = Available − Req (negative = short, in red) · "
                                "next month's Available = this Balance when positive, else 0. "
                                "PO arrivals by week (ETA day 1-7 WK01, 8-14 WK02, 15-21 WK03, 22+ WK04) are shown per component in Model + components.")
 
@@ -4173,7 +4190,7 @@ elif st.session_state["page"] == "import":
         with u1:
             pf=st.file_uploader("Import parts with PO Qty, ETD, ETA (.xlsx)",type=["xlsx","xls"],key="imp_po_u",
                                 help="One row per PO line. Columns: Import Part, Description (opt), PO No (opt), Supplier (opt), PO Qty, ETD, ETA")
-            if pf: st.session_state["_imp_po"]=pf.read()
+            if pf: st.session_state["_imp_po"]=pf.getvalue()
             if st.session_state.get("_imp_po") and not pf:
                 st.caption("✓ Import PO file retained in session. Re-upload to replace.")
         with u2:
