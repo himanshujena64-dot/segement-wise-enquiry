@@ -1724,6 +1724,11 @@ def df_to_sheet(w,df,sheet):
     ws.row_dimensions[1].height=30; ws.freeze_panes="A2"
     if len(df): ws.auto_filter.ref=f"A1:{get_column_letter(len(df.columns))}{len(df)+1}"
 
+# Report switches (hidden for now on request; set True to show again)
+SHOW_PCB_REFLASH=False      # '⇄ PCB re-flash plan' tab + 'PCB Re-flash summary / list', 'PCB Code ledger' sheets
+SHOW_PCB_SETS=False         # per-model 'PCB-based sets' table / sheet ('PCB-based material' stays)
+SHOW_INTERCHANGE_COL=False  # 'Interchange Group' column in Model + components
+
 REFLASH_KEYS={"Interchange Group":"Interchange Group","Component":"Component","Description":"Description",
               "Own stock":"Own stock","Used in FG codes":"Used in FG codes"}
 
@@ -3454,10 +3459,10 @@ elif st.session_state["page"] == "segment":
 
                     seg_keys={"Segment":"Segment"}
                     has_ig=bool(r.get("group_members"))
-                    fg_keys={k:v for k,v in MODEL_KEYS.items() if has_ig or k!="Interchange Group"}
+                    fg_keys={k:v for k,v in MODEL_KEYS.items() if (has_ig and SHOW_INTERCHANGE_COL) or k!="Interchange Group"}
                     cs_keys={"Component":"Component","Unit":"Unit","Codes":"Codes","Used in BOM headers":"Used in BOM headers","FG codes":"FG codes"}
                     seg_g=monthwise_grouped(mw,["Segment"],mw_months,signed=True)
-                    fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Description":"Model","FG Code":"FG Code"}
+                    fgo_keys={"Segment":"Segment","Alt BOM":"Alt BOM","FG Code":"FG Code"}
                     fgo_g=monthwise_grouped(mw,list(fgo_keys),mw_months,signed=True)
                     fgo_g=pd.concat([fgo_g.iloc[:-1].sort_values(("","Segment"),kind="stable"),fgo_g.iloc[-1:]],ignore_index=True)
                     _bom=mrp_r["bom"]
@@ -3490,21 +3495,37 @@ elif st.session_state["page"] == "segment":
                         grouped_to_excel(_w,seg_g,"Segment-wise",seg_keys,weeks=False)
                         grouped_to_excel(_w,fgo_g,"Model-wise (sets)",fgo_keys,weeks=False)
                         if not fg_g.empty: grouped_to_excel(_w,_novk(fg_g),"Model + components",fg_keys)
-                        if not rf_grid.empty:                                 # only when interchange groups are pooled
+                        if not rf_grid.empty and SHOW_PCB_REFLASH:            # only when interchange groups are pooled
                             rf_flows.to_excel(_w,sheet_name="PCB Re-flash list",index=False)
                             grouped_to_excel(_w,rf_grid,"PCB Code ledger",REFLASH_KEYS,weeks=rf_wk)
                         if has_pb:
-                            df_to_sheet(_w,pb_sets,"PCB-based sets"); df_to_sheet(_w,pb_mat,"PCB-based material")
+                            if SHOW_PCB_SETS: df_to_sheet(_w,pb_sets,"PCB-based sets")
+                            if not pb_mat.empty: df_to_sheet(_w,pb_mat,"PCB-based material")
                         if "Sheet" in _w.book.sheetnames and len(_w.book.sheetnames)>1: del _w.book["Sheet"]
                     _xb.seek(0)
                     st.download_button("⬇ Download month-wise tables (.xlsx)",data=_xb,file_name="segment_monthwise.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                        type="primary",key="dl_seg_mw")
+                    show_rf=has_ig and SHOW_PCB_REFLASH
                     _tabs=st.tabs(["Segment-wise (sets)","Model-wise (sets)","Model + components (drill-down)",
-                                   "Component shortage & arrivals","Single FG / segment view"]+(["⇄ PCB re-flash plan"] if has_ig else [])
-                                  +(["🔲 PCB-based sets"] if has_pb else []))
+                                   "Component shortage & arrivals","Single FG / segment view"]+(["⇄ PCB re-flash plan"] if show_rf else [])
+                                  +([("🔲 PCB-based sets" if SHOW_PCB_SETS else "🔲 PCB-based material")] if has_pb else []))
                     sw1,sw5,sw2,sw4,sw3=_tabs[:5]
-                    if has_pb:
+                    if has_pb and not SHOW_PCB_SETS:
+                        with _tabs[-1]:
+                            st.caption("If the PCB stock is turned into sets (requirement first, earlier months first, then the PCBs still "
+                                       "left; interchange groups pooled): each import material needed vs stock (+ = excess, − = short), "
+                                       "also after PO arrivals in the horizon.")
+                            st.metric("Materials short",f"{int((pb_mat['Excess (+) / Short (−)']<0).sum()) if not pb_mat.empty else 0} / {len(pb_mat)}")
+                            if pb_mat.empty: st.info("No sets can be made from the PCB stock.")
+                            else:
+                                _neg=lambda c:["color:#dc2626;font-weight:600" if isinstance(v,(int,float)) and v<0 else "" for v in c]
+                                only_sh=st.checkbox("Only short materials",value=False,key="seg_pb_short")
+                                mv=pb_mat[pb_mat["Excess (+) / Short (−)"]<0] if only_sh else pb_mat
+                                _mc=[c for c in mv.columns if pd.api.types.is_numeric_dtype(mv[c])]
+                                st.dataframe(mv.style.apply(_neg,subset=["Excess (+) / Short (−)","After PO"]).format({c:"{:,.0f}" for c in _mc}),
+                                             use_container_width=True,hide_index=True)
+                    if has_pb and SHOW_PCB_SETS:
                         with _tabs[-1]:
                             st.caption("PCB as the base for all models: sets the PCB stock allows (interchange groups pooled), shared out "
                                        "requirement first (earlier months first), then the PCBs still left become extra sets — so all PCBs are "
@@ -3529,7 +3550,7 @@ elif st.session_state["page"] == "segment":
                                 _mc=[c for c in mv.columns if pd.api.types.is_numeric_dtype(mv[c])]
                                 st.dataframe(mv.style.apply(_neg,subset=["Excess (+) / Short (−)","After PO"]).format({c:"{:,.0f}" for c in _mc}),
                                              use_container_width=True,hide_index=True)
-                    if has_ig:
+                    if show_rf:
                         with _tabs[5]:
                             st.caption("Interchangeable PCBs (same hardware, only EPROM / firmware differs). Each code first uses its own "
                                        "stock and its own PO arrivals; only the demand left over is covered by re-flashing spare stock of "
@@ -3650,12 +3671,13 @@ elif st.session_state["page"] == "segment":
                     if not _mwx[5].empty:
                         _mwx[7].to_excel(w,sheet_name="Component Shortage",index=False)
                         grouped_to_excel(w,_mwx[5],"Component Monthwise",_mwx[6])
-                    if len(_mwx)>10 and not _mwx[10].empty:               # PCB re-flash plan (interchange groups pooled)
+                    if SHOW_PCB_REFLASH and len(_mwx)>10 and not _mwx[10].empty:   # PCB re-flash plan (groups pooled)
                         _mwx[12].to_excel(w,sheet_name="PCB Re-flash summary",index=False)
                         _mwx[11].to_excel(w,sheet_name="PCB Re-flash list",index=False)
                         grouped_to_excel(w,_mwx[10],"PCB Code ledger",REFLASH_KEYS,weeks=_mwx[13])
                     if len(_mwx)>14 and not _mwx[14].empty:
-                        df_to_sheet(w,_mwx[14],"PCB-based sets"); df_to_sheet(w,_mwx[15],"PCB-based material")
+                        if SHOW_PCB_SETS: df_to_sheet(w,_mwx[14],"PCB-based sets")
+                        if not _mwx[15].empty: df_to_sheet(w,_mwx[15],"PCB-based material")
                     _mwx[2].to_excel(w,sheet_name="Monthwise Detail",index=False)
             buf.seek(0)
             st.download_button("⬇ Download Segment Capacity (.xlsx)",data=buf,file_name="segment_capacity.xlsx",
